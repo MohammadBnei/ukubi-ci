@@ -1,0 +1,108 @@
+# Build one image on a GitHub-hosted runner as a check: no login, no push, no
+# Infisical, only contents: read, so a checks.yml caller needs no write grants
+# (image.yml asks for contents: write and id-token: write even on PRs).
+# The tag and Build steps are image.yml's, byte for byte, so a PR builds the
+# way production does; test/reusable.sh diffs them (env included) so the two
+# cannot drift. A composite action cannot share them: in a reusable workflow
+# `./` is the caller's checkout.
+name: image-build
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Image name, used for the local tag only, e.g. drop.
+        type: string
+        required: true
+      context:
+        description: Build context, relative to the repo root.
+        type: string
+        default: .
+      dockerfile:
+        description: Dockerfile path, relative to the repo root (not to context).
+        type: string
+        default: Dockerfile
+      target:
+        description: Optional multi-stage --target.
+        type: string
+        default: ''
+      build-args:
+        description: Multiline KEY=VALUE, one per line. Not secret; never put a secret here.
+        type: string
+        default: ''
+      layers:
+        description: Pass --layers.
+        type: boolean
+        default: true
+      pull-newer:
+        description: Pass --pull=newer.
+        type: boolean
+        default: true
+    secrets:
+      build-secrets:
+        description: Multiline id=value; each becomes `--secret id=<id>` (RUN --mount=type=secret,id=<id>).
+        required: false
+
+env:
+  REGISTRY: localhost
+  IMAGE: ${{ inputs.image }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check inputs
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE" =~ ^[a-z0-9][a-z0-9._/-]*$ ]] || { echo "::error::bad image name: $IMAGE"; exit 1; }
+
+      # No token in .git/config: a `COPY . .` would put it in the image.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Compute the image tag
+        id: tag
+        run: echo "value=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Check buildah
+        run: command -v buildah || { echo "::error::buildah is not installed on this runner"; exit 1; }
+
+      # Verbatim from image.yml; edit both or neither.
+      - name: Build
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+          CONTEXT: ${{ inputs.context }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          TARGET: ${{ inputs.target }}
+          BUILD_ARGS: ${{ inputs.build-args }}
+          LAYERS: ${{ inputs.layers }}
+          PULL_NEWER: ${{ inputs.pull-newer }}
+          BUILD_SECRETS: ${{ secrets.build-secrets }}
+        run: |
+          set -euo pipefail
+          args=(--isolation chroot --format docker -f "$DOCKERFILE" -t "$REGISTRY/$IMAGE:$TAG")
+          [ "$LAYERS" = true ] && args+=(--layers)
+          [ "$PULL_NEWER" = true ] && args+=(--pull=newer)
+          [ -n "$TARGET" ] && args+=(--target "$TARGET")
+          while IFS= read -r a; do
+            [ -n "$a" ] && args+=(--build-arg "$a")
+          done <<< "$BUILD_ARGS"
+          sdir=$(mktemp -d); trap 'rm -rf "$sdir"' EXIT
+          while IFS= read -r s; do
+            [ -n "$s" ] || continue
+            id=${s%%=*}; val=${s#*=}
+            [[ "$id" =~ ^[A-Za-z0-9_.-]+$ && "$s" == *=* ]] || { echo "::error::build-secrets lines are id=value"; exit 1; }
+            echo "::add-mask::$val"
+            (umask 077; printf '%s' "$val" > "$sdir/$id")
+            args+=(--secret "id=$id,src=$sdir/$id")
+          done <<< "$BUILD_SECRETS"
+          sudo -n buildah bud "${args[@]}" "$CONTEXT"
+
+      - name: Remove the local image
+        if: always() && steps.tag.outputs.value != ''
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+        run: sudo -n buildah rmi "$REGISTRY/$IMAGE:$TAG" || true

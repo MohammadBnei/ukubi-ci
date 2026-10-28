@@ -1,0 +1,103 @@
+# Bun checks for one package: bun pinned exactly from package.json
+# packageManager, a frozen install, typecheck, test, the package's REAL build
+# script, and optionally that the committed dist is what the build writes.
+# Inputs reach scripts through env only, never inline ${{ }}.
+name: bun-checks
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: The package directory (holds package.json and bun.lock), relative to the repo root.
+        type: string
+        default: .
+      typecheck-script:
+        description: package.json script run as the typecheck. Empty skips.
+        type: string
+        default: typecheck
+      test-script:
+        description: package.json script run as the tests. Empty skips.
+        type: string
+        default: test
+      build-script:
+        description: package.json script that is the real build. Empty skips (a package with no build).
+        type: string
+        default: build
+      dist:
+        description: Committed build output, relative to working-directory. After the build, git must see no change in it. Empty skips.
+        type: string
+        default: ''
+
+jobs:
+  bun:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      # test/reusable.sh runs the named blocks below verbatim; keep the names.
+      # Fail closed: a missing pin, a range or a tag is refused, not "latest".
+      - name: Check inputs
+        id: bun
+        env:
+          BUILD_SCRIPT: ${{ inputs.build-script }}
+          DIST: ${{ inputs.dist }}
+        run: |
+          set -euo pipefail
+          pm=$(jq -r '.packageManager // ""' package.json)
+          [[ "$pm" =~ ^bun@[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::package.json packageManager must be exactly bun@X.Y.Z, got '$pm'"; exit 1; }
+          if [ -n "$DIST" ]; then
+            [ -n "$BUILD_SCRIPT" ] || { echo "::error::dist is set but build-script is empty: nothing would rebuild it"; exit 1; }
+            [ -n "$(git ls-files -- "$DIST")" ] || { echo "::error::dist '$DIST' tracks no files"; exit 1; }
+          fi
+          echo "version=${pm#bun@}" >> "$GITHUB_OUTPUT"
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ steps.bun.outputs.version }}
+
+      - name: Check the bun version
+        env:
+          WANT: ${{ steps.bun.outputs.version }}
+        run: |
+          got=$(bun --version)
+          [ "$got" = "$WANT" ] || { echo "::error::bun is $got, package.json pins $WANT"; exit 1; }
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        if: inputs.typecheck-script != ''
+        env:
+          SCRIPT: ${{ inputs.typecheck-script }}
+        run: bun run "$SCRIPT"
+
+      - name: Test
+        if: inputs.test-script != ''
+        env:
+          SCRIPT: ${{ inputs.test-script }}
+        run: bun run "$SCRIPT"
+
+      - name: Build
+        if: inputs.build-script != ''
+        env:
+          SCRIPT: ${{ inputs.build-script }}
+        run: bun run "$SCRIPT"
+
+      # Porcelain also lists untracked files, so a new chunk not committed fails.
+      - name: Dist is fresh
+        if: inputs.dist != ''
+        env:
+          DIST: ${{ inputs.dist }}
+        run: |
+          set -euo pipefail
+          out=$(git status --porcelain -- "$DIST")
+          [ -z "$out" ] || { echo "::error::$DIST is stale; run the build and commit it:"; echo "$out"; exit 1; }

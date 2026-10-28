@@ -1,0 +1,122 @@
+# Rust checks for one crate or workspace, the ukubi-stt shape: the toolchain
+# rust-toolchain.toml names (required), fmt, clippy -D warnings, tests, and a
+# blocking cargo audit. Inputs reach scripts through env only, never inline ${{ }}.
+name: rust-checks
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: The crate or workspace root (holds Cargo.toml, Cargo.lock and rust-toolchain.toml), relative to the repo root.
+        type: string
+        default: .
+      apt-packages:
+        description: Space-separated apt packages the build needs, e.g. protobuf-compiler. Empty skips.
+        type: string
+        default: ''
+      audit-ignore:
+        description: Multiline RUSTSEC-YYYY-NNNN ids passed to cargo audit --ignore. .cargo/audit.toml is read as well; keep the reasons there.
+        type: string
+        default: ''
+
+env:
+  CARGO_TERM_COLOR: always
+  # Plain rustup does not retry flaky downloads; at least cargo does.
+  CARGO_NET_RETRY: 10
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      # test/reusable.sh runs the named blocks below verbatim; keep the names.
+      - name: Check inputs
+        env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          set -euo pipefail
+          [ -f rust-toolchain.toml ] || { echo "::error::rust-toolchain.toml is required: it is where the toolchain is pinned"; exit 1; }
+          for p in $APT_PACKAGES; do
+            [[ "$p" =~ ^[a-z0-9][a-z0-9.+-]+$ ]] || { echo "::error::bad apt package name '$p'"; exit 1; }
+          done
+
+      # No arguments: installs exactly what rust-toolchain.toml names, components
+      # included. The second line fails if that file is not what is active.
+      - name: Install the pinned toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup show active-toolchain | tee /dev/stderr | grep -q 'rust-toolchain.toml'
+
+      - name: Install apt packages
+        if: inputs.apt-packages != ''
+        env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          set -euo pipefail
+          read -ra pkgs <<<"$APT_PACKAGES"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "${pkgs[@]}"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ${{ inputs.working-directory }} -> target
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+  # Blocking. An accepted advisory goes in audit-ignore (or .cargo/audit.toml)
+  # with its reason; this job is never made non-blocking. "error loading
+  # advisory database" means the cargo-audit pin is too old for the DB format:
+  # bump the pin, do not ignore an id.
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ${{ inputs.working-directory }} -> target
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Audit
+        env:
+          AUDIT_IGNORE: ${{ inputs.audit-ignore }}
+        run: |
+          set -euo pipefail
+          args=()
+          while IFS= read -r id; do
+            id=${id//[[:space:]]/}
+            [ -n "$id" ] || continue
+            [[ "$id" =~ ^RUSTSEC-[0-9]{4}-[0-9]{4}$ ]] || { echo "::error::audit-ignore lines are RUSTSEC-YYYY-NNNN, got '$id'"; exit 1; }
+            args+=(--ignore "$id")
+          done <<<"$AUDIT_IGNORE"
+          cargo audit ${args[@]+"${args[@]}"}

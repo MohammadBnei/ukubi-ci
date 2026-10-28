@@ -35,9 +35,12 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: shellcheck
-        run: shellcheck test/check.sh
+        run: shellcheck test/check.sh test/reusable.sh
       - name: image.yml run blocks against fixtures
         run: test/check.sh
+      # go is on ubuntu-latest, so the gofmt and vettool cases run here too.
+      - name: reusable workflows' run blocks against fixtures
+        run: test/reusable.sh
 
   # The real build path on a GitHub-hosted runner, build-only (pull_request
   # skips Infisical, login, push and deploy). The grants are needed even so:
@@ -57,3 +60,52 @@ jobs:
       values-file: ''
     secrets:
       build-secrets: probe=from-build-secrets
+
+  # The C2 reusable checks, each called the way a caller will, on its fixture.
+  go-self-test:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/go-checks.yml
+    with:
+      working-directory: test/fixture-go
+      golangci-lint-version: v2.14.0
+      # Reaches the vettool path until ukubicheck (ukubi-go) ships.
+      vettool: golang.org/x/tools/go/analysis/passes/nilness/cmd/nilness@v0.52.0
+
+  bun-self-test:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/bun-checks.yml
+    with:
+      working-directory: test/fixture-bun
+      dist: dist
+
+  rust-self-test:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/rust-checks.yml
+    with:
+      working-directory: test/fixture-rust
+      # Not an advisory against this crate; proves the --ignore path runs.
+      audit-ignore: RUSTSEC-2026-0414
+
+  image-build-self-test:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/image-build.yml
+    with:
+      image: ukubi-ci-selftest
+      context: test/fixture
+      dockerfile: test/fixture/Dockerfile
+      build-args: PROBE=from-build-args
+    secrets:
+      build-secrets: probe=from-build-secrets
+
+  # This PR's own commits, with this repo's rule. On push it is the no-op path.
+  trailers-self-test:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/trailers.yml
+    with:
+      conventional: true
+      agent-trailers: pair
