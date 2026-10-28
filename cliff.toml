@@ -1,0 +1,40 @@
+# Shared git-cliff config for release.yml (embedded there byte for byte;
+# test/release.sh checks). A caller's own cliff.toml at the repo root wins.
+# release.yml always passes --tag-pattern on the command line.
+[changelog]
+header = "# Changelog\n\n"
+# One line per commit: the subject only, never a body or trailers.
+body = """
+{% if version %}## {{ version | trim_start_matches(pat="v") }} - {{ timestamp | date(format="%Y-%m-%d") }}{% else %}## Unreleased{% endif %}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message | split(pat="\n") | first | trim | upper_first }}\
+{% endfor %}
+{% endfor %}\n
+"""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+commit_parsers = [
+  # Bot commits: release.yml's own, image.yml's tag bump, release-it's bump.
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^chore\\(deploy\\)", skip = true },
+  { message = "^chore: update helm image tag", skip = true },
+  # Merges: their commits are listed on their own.
+  { message = "^Merge ", skip = true },
+  { message = "^feat", group = "<!-- 0 -->Features" },
+  { message = "^fix", group = "<!-- 1 -->Fixes" },
+  { message = "^perf", group = "<!-- 2 -->Performance" },
+  { message = ".*", group = "<!-- 9 -->Other" },
+]
+topo_order = false
+
+[bump]
+features_always_bump_minor = true
+# 0.x: a breaking change bumps the minor; 1.x and up: the major.
+breaking_always_bump_major = false
+initial_tag = "v0.1.0"

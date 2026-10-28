@@ -1,0 +1,217 @@
+# Cut a release from Conventional Commits with git-cliff: compute the next
+# semver since the last X.Y.Z / vX.Y.Z tag, prepend its section to the
+# CHANGELOG, commit `chore(release): <tag>` to the default branch, push an
+# annotated tag with it (one atomic push), and output the version for the
+# image workflow's VERSION build-arg.
+#
+# Only push and workflow_dispatch on the default branch release. Any other
+# event (pull_request included) is a dry run: version and section go to the
+# step summary; nothing is committed, tagged or pushed.
+#
+# A direct commit, not a PR: no caller protects its default branch today, and
+# image.yml's tag bump pushes the same way. A protected branch fails the
+# atomic push loudly, with nothing half-pushed.
+#
+# GITHUB_TOKEN pushes never trigger another run, so the release commit cannot
+# loop. The caller's job must grant `contents: write`, also on pull_request
+# (GitHub checks nested permissions before any job starts).
+# Inputs reach scripts through env only, never inline ${{ }}.
+name: release
+
+on:
+  workflow_call:
+    inputs:
+      config:
+        description: git-cliff config path. Empty uses cliff.toml at the repo root if present, else ukubi-ci's default (embedded below). A non-empty path must exist.
+        type: string
+        default: ''
+      changelog:
+        description: The changelog file to prepend to (created on the first release).
+        type: string
+        default: CHANGELOG.md
+    outputs:
+      version:
+        description: X.Y.Z without a v (the release cut, or on a dry run the one that would be). Feed it to image.yml as build-args VERSION=...
+        value: ${{ jobs.release.outputs.version }}
+      tag:
+        description: The release tag at the released commit, for image.yml's ref. Empty on a dry run, or when nothing was released and the tip is untagged.
+        value: ${{ jobs.release.outputs.tag }}
+      released:
+        description: true when this run pushed a new tag.
+        value: ${{ jobs.release.outputs.released }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Keyed on the ref: a pull_request dry run must not take the one pending
+    # slot and cancel a queued real release on the default branch.
+    concurrency:
+      group: ukubi-ci-release-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      released: ${{ steps.release.outputs.released }}
+    steps:
+      # Full history and tags; no token on disk (cliff.toml can run commands).
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # ci.yml runs this block verbatim; the pin lives only here.
+      - name: Install git-cliff
+        run: |
+          set -euo pipefail
+          v=2.14.2
+          sha=24f397c733add5390fdceee3a2088588ab0d5f944ce00d34cb7029b888cf2db4
+          f="git-cliff-$v-x86_64-unknown-linux-gnu.tar.gz"
+          curl -sSfLo "$RUNNER_TEMP/$f" "https://github.com/orhun/git-cliff/releases/download/v$v/$f"
+          echo "$sha  $RUNNER_TEMP/$f" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP" "git-cliff-$v/git-cliff"
+          echo "$RUNNER_TEMP/git-cliff-$v" >> "$GITHUB_PATH"
+
+      # test/release.sh runs this block verbatim against throwaway repos; keep the name.
+      - name: Release
+        id: release
+        env:
+          # Only a real release gets the token; a dry run reads only.
+          TOKEN: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.token || '' }}
+          SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+          CONFIG: ${{ inputs.config }}
+          CHANGELOG: ${{ inputs.changelog }}
+        run: |
+          set -euo pipefail
+          # Out of the environment before git-cliff runs: a cliff.toml
+          # postprocessor inherits it otherwise. ponytail: /proc/$PPID/environ
+          # still holds it; cliff.toml is trusted like the workflow file (same branch).
+          tok=$TOKEN; unset TOKEN
+          pattern='^v?[0-9]+\.[0-9]+\.[0-9]+$'
+          if [ -n "$CONFIG" ]; then
+            [ -f "$CONFIG" ] || { echo "::error::config $CONFIG not found"; exit 1; }
+            cfg=$CONFIG
+          elif [ -f cliff.toml ]; then
+            cfg=cliff.toml
+          else
+            cfg=$(mktemp -d)/cliff.toml # git-cliff wants the .toml name
+            cat > "$cfg" <<'CLIFF'
+          # Shared git-cliff config for release.yml (embedded there byte for byte;
+          # test/release.sh checks). A caller's own cliff.toml at the repo root wins.
+          # release.yml always passes --tag-pattern on the command line.
+          [changelog]
+          header = "# Changelog\n\n"
+          # One line per commit: the subject only, never a body or trailers.
+          body = """
+          {% if version %}## {{ version | trim_start_matches(pat="v") }} - {{ timestamp | date(format="%Y-%m-%d") }}{% else %}## Unreleased{% endif %}
+          {% for group, commits in commits | group_by(attribute="group") %}
+          ### {{ group | striptags | trim | upper_first }}
+          {% for commit in commits %}
+          - {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message | split(pat="\n") | first | trim | upper_first }}\
+          {% endfor %}
+          {% endfor %}\n
+          """
+          trim = true
+
+          [git]
+          conventional_commits = true
+          filter_unconventional = false
+          split_commits = false
+          commit_parsers = [
+            # Bot commits: release.yml's own, image.yml's tag bump, release-it's bump.
+            { message = "^chore\\(release\\)", skip = true },
+            { message = "^chore\\(deploy\\)", skip = true },
+            { message = "^chore: update helm image tag", skip = true },
+            # Merges: their commits are listed on their own.
+            { message = "^Merge ", skip = true },
+            { message = "^feat", group = "<!-- 0 -->Features" },
+            { message = "^fix", group = "<!-- 1 -->Fixes" },
+            { message = "^perf", group = "<!-- 2 -->Performance" },
+            { message = ".*", group = "<!-- 9 -->Other" },
+          ]
+          topo_order = false
+
+          [bump]
+          features_always_bump_minor = true
+          # 0.x: a breaking change bumps the minor; 1.x and up: the major.
+          breaking_always_bump_major = false
+          initial_tag = "v0.1.0"
+          CLIFF
+          fi
+          cliff() { git-cliff --config "$cfg" --tag-pattern "$pattern" "$@"; }
+          out() { printf 'version=%s\ntag=%s\nreleased=%s\n' "$1" "$2" "$3" >> "$GITHUB_OUTPUT"; }
+          # Nothing releasable (only skipped commits since the last tag): the
+          # last version, and its tag if the tip carries it (a re-run is a no-op).
+          unchanged() {
+            local last; last=$(cliff --latest --context | jq -r '.[0].version // ""')
+            local t=''
+            [ -n "$last" ] && [ "$(git rev-parse "$last^{commit}")" = "$(git rev-parse HEAD)" ] && t=$last
+            echo "::notice::nothing to release since ${last:-the start}"
+            out "${last#v}" "$t" false
+          }
+          next() { # the next tag, checked
+            local t; t=$(cliff --bumped-version)
+            [[ "$t" =~ $pattern ]] || { echo "::error::git-cliff gave a bad version: '$t'" >&2; exit 1; }
+            ! git rev-parse -q --verify "refs/tags/$t" >/dev/null || { echo "::error::tag $t already exists" >&2; exit 1; }
+            echo "$t"
+          }
+          releasable() { cliff --unreleased --context | jq '[.[].commits[]] | length'; }
+
+          if ! [[ ( "$EVENT" == push || "$EVENT" == workflow_dispatch ) && "$REF" == "refs/heads/$BRANCH" ]]; then
+            n=$(releasable)
+            if [ "$n" = 0 ]; then unchanged; exit 0; fi
+            t=$(next)
+            { echo "## Dry run: would release $t"; echo; cliff --unreleased --tag "$t" --strip header; } >> "$GITHUB_STEP_SUMMARY"
+            out "${t#v}" '' false
+            exit 0
+          fi
+
+          # Mask the base64 itself: GitHub masks only the raw token.
+          b64=$(printf 'x-access-token:%s' "$tok" | base64 | tr -d '\n')
+          echo "::add-mask::$b64"
+          hdr="AUTHORIZATION: basic $b64"
+          # Commits past $SHA that trigger no run of their own (GITHUB_TOKEN pushes).
+          bots='^(chore\((release|deploy)\)|chore: update helm image tag)'
+          for attempt in 1 2 3; do
+            git -c http.extraheader="$hdr" fetch -q --tags origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+            # Release the commit whose checks gated this run, never newer work:
+            # a tip past it by anything but bot commits has its own queued run.
+            tip=refs/remotes/origin/$BRANCH
+            if ! git merge-base --is-ancestor "$SHA" "$tip" \
+              || git log --format=%s "$SHA..$tip" | grep -vE "$bots" >/dev/null; then
+              echo "::notice::$BRANCH moved past $SHA; the run for the newer commits releases them"
+              unchanged; exit 0
+            fi
+            # The tip, bot commits included, so the push fast-forwards.
+            git reset -q --hard "$tip"
+            n=$(releasable)
+            if [ "$n" = 0 ]; then unchanged; exit 0; fi
+            t=$(next)
+            touch "$CHANGELOG"
+            cliff --unreleased --tag "$t" --prepend "$CHANGELOG"
+            git add -- "$CHANGELOG"
+            # git-cliff exits 0 on an IO error: the version must have landed.
+            # No grep -q: exiting early SIGPIPEs the writers and pipefail fails it.
+            git diff --cached -U0 -- "$CHANGELOG" | grep '^+' | grep -F "${t#v}" >/dev/null \
+              || { echo "::error::$t did not land in $CHANGELOG"; exit 1; }
+            id=(-c user.name=release-ci -c user.email=noreply@bnei.dev)
+            git "${id[@]}" commit -q -m "chore(release): $t"
+            git "${id[@]}" tag -a "$t" -m "$t"
+            if git -c http.extraheader="$hdr" push --atomic origin "HEAD:refs/heads/$BRANCH" "refs/tags/$t"; then
+              echo "::notice::released $t"
+              out "${t#v}" "$t" true
+              exit 0
+            fi
+            # Not on origin: drop it, or the next attempt takes it for the last release.
+            git tag -d "$t" >/dev/null
+            echo "::warning::push of $t rejected (attempt $attempt); retrying from the new tip"
+            sleep 5
+          done
+          echo "::error::could not push $t"; exit 1

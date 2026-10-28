@@ -35,18 +35,33 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: shellcheck
-        run: shellcheck test/check.sh test/reusable.sh
+        run: shellcheck test/check.sh test/reusable.sh test/release.sh
+      # release.yml's own install block: one copy of the git-cliff pin.
+      - name: Install git-cliff
+        run: yq '.jobs.release.steps[] | select(.name == "Install git-cliff") | .run' .github/workflows/release.yml | bash
       - name: image.yml run blocks against fixtures
         run: test/check.sh
       # go is on ubuntu-latest, so the gofmt and vettool cases run here too.
       - name: reusable workflows' run blocks against fixtures
         run: test/reusable.sh
+      - name: release.yml's Release block against throwaway repos
+        run: test/release.sh
+
+  # release.yml as callers chain it: after the checks; on pull_request a dry
+  # run, on push to main the real release (CHANGELOG commit + tag). Its
+  # version reaches both image self-tests as the VERSION build-arg.
+  release-self-test:
+    needs: [actionlint, check]
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
 
   # The real build path on a GitHub-hosted runner, build-only (pull_request
   # skips Infisical, login, push and deploy). The grants are needed even so:
   # GitHub checks the nested jobs' permissions before any job starts.
   self-test:
     if: github.event_name == 'pull_request'
+    needs: release-self-test
     permissions:
       contents: write
       id-token: write
@@ -56,7 +71,9 @@ jobs:
       image: ukubi-ci-selftest
       context: test/fixture
       dockerfile: test/fixture/Dockerfile
-      build-args: PROBE=from-build-args
+      build-args: |
+        PROBE=from-build-args
+        VERSION=${{ needs.release-self-test.outputs.version }}
       values-file: ''
     secrets:
       build-secrets: probe=from-build-secrets
@@ -91,6 +108,7 @@ jobs:
       audit-ignore: RUSTSEC-2026-0414
 
   image-build-self-test:
+    needs: release-self-test
     permissions:
       contents: read
     uses: ./.github/workflows/image-build.yml
@@ -98,7 +116,9 @@ jobs:
       image: ukubi-ci-selftest
       context: test/fixture
       dockerfile: test/fixture/Dockerfile
-      build-args: PROBE=from-build-args
+      build-args: |
+        PROBE=from-build-args
+        VERSION=${{ needs.release-self-test.outputs.version }}
     secrets:
       build-secrets: probe=from-build-secrets
 
