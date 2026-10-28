@@ -89,6 +89,14 @@ jobs:
       # Reaches the vettool path until ukubicheck (ukubi-go) ships.
       vettool: golang.org/x/tools/go/analysis/passes/nilness/cmd/nilness@v0.52.0
 
+  status-self-test:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/go-checks.yml
+    with:
+      working-directory: standard-status
+      golangci-lint-version: v2.14.0
+
   bun-self-test:
     permissions:
       contents: read
