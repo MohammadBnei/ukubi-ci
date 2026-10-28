@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -37,7 +38,14 @@ func workflow(p string) bool {
 	return strings.HasPrefix(p, ".github/workflows/") && (strings.HasSuffix(p, ".yml") || strings.HasSuffix(p, ".yaml"))
 }
 
-func src(p string) bool { return !testGo(p) && !workflow(p) && !strings.HasSuffix(p, ".md") }
+// src allowlists code, so docs, .env examples and fixtures are never evidence.
+func src(p string) bool {
+	switch filepath.Ext(p) {
+	case ".go", ".rs", ".ts", ".js":
+		return !testGo(p)
+	}
+	return false
+}
 
 func r(files func(string) bool, re string) rule {
 	return rule{files: files, re: regexp.MustCompile(re)}
@@ -48,9 +56,10 @@ var checks = []check{
 	{"Key-registry test", "§6", []rule{r(testGo, `\b(TestErrKeys|TestKeys)\b`)}},
 	{"JSON logger", "§7", []rule{
 		r(ext(".go"), `slog\.NewJSONHandler|telemetry\.NewLogger`),
-		r(ext(".rs"), `(?s)tracing_subscriber.*\.json\(\)`),
+		// .json() in the same builder statement, not anywhere after.
+		r(ext(".rs"), `tracing_subscriber::fmt(::layer)?\(\)[^;]*\.json\(\)`),
 	}},
-	{"ErrorLog", "§7", []rule{r(ext(".go"), `ErrorLog:\s*\S`)}},
+	{"ErrorLog", "§7", []rule{r(ext(".go"), `ErrorLog:[ \t]*(?:[^\s,}n]|n(?:[^i]|i[^l]|il\w))`)}},
 	{"Traces opt-in", "§7", []rule{r(src, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`)}},
 	{"/metrics exposition test", "§7", []rule{r(testGo, `TestMetricsExposition`)}},
 	{"PR CI", "§9", []rule{r(workflow, `(?m)^on:.*\bpull_request\b|^\s*pull_request(_target)?\s*:|^\s*-\s*pull_request\s*$`)}},
@@ -74,8 +83,7 @@ type Result struct {
 	Found           []string
 }
 
-// scan walks dir (skipping .git, vendor, node_modules, *.md except CLAUDE.md)
-// and returns the first piece of evidence per check, in path order.
+// scan walks dir (skipping .git, vendor, node_modules) and returns the first piece of evidence per check, in path order.
 func scan(dir string) []string {
 	found := make([]string, len(checks))
 	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
@@ -91,10 +99,8 @@ func scan(dir string) []string {
 		}
 		rel, _ := filepath.Rel(dir, p)
 		rel = filepath.ToSlash(rel)
-		if strings.HasSuffix(rel, ".md") && rel != "CLAUDE.md" {
-			return nil
-		}
 		var body string
+		read := false
 		for i, c := range checks {
 			if found[i] != "" {
 				continue
@@ -103,12 +109,12 @@ func scan(dir string) []string {
 				if !ru.files(rel) {
 					continue
 				}
-				if body == "" {
+				if !read {
 					b, err := os.ReadFile(p)
 					if err != nil {
 						return nil
 					}
-					body = string(b)
+					body, read = string(b), true
 				}
 				if m := ru.re.FindStringSubmatch(body); m != nil {
 					found[i] = rel
@@ -133,7 +139,7 @@ func render(rs []Result) string {
 			switch {
 			case x.Err != "":
 			case x.Found[i] != "":
-				has = append(has, fmt.Sprintf("%s (%s)", x.Repo, x.Found[i]))
+				has = append(has, fmt.Sprintf("%s (%s)", x.Repo, strings.ReplaceAll(x.Found[i], "|", `\|`)))
 			default:
 				not = append(not, x.Repo)
 			}
@@ -177,8 +183,8 @@ func run(name string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-func read(repo, tmp string) Result {
-	dir := filepath.Join(tmp, strings.ReplaceAll(repo, "/", "_"))
+// dir is per call: repo names can collide once flattened, or repeat.
+func read(repo, dir string) Result {
 	if _, err := run("gh", "repo", "clone", repo, dir, "--", "--depth", "1", "--single-branch", "-q"); err != nil {
 		return Result{Repo: repo, Err: strings.ReplaceAll(err.Error(), "|", "/")}
 	}
@@ -201,15 +207,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	defer os.RemoveAll(tmp)
 	var rs []Result
 	bad := false
-	for _, repo := range os.Args[1:] {
-		x := read(repo, tmp)
+	for i, repo := range os.Args[1:] {
+		x := read(repo, filepath.Join(tmp, strconv.Itoa(i)))
 		bad = bad || x.Err != ""
 		rs = append(rs, x)
 	}
 	fmt.Print(render(rs))
+	_ = os.RemoveAll(tmp) // not deferred: os.Exit skips defers
 	if bad {
 		os.Exit(1)
 	}
