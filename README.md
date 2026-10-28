@@ -183,6 +183,31 @@ Rules:
   ukubi-ci is public: real mode on a private repo is first proven by the first
   private caller's run on its default branch.
 
+## standard-status
+
+Reports which Code Standard mechanisms each repo's origin default branch has,
+as the markdown tables for standard §18 (one row per mechanism) and §19 (one
+row per repo: tier, head, n/10). Stdlib Go; it shallow-clones each repo with
+`gh repo clone`, so it needs `gh` authenticated for the repos (private ones
+included) and runs only in local sessions, not in agent-fleet. It reads, prints
+and writes no token.
+
+```sh
+go run github.com/MohammadBnei/ukubi-ci/standard-status@<40-char sha> \
+  MohammadBnei/hq MohammadBnei/drop MohammadBnei/ukubi-bridge MohammadBnei/mountain \
+  MohammadBnei/ukubi-game MohammadBnei/agent-fleet MohammadBnei/pi-lab
+```
+
+The output depends only on the repos' heads, so the same heads print the same
+bytes. A repo that cannot be cloned gets an `unreadable` row and the exit code
+is 1. "Not found" means the pattern search found nothing, not that the
+mechanism is absent. Patterns live in `standard-status/main.go`.
+
+hq's weekly-review calls it once in its Sources step and pastes the output
+under a `## Standard status` heading in `reviews/YYYY-MM-DD.md`; the
+standard's §18 and §19 are updated from that. When `gh` is not authenticated
+the review writes `Standard status not generated`.
+
 ## Checks: go-checks, bun-checks, rust-checks, image-build, trailers
 
 Five least-privilege checks for a caller's `checks.yml`. Each runs on
