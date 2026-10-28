@@ -2,7 +2,7 @@
 
 Reusable GitHub Actions workflows (`on: workflow_call`) and composite actions
 shared by the ukubi app repos: image build, push and tag bump; Go, Bun and Rust
-checks; the commit-trailer check.
+checks; the commit-trailer check; releases.
 
 App repos call them pinned by commit sha:
 
@@ -100,6 +100,83 @@ Prerequisites per caller repo (infra-bootstrap
 - The repo on the `ci-oidc` identity's bound `repository` list. Under
   `workflow_call` the OIDC claims are the caller's. ukubi-ci itself must
   never be added there, and must never get a build runner.
+
+## release.yml
+
+Cuts a release from Conventional Commits with git-cliff 2.14.2 (sha256-pinned):
+the next semver since the last `X.Y.Z` or `vX.Y.Z` tag, its section prepended
+to the CHANGELOG, a `chore(release): <tag>` commit by `release-ci` on the
+default branch and an annotated tag, pushed together with `git push --atomic`
+(3 attempts, each from the fresh tip). Only `push` and `workflow_dispatch` on
+the default branch release; any other event, `pull_request` included, is a dry
+run that writes the would-be section to the step summary and pushes nothing.
+
+Chain it before image.yml: the image builds the release tag and carries the
+version as a label. The SHA tag still drives deploys.
+
+```yaml
+# .github/workflows/app.yml in the app repo
+jobs:
+  release:
+    permissions:
+      contents: write   # the CHANGELOG commit and the tag; needed on every event
+    uses: MohammadBnei/ukubi-ci/.github/workflows/release.yml@<40-char sha>
+  image:
+    needs: release
+    permissions:
+      contents: write
+      id-token: write
+    uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@<40-char sha>
+    with:
+      runs-on: ${{ github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["self-hosted","ukubi-build"]' }}
+      image: drop
+      ref: ${{ needs.release.outputs.tag }}            # empty on a dry run: the triggering commit
+      build-args: VERSION=${{ needs.release.outputs.version }}
+```
+
+```dockerfile
+ARG VERSION
+LABEL org.opencontainers.image.version=$VERSION
+```
+
+| input | default | |
+|---|---|---|
+| `config` | | git-cliff config. Empty: `cliff.toml` at the repo root if present, else this repo's [`cliff.toml`](cliff.toml) (embedded in release.yml). A non-empty path must exist |
+| `changelog` | `CHANGELOG.md` | created on the first release |
+
+| output | |
+|---|---|
+| `version` | `X.Y.Z`, no `v`: the release cut, or on a dry run the one that would be; with nothing to release, the last one |
+| `tag` | the tag at the released commit; empty on a dry run, or when nothing was released and the tip is untagged |
+| `released` | `true` when this run pushed a new tag |
+
+Rules:
+
+- One version line per repo. The tag pattern `^v?[0-9]+\.[0-9]+\.[0-9]+$` is
+  always passed on the command line; a caller's `tag_pattern` cannot change
+  it. The next tag keeps the last tag's prefix (`0.10.2` -> `0.10.3`); a repo
+  with no tag starts at `v0.1.0`. wird's app tags `vX.Y.Z` itself today: its
+  lane must make `release-app.yml` read this version instead of tagging, or
+  the two flows fight over one tag line.
+- Bumps: `feat` minor, anything else patch; a breaking change is a minor
+  bump at `0.x` and a major one from `1.0.0`. A Go module must not cross
+  `v1` -> `v2` this way without first changing its module path to `/v2`.
+- Not counted (and not listed): `chore(release)`, image.yml's
+  `chore(deploy)`, release-it's `chore: update helm image tag`, and merge
+  commits. Only those since the last tag: `released=false`, no commit.
+- Each commit is one line, its subject: never a body or trailers.
+- A caller's own template must print the version in its section; the step
+  fails if the version is not in the CHANGELOG diff (git-cliff exits 0 on a
+  write error).
+- A direct commit, not a PR: no caller protects its default branch. If one
+  does later, the atomic push fails with nothing pushed.
+- `GITHUB_TOKEN` pushes never trigger a run, so the release commit cannot
+  loop. The token reaches git only on the fetch and the push
+  (`http.extraheader`, masked) and is removed from the environment before
+  git-cliff runs; the checkout keeps no credentials.
+- `test/release.sh` runs the Release block against local repos only, and
+  ukubi-ci is public: real mode on a private repo is first proven by the first
+  private caller's run on its default branch.
 
 ## Checks: go-checks, bun-checks, rust-checks, image-build, trailers
 
