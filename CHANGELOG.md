@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 - 2026-10-28
+
+### Fixes
+
+- **standard-status:** Green CI, no leaked clones, tighter rules (#5)
+
 ## 0.2.0 - 2026-10-28
 
 ### Features
