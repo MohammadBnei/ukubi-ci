@@ -1,0 +1,299 @@
+# Build one image with buildah, push it to the Zot registry, then pin the tag
+# in the caller's helm values so ArgoCD rolls it out. Generalised from
+# drop/mountain/ukubi-bridge app.yml. Their gotchas, paid for once:
+#   - every buildah call is `sudo -n buildah`: the build-runner sudoers grants
+#     /usr/bin/buildah only, and anything else hangs on a password prompt
+#     (-n makes a missing grant fail at once instead)
+#   - --tls-verify=false on login AND push (plain HTTP; LE can't issue for .lan)
+#   - a per-job --authfile plus logout: every runner sudoes into the same root,
+#     so root's shared auth file would keep the password for later jobs
+#   - build BEFORE fetching the password: a broken Dockerfile fails on its own
+#     terms, and the password is never in the env while RUN steps execute
+#   - --layers, or buildah caches nothing; --pull=newer, or the base image
+#     stays at the patch the box first pulled (both inputs, default on)
+#   - the deploy job needs always() && result == 'success'
+#   - the bump pushes with GITHUB_TOKEN, which never triggers another run
+#
+# The caller's job must grant `contents: write` and `id-token: write`, also on
+# pull_request (GitHub checks nested permissions before any job starts).
+# Inputs reach scripts through env only, never inline ${{ }}.
+name: image
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: JSON list of runner labels for the build job, e.g. '["self-hosted","ukubi-build"]'.
+        type: string
+        required: true
+      image:
+        description: Image name under the registry, e.g. drop.
+        type: string
+        required: true
+      ref:
+        description: Git ref to build (a release tag). Empty builds the triggering commit.
+        type: string
+        default: ''
+      context:
+        description: Build context, relative to the repo root.
+        type: string
+        default: .
+      dockerfile:
+        description: Dockerfile path, relative to the repo root (not to context).
+        type: string
+        default: Dockerfile
+      target:
+        description: Optional multi-stage --target.
+        type: string
+        default: ''
+      build-args:
+        description: Multiline KEY=VALUE, one per line. Not secret; never put a secret here.
+        type: string
+        default: ''
+      layers:
+        description: Pass --layers (cache intermediate layers on the box).
+        type: boolean
+        default: true
+      pull-newer:
+        description: Pass --pull=newer (refresh the base image).
+        type: boolean
+        default: true
+      values-file:
+        description: Helm values file to bump on the default branch. Empty skips the deploy job.
+        type: string
+        default: helm/values.yaml
+      values-key:
+        description: yq path of the quoted tag value, two-space indented YAML.
+        type: string
+        default: .image.tag
+      registry:
+        type: string
+        default: registry.bnei.lan:5000
+    secrets:
+      build-secrets:
+        description: Multiline id=value; each becomes `--secret id=<id>` (RUN --mount=type=secret,id=<id>).
+        required: false
+    outputs:
+      tag:
+        description: The pushed image tag (12-character short sha).
+        value: ${{ jobs.build.outputs.tag }}
+
+env:
+  REGISTRY: ${{ inputs.registry }}
+  # Not a secret, and an empty secret cost agent-fleet a release once.
+  REGISTRY_USER: ci
+  IMAGE: ${{ inputs.image }}
+  # The registry password comes from the shared platform-commons project over
+  # GitHub OIDC (infra-bootstrap ADR-0049). Under workflow_call the claims are
+  # the CALLER's: the caller repo must be on the identity's repository list
+  # (build-runner-ops step 3), else "OIDC claim not allowed" / 401.
+  INFISICAL_DOMAIN: https://infisical.bnei.dev
+  INFISICAL_PROJECT_SLUG: platform-commons-76pb
+  INFISICAL_ENV: dev
+  INFISICAL_IDENTITY_ID: 19807471-d73a-48d4-9e58-1dc34255ef77
+
+jobs:
+  # Its own GitHub-hosted job, so a refused PR never lands on the shared box.
+  # An allowlist: a self-hosted runner matches on any of its labels (e.g.
+  # just "ukubi-build", or "Self-Hosted": labels are case-insensitive), so on
+  # pull_request every label must be a GitHub-hosted ubuntu-* one. This is a
+  # tripwire, not the boundary: a PR can edit the caller's app.yml to skip
+  # image.yml entirely. The boundary is the runner and repo settings
+  # (build-runner-ops: per-repo runners, fork PR approval).
+  guard:
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Refuse a non-GitHub-hosted runner on pull_request
+        env:
+          EVENT: ${{ github.event_name }}
+          RUNS_ON: ${{ inputs.runs-on }}
+        run: |
+          set -euo pipefail
+          # pull_request_target too: it runs with secrets, so building PR code there is worse.
+          case "$EVENT" in pull_request|pull_request_target) ;; *) exit 0 ;; esac
+          # jq missing or RUNS_ON not a JSON list also refuses (fail closed).
+          if ! jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and test("^ubuntu-"; "i"))' <<<"$RUNS_ON" >/dev/null 2>&1; then
+            echo "::error::pull_request must build on GitHub-hosted ubuntu-* runners only, not $RUNS_ON"; exit 1
+          fi
+
+  build:
+    needs: guard
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    concurrency:
+      group: ukubi-ci-image-${{ inputs.image }}-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      id-token: write # the Infisical OIDC login
+    outputs:
+      tag: ${{ steps.tag.outputs.value }}
+    steps:
+      - name: Check inputs
+        env:
+          VALUES_KEY: ${{ inputs.values-key }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE" =~ ^[a-z0-9][a-z0-9._/-]*$ ]] || { echo "::error::bad image name: $IMAGE"; exit 1; }
+          [[ "$VALUES_KEY" =~ ^(\.[A-Za-z0-9_-]+)+$ ]] || { echo "::error::bad values-key: $VALUES_KEY"; exit 1; }
+
+      # No token in .git/config: the context (often `.`) holds .git, and RUN
+      # steps or a `COPY . .` would see it on the shared box and in the image.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Compute the image tag
+        id: tag
+        run: echo "value=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      # The runner cannot install tools (sudo is buildah-only); the playbook does.
+      - name: Check buildah
+        run: command -v buildah || { echo "::error::buildah is not installed on this runner"; exit 1; }
+
+      - name: Build
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+          CONTEXT: ${{ inputs.context }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          TARGET: ${{ inputs.target }}
+          BUILD_ARGS: ${{ inputs.build-args }}
+          LAYERS: ${{ inputs.layers }}
+          PULL_NEWER: ${{ inputs.pull-newer }}
+          BUILD_SECRETS: ${{ secrets.build-secrets }}
+        run: |
+          set -euo pipefail
+          args=(--isolation chroot --format docker -f "$DOCKERFILE" -t "$REGISTRY/$IMAGE:$TAG")
+          [ "$LAYERS" = true ] && args+=(--layers)
+          [ "$PULL_NEWER" = true ] && args+=(--pull=newer)
+          [ -n "$TARGET" ] && args+=(--target "$TARGET")
+          while IFS= read -r a; do
+            [ -n "$a" ] && args+=(--build-arg "$a")
+          done <<< "$BUILD_ARGS"
+          sdir=$(mktemp -d); trap 'rm -rf "$sdir"' EXIT
+          while IFS= read -r s; do
+            [ -n "$s" ] || continue
+            id=${s%%=*}; val=${s#*=}
+            [[ "$id" =~ ^[A-Za-z0-9_.-]+$ && "$s" == *=* ]] || { echo "::error::build-secrets lines are id=value"; exit 1; }
+            echo "::add-mask::$val"
+            (umask 077; printf '%s' "$val" > "$sdir/$id")
+            args+=(--secret "id=$id,src=$sdir/$id")
+          done <<< "$BUILD_SECRETS"
+          sudo -n buildah bud "${args[@]}" "$CONTEXT"
+
+      # Only REGISTRY_PASSWORD, not the whole environment. The identity's bound
+      # claims allow push and workflow_dispatch only, so nothing else asks.
+      - name: Read the registry password from Infisical
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: Infisical/secrets-action@a663da43e1541832614bfd9dcf9ab67381ea2b98 # v1.0.12
+        with:
+          method: oidc
+          identity-id: ${{ env.INFISICAL_IDENTITY_ID }}
+          oidc-audience: infisical.bnei.dev
+          domain: ${{ env.INFISICAL_DOMAIN }}
+          project-slug: ${{ env.INFISICAL_PROJECT_SLUG }}
+          env-slug: ${{ env.INFISICAL_ENV }}
+          secret-path: /
+          secret-name: REGISTRY_PASSWORD
+          export-type: env
+
+      # GitHub masks only secrets.*; an unmasked Infisical value leaked a token
+      # in this estate once.
+      - name: Mask the fetched password
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: echo "::add-mask::$REGISTRY_PASSWORD"
+
+      - name: Registry login
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          [ -n "${REGISTRY_PASSWORD:-}" ] || { echo "::error::Infisical returned no REGISTRY_PASSWORD"; exit 1; }
+          printf '%s' "$REGISTRY_PASSWORD" | sudo -n buildah login \
+            --authfile "$RUNNER_TEMP/registry-auth.json" \
+            --tls-verify=false \
+            --username "$REGISTRY_USER" \
+            --password-stdin "$REGISTRY"
+
+      - name: Push
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          sudo -n buildah push --authfile "$RUNNER_TEMP/registry-auth.json" \
+            --tls-verify=false "$REGISTRY/$IMAGE:$TAG"
+
+      # Its own step, so a failed push does not leave the tag in the shared store.
+      - name: Remove the local image
+        if: always() && steps.tag.outputs.value != ''
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+        run: sudo -n buildah rmi "$REGISTRY/$IMAGE:$TAG" || true
+
+      # The runner user cannot sudo rm, but buildah can clear its own entry.
+      - name: Registry logout
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        run: sudo -n buildah logout --authfile "$RUNNER_TEMP/registry-auth.json" "$REGISTRY" || true
+
+  deploy:
+    needs: build
+    # Only push/dispatch on the default branch deploys; a branch dispatch builds.
+    if: >-
+      always() && needs.build.result == 'success'
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && inputs.values-file != ''
+      && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ukubi-ci-image-${{ inputs.image }}-deploy
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+      VALUES_FILE: ${{ inputs.values-file }}
+      VALUES_KEY: ${{ inputs.values-key }}
+      BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      # test/check.sh runs this block verbatim against fixtures; keep the name.
+      # yq -i would reformat most values files (drops blank lines), so a
+      # one-line sed does the edit and yq only reads it back.
+      - name: Bump the pinned image tag
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::bad image tag: '$TAG'"; exit 1; }
+          [ -f "$VALUES_FILE" ] || { echo "::error::$VALUES_FILE not found"; exit 1; }
+          # Re-run or rebuild of the deployed commit: nothing to bump, stay green.
+          if [ "$(yq "$VALUES_KEY" "$VALUES_FILE")" = "$TAG" ]; then
+            echo "::notice::$VALUES_FILE $VALUES_KEY is already $TAG"; exit 0
+          fi
+          leaf=${VALUES_KEY##*.}
+          dots=${VALUES_KEY//[^.]/}
+          indent=$(printf '%*s' $(( (${#dots} - 1) * 2 )) '')
+          orig=$(mktemp); cp "$VALUES_FILE" "$orig"
+          sed -i -E "s/^(${indent}${leaf}: \")[^\"]+(\")/\1${TAG}\2/" "$VALUES_FILE"
+          # Exactly one line changed: catches a no-op sed (green deploy, old
+          # image) and a second same-named key elsewhere.
+          [ "$(diff "$orig" "$VALUES_FILE" | grep -c '^[<>]')" = 2 ] \
+            || { echo "::error::tag bump must change exactly one line of $VALUES_FILE"; exit 1; }
+          [ "$(yq "$VALUES_KEY" "$VALUES_FILE")" = "$TAG" ] \
+            || { echo "::error::tag bump did not land on $VALUES_KEY in $VALUES_FILE"; exit 1; }
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git config user.name "$IMAGE-ci"
+          git config user.email "noreply@bnei.dev"
+          git add "$VALUES_FILE"
+          git diff --cached --quiet && exit 0
+          git commit -m "chore(deploy): bump $IMAGE image to $TAG"
+          # The default branch also takes local pushes; retry if it moves.
+          for _ in 1 2 3; do
+            git pull --rebase origin "$BRANCH" && git push origin "HEAD:$BRANCH" && exit 0
+            sleep 5
+          done
+          echo "::error::could not push the tag bump"; exit 1
