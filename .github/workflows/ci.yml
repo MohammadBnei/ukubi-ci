@@ -86,7 +86,8 @@ jobs:
     uses: ./.github/workflows/rust-checks.yml
     with:
       working-directory: test/fixture-rust
-      # Not an advisory against this crate; proves the --ignore path runs.
+      # Not an advisory against this crate (it has no dependencies): proves only
+      # that the flag parses. Blocking is tested by test/reusable.sh's fake cargo.
       audit-ignore: RUSTSEC-2026-0414
 
   image-build-self-test:

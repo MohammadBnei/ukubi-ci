@@ -97,15 +97,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install the pinned toolchain
-        run: rustup toolchain install
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          workspaces: ${{ inputs.working-directory }} -> target
-
+      # cargo audit only reads Cargo.lock, so this job ignores the repo pin:
+      # cargo-audit 0.22.2 needs rustc >= 1.88, which a caller's pin may predate.
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked --version 0.22.2
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          cargo +stable install cargo-audit --locked --version 0.22.2
 
       - name: Audit
         env:
@@ -119,4 +117,4 @@ jobs:
             [[ "$id" =~ ^RUSTSEC-[0-9]{4}-[0-9]{4}$ ]] || { echo "::error::audit-ignore lines are RUSTSEC-YYYY-NNNN, got '$id'"; exit 1; }
             args+=(--ignore "$id")
           done <<<"$AUDIT_IGNORE"
-          cargo audit ${args[@]+"${args[@]}"}
+          cargo +stable audit ${args[@]+"${args[@]}"}
