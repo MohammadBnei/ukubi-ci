@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: 1.7.12
+      SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      # A pinned release, checked by sha256. ubuntu-latest ships shellcheck,
+      # so actionlint also lints every run block.
+      - name: Install actionlint
+        run: |
+          set -euo pipefail
+          f="actionlint_${VERSION}_linux_amd64.tar.gz"
+          curl -sSfLo "$RUNNER_TEMP/$f" "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/$f"
+          echo "$SHA256  $RUNNER_TEMP/$f" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP" actionlint
+      - name: actionlint
+        run: |
+          command -v shellcheck
+          "$RUNNER_TEMP/actionlint" -color
+
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: shellcheck
+        run: shellcheck test/check.sh
+      - name: image.yml run blocks against fixtures
+        run: test/check.sh
+
+  # The real build path on a GitHub-hosted runner, build-only (pull_request
+  # skips Infisical, login, push and deploy). The grants are needed even so:
+  # GitHub checks the nested jobs' permissions before any job starts.
+  self-test:
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: write
+      id-token: write
+    uses: ./.github/workflows/image.yml
+    with:
+      runs-on: '["ubuntu-latest"]'
+      image: ukubi-ci-selftest
+      context: test/fixture
+      dockerfile: test/fixture/Dockerfile
+      build-args: PROBE=from-build-args
+      values-file: ''
+    secrets:
+      build-secrets: probe=from-build-secrets
