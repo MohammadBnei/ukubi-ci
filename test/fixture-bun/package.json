@@ -1,0 +1,16 @@
+{
+  "name": "ukubi-ci-fixture-bun",
+  "private": true,
+  "type": "module",
+  "description": "bun-checks.yml's self-test fixture. dist/ is committed on purpose so the freshness check reaches a real tracked dist.",
+  "packageManager": "bun@1.4.2",
+  "scripts": {
+    "build": "rm -rf dist && bun build src/index.ts --outdir dist --target browser --format esm",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "bun test ./src"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "typescript": "6.0.3"
+  }
+}

@@ -1,0 +1,118 @@
+# Go checks for one module: gofmt, go vet, go test -race, and optionally
+# golangci-lint and a vet tool (ukubicheck once it ships). The toolchain is
+# the one go.mod names. working-directory must be a module directory (a go.work
+# root that is not a module rejects `./...`). Inputs reach scripts through env
+# only, never inline ${{ }}.
+name: go-checks
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: The module directory, relative to the repo root.
+        type: string
+        default: .
+      golangci-lint-version:
+        description: e.g. v2.14.0. Empty skips golangci-lint.
+        type: string
+        default: ''
+      vettool:
+        description: A vet tool as pkg@vX.Y.Z, run with go vet -vettool. Empty skips.
+        type: string
+        default: ''
+      test-flags:
+        description: Extra go test flags after -race -count=1, e.g. '-p 1' for tests sharing one database.
+        type: string
+        default: ''
+      pre-test:
+        description: A shell command run at the repo root before go test, e.g. 'docker compose up -d --wait postgres'.
+        type: string
+        default: ''
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      # test/reusable.sh runs the named blocks below verbatim; keep the names.
+      - name: Check inputs
+        env:
+          LINT_VERSION: ${{ inputs.golangci-lint-version }}
+          VETTOOL: ${{ inputs.vettool }}
+          TEST_FLAGS: ${{ inputs.test-flags }}
+        run: |
+          set -euo pipefail
+          [ -f go.mod ] || { echo "::error::working-directory must be a Go module (no go.mod)"; exit 1; }
+          v='^v[0-9]+\.[0-9]+\.[0-9]+$'
+          [ -z "$LINT_VERSION" ] || [[ "$LINT_VERSION" =~ $v ]] \
+            || { echo "::error::golangci-lint-version must be vX.Y.Z, got '$LINT_VERSION'"; exit 1; }
+          t='^[A-Za-z0-9._~/-]+@v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          [ -z "$VETTOOL" ] || [[ "$VETTOOL" =~ $t ]] \
+            || { echo "::error::vettool must be pkg@vX.Y.Z (never @latest), got '$VETTOOL'"; exit 1; }
+          f='^[A-Za-z0-9 ._=,/:-]*$'
+          [[ "$TEST_FLAGS" =~ $f ]] || { echo "::error::test-flags has characters outside [A-Za-z0-9 ._=,/:-]"; exit 1; }
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: ${{ inputs.working-directory }}/go.mod
+          cache-dependency-path: ${{ inputs.working-directory }}/go.sum
+
+      # gofmt -l exits 0 on unformatted files, so the output is the check.
+      # -r: no .go files must not hang gofmt on stdin. vendor/ and testdata/
+      # are skipped, as ./... skips them.
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          out=$(git ls-files -z -- '*.go' ':!:vendor/*' ':!:testdata/*' ':!:*/testdata/*' | xargs -0 -r gofmt -l)
+          [ -z "$out" ] || { echo "::error::not gofmt-clean:"; echo "$out"; exit 1; }
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Pre-test
+        if: inputs.pre-test != ''
+        working-directory: .
+        env:
+          PRE_TEST: ${{ inputs.pre-test }}
+        run: bash -euo pipefail -c "$PRE_TEST"
+
+      - name: go test
+        env:
+          TEST_FLAGS: ${{ inputs.test-flags }}
+        run: |
+          set -euo pipefail
+          read -ra flags <<<"$TEST_FLAGS"
+          go test -race -count=1 ${flags[@]+"${flags[@]}"} ./...
+
+      # Built with the module's own toolchain; the module proxy and sumdb check it.
+      - name: golangci-lint
+        if: inputs.golangci-lint-version != ''
+        env:
+          LINT_VERSION: ${{ inputs.golangci-lint-version }}
+        run: |
+          set -euo pipefail
+          GOBIN="$RUNNER_TEMP/golangci" go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$LINT_VERSION"
+          "$RUNNER_TEMP/golangci/golangci-lint" run ./...
+
+      - name: go vet -vettool
+        if: inputs.vettool != ''
+        env:
+          VETTOOL: ${{ inputs.vettool }}
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/vettool"
+          GOBIN="$d" go install "$VETTOOL"
+          tool=$(find "$d" -type f)
+          if [ -z "$tool" ] || [ "$(wc -l <<<"$tool")" -ne 1 ]; then
+            echo "::error::expected one binary from $VETTOOL"; exit 1
+          fi
+          go vet -vettool="$tool" ./...
