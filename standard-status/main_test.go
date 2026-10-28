@@ -39,11 +39,17 @@ func TestScan(t *testing.T) {
 	write(t, n, ".github/workflows/ci.yml", "on:\n  push:\n")
 	write(t, n, ".github/workflows/trailers.yml", "jobs: {}")
 	write(t, n, "sub/CLAUDE.md", "Tier: service")
-	write(t, n, "CLAUDE.md", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+	write(t, n, "CLAUDE.md", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT\nTier:\n\nservice\n**Tier**: service")
 	for i, g := range scan(n) {
 		if g != "" {
 			t.Errorf("%s: unexpected %q", checks[i].name, g)
 		}
+	}
+}
+
+func TestRunEmptyStderr(t *testing.T) {
+	if _, err := run("sh", "-c", "exit 3"); err == nil || err.Error() == "" {
+		t.Fatalf("want a non-empty error, got %v", err)
 	}
 }
 

@@ -203,10 +203,16 @@ bytes. A repo that cannot be cloned gets an `unreadable` row and the exit code
 is 1. "Not found" means the pattern search found nothing, not that the
 mechanism is absent. Patterns live in `standard-status/main.go`.
 
-hq's weekly-review calls it once in its Sources step and pastes the output
-under a `## Standard status` heading in `reviews/YYYY-MM-DD.md`; the
-standard's §18 and §19 are updated from that. When `gh` is not authenticated
-the review writes `Standard status not generated`.
+The tier is read from the repo-root `CLAUDE.md`: a line that starts with
+`Tier:`, then spaces or tabs, then one word, e.g. `Tier: service`. Other
+spellings (`**Tier**: service`, the word on the next line) are reported as not
+found.
+
+Intended call convention: hq's weekly-review should call it once in its
+Sources step and paste the output under a `## Standard status` heading in
+`reviews/YYYY-MM-DD.md`, and the standard's §18 and §19 are updated from that.
+When `gh` is not authenticated the review should write `Standard status not
+generated`. That hq change is not part of this repo.
 
 ## Checks: go-checks, bun-checks, rust-checks, image-build, trailers
 

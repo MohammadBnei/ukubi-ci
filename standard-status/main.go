@@ -62,7 +62,7 @@ var checks = []check{
 			return "inline"
 		}}}},
 	{"Release workflow", "B3", []rule{r(workflow, `ukubi-ci/\.github/workflows/release\.yml@`)}},
-	{"Tier line", "§19", []rule{{func(p string) bool { return p == "CLAUDE.md" }, regexp.MustCompile(`(?m)^Tier:\s*(\w+)`),
+	{"Tier line", "§19", []rule{{func(p string) bool { return p == "CLAUDE.md" }, regexp.MustCompile(`(?m)^Tier:[ \t]*(\w+)`),
 		func(_ string, m []string) string { return m[1] }}}},
 }
 
@@ -168,7 +168,9 @@ func run(name string, args ...string) (string, error) {
 	if err != nil {
 		msg := err.Error()
 		if ee, ok := err.(*exec.ExitError); ok {
-			msg = strings.SplitN(strings.TrimSpace(string(ee.Stderr)), "\n", 2)[0]
+			if line := strings.SplitN(strings.TrimSpace(string(ee.Stderr)), "\n", 2)[0]; line != "" {
+				msg = line
+			}
 		}
 		return "", fmt.Errorf("%s", msg)
 	}
