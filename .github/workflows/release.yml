@@ -80,7 +80,9 @@ jobs:
       - name: Release
         id: release
         env:
-          TOKEN: ${{ github.token }}
+          # Only a real release gets the token; a dry run reads only.
+          TOKEN: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.token || '' }}
+          SHA: ${{ github.sha }}
           EVENT: ${{ github.event_name }}
           REF: ${{ github.ref }}
           BRANCH: ${{ github.event.repository.default_branch }}
@@ -171,12 +173,24 @@ jobs:
             exit 0
           fi
 
-          hdr="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$tok" | base64 | tr -d '\n')"
-          echo "::add-mask::$hdr"
+          # Mask the base64 itself: GitHub masks only the raw token.
+          b64=$(printf 'x-access-token:%s' "$tok" | base64 | tr -d '\n')
+          echo "::add-mask::$b64"
+          hdr="AUTHORIZATION: basic $b64"
+          # Commits past $SHA that trigger no run of their own (GITHUB_TOKEN pushes).
+          bots='^(chore\((release|deploy)\)|chore: update helm image tag)'
           for attempt in 1 2 3; do
-            # Always from the tip, so no commit is left out of the changelog.
             git -c http.extraheader="$hdr" fetch -q --tags origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
-            git reset -q --hard "refs/remotes/origin/$BRANCH"
+            # Release the commit whose checks gated this run, never newer work:
+            # a tip past it by anything but bot commits has its own queued run.
+            tip=refs/remotes/origin/$BRANCH
+            if ! git merge-base --is-ancestor "$SHA" "$tip" \
+              || git log --format=%s "$SHA..$tip" | grep -vE "$bots" >/dev/null; then
+              echo "::notice::$BRANCH moved past $SHA; the run for the newer commits releases them"
+              unchanged; exit 0
+            fi
+            # The tip, bot commits included, so the push fast-forwards.
+            git reset -q --hard "$tip"
             n=$(releasable)
             if [ "$n" = 0 ]; then unchanged; exit 0; fi
             t=$(next)
@@ -184,7 +198,8 @@ jobs:
             cliff --unreleased --tag "$t" --prepend "$CHANGELOG"
             git add -- "$CHANGELOG"
             # git-cliff exits 0 on an IO error: the version must have landed.
-            git diff --cached -U0 -- "$CHANGELOG" | grep '^+' | grep -qF "${t#v}" \
+            # No grep -q: exiting early SIGPIPEs the writers and pipefail fails it.
+            git diff --cached -U0 -- "$CHANGELOG" | grep '^+' | grep -F "${t#v}" >/dev/null \
               || { echo "::error::$t did not land in $CHANGELOG"; exit 1; }
             id=(-c user.name=release-ci -c user.email=noreply@bnei.dev)
             git "${id[@]}" commit -q -m "chore(release): $t"

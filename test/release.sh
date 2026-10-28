@@ -37,11 +37,11 @@ repo() {
 c() { as git -C "$D" commit -q --allow-empty -m "$1"; } # commit an empty change
 pushall() { git -C "$D" push -q --follow-tags origin HEAD:main 2>/dev/null; git -C "$D" push -q --tags origin 2>/dev/null; }
 remote() { git -C "$O" for-each-ref --format='%(refname) %(objectname)' | sort; }
-# rel [VAR=value ...]: run the block in $D; sets rc, out, version, tag, released.
+# rel [VAR=value ...]: run the block in $D (SHA defaults to its HEAD); sets rc, out, version, tag, released.
 rel() {
   : > "$T/gh-out"; : > "$T/summary"
   out=$(cd "$D" && env -u GIT_AUTHOR_NAME -u GIT_AUTHOR_EMAIL -u GIT_COMMITTER_NAME -u GIT_COMMITTER_EMAIL \
-    PATH="$T/bin:$PATH" TOKEN=s3cr3t-token EVENT=push REF=refs/heads/main BRANCH=main CONFIG='' CHANGELOG=CHANGELOG.md \
+    PATH="$T/bin:$PATH" TOKEN=s3cr3t-token SHA="$(git rev-parse HEAD)" EVENT=push REF=refs/heads/main BRANCH=main CONFIG='' CHANGELOG=CHANGELOG.md \
     GITHUB_OUTPUT="$T/gh-out" GITHUB_STEP_SUMMARY="$T/summary" "$@" bash "$T/rel.sh" 2>&1); rc=$?
   version=$(sed -n 's/^version=//p' "$T/gh-out"); tag=$(sed -n 's/^tag=//p' "$T/gh-out")
   released=$(sed -n 's/^released=//p' "$T/gh-out")
@@ -78,8 +78,9 @@ check "b: header first, new section, old entries kept as the tail" \
   "at_origin | head -1 | grep -qx '# Changelog' && at_origin | grep -q '^## 0.10.3 - ' && [ \"\$(at_origin | tail -n $(printf '%s' "$old" | wc -l | tr -d ' '))\" = \"\$(printf '%s' \"\$old\")\" ]"
 
 # (c) Bump table (dry runs).
+nc=0
 bump() { # name start-tag subject want-version
-  repo "c$RANDOM"; c 'chore: init'; [ -n "$2" ] && git -C "$D" tag "$2"; c "$3"; pushall
+  nc=$((nc + 1)); repo "c$nc"; c 'chore: init'; [ -n "$2" ] && git -C "$D" tag "$2"; c "$3"; pushall
   rel EVENT=pull_request REF=refs/pull/1/merge
   check "c: $1" "outs '$4||false'"
 }
@@ -118,18 +119,30 @@ rel EVENT=pull_request REF=refs/pull/1/merge
 check "e: multi-line commit -> one list line, no body or trailers" \
   "[ \"\$(grep -c 'Update the journal' '$T/summary')\" = 1 ] && grep -qx -- '- Update the journal' '$T/summary' && ! grep -qE 'private line|Agent-Session' '$T/summary'"
 
-# (f) Origin moves between attempt 1's fetch and its push: retry from the new tip.
+# (f) Origin moves between attempt 1's fetch and its push. race <subject>: the
+# shim commits <subject> to origin from a second clone on the first push.
+race() {
+  git clone -q "$O" "$T/$1-2" 2>/dev/null
+  printf '#!/bin/sh\ncase " $* " in *" push "*) if [ ! -e %s ]; then : > %s; ( cd %s && GIT_AUTHOR_NAME=o GIT_AUTHOR_EMAIL=o@o GIT_COMMITTER_NAME=o GIT_COMMITTER_EMAIL=o@o %s commit -q --allow-empty -m "%s" && %s push -q origin HEAD:main ); fi;; esac\nexec %s "$@"\n' \
+    "$T/raced-$1" "$T/raced-$1" "$T/$1-2" "$REALGIT" "$2" "$REALGIT" "$REALGIT" > "$T/bin/git"; chmod +x "$T/bin/git"
+  rel; rm "$T/bin/git"
+}
+# A bot commit (no run of its own) lands: retry from the new tip.
 repo f; c 'chore: init'; git -C "$D" tag 0.1.0; c 'fix: already unreleased'; pushall
-git clone -q "$O" "$T/f2" 2>/dev/null
-printf '#!/bin/sh\ncase " $* " in *" push "*) if [ ! -e %s ]; then : > %s; ( cd %s && GIT_AUTHOR_NAME=o GIT_AUTHOR_EMAIL=o@o GIT_COMMITTER_NAME=o GIT_COMMITTER_EMAIL=o@o %s commit -q --allow-empty -m "fix: injected" && %s push -q origin HEAD:main ); fi;; esac\nexec %s "$@"\n' \
-  "$T/raced" "$T/raced" "$T/f2" "$REALGIT" "$REALGIT" "$REALGIT" > "$T/bin/git"; chmod +x "$T/bin/git"
-rel
-rm "$T/bin/git"
-check "f: race -> released on attempt 2" "outs '0.1.1|0.1.1|true' && grep -q 'attempt 1' <<<\"\$out\""
-check "f: changelog lists the unreleased and the injected commit" \
-  "at_origin | grep -qx -- '- Already unreleased' && at_origin | grep -qx -- '- Injected'"
-check "f: tag on the release commit, above the injected one" \
-  "[ \"\$(git -C '$O' rev-parse '0.1.1^{commit}')\" = \"\$(git -C '$O' rev-parse main)\" ] && [ \"\$(git -C '$O' log -1 --format=%s main~1)\" = 'fix: injected' ]"
+race f 'chore(deploy): bump f image to 0123456789ab'
+check "f: bot commit races -> released on attempt 2" "outs '0.1.1|0.1.1|true' && grep -q 'attempt 1' <<<\"\$out\""
+check "f: changelog lists the unreleased commit" "at_origin | grep -qx -- '- Already unreleased'"
+check "f: tag on the release commit, above the bot commit" \
+  "[ \"\$(git -C '$O' rev-parse '0.1.1^{commit}')\" = \"\$(git -C '$O' rev-parse main)\" ] && [ \"\$(git -C '$O' log -1 --format=%s main~1)\" = 'chore(deploy): bump f image to 0123456789ab' ]"
+# A real commit lands: it has its own run, so this one releases nothing.
+repo f2; c 'chore: init'; git -C "$D" tag 0.1.0; c 'fix: already unreleased'; pushall
+race f2 'fix: injected'
+check "f: real commit races -> nothing released, origin has no new tag" \
+  "outs '0.1.0||false' && [ \"\$(git -C '$O' log -1 --format=%s main)\" = 'fix: injected' ] && [ \"\$(git -C '$O' tag)\" = 0.1.0 ]"
+# Origin already past the triggering commit: never release unchecked commits.
+repo f4; c 'chore: init'; c 'feat: x'; c 'fix: newer'; pushall; before=$(remote)
+rel SHA="$(git -C "$D" rev-parse HEAD~1)"
+check "f: tip ahead of SHA by a real commit -> nothing released" "outs '||false' && [ \"\$(remote)\" = \"\$before\" ]"
 # Reject once without origin moving: attempt 2 must not trip on its own local tag.
 repo f3; c 'chore: init'; c 'feat: x'; pushall
 printf '#!/bin/sh\nif [ ! -e %s ]; then : > %s; exit 1; fi\n' "$T/rej1" "$T/rej1" > "$O/hooks/pre-receive"; chmod +x "$O/hooks/pre-receive"
@@ -172,6 +185,13 @@ rel
 check "i: version not in the changelog diff -> fails, origin unchanged" \
   "[ '$rc' != 0 ] && grep -q 'did not land' <<<\"\$out\" && [ \"\$(remote)\" = \"\$before\" ]"
 
+# (i) A long changelog diff (well past a pipe buffer) still counts as landed.
+repo i2; c 'chore: init'; c 'feat: x'
+printf '[changelog]\nbody = "## {{ version }}\\n{%% for i in range(end=20000) %%}- line {{ i }} padding padding\\n{%% endfor %%}"\n[git]\nconventional_commits = true\n' > "$D/cliff.toml"
+git -C "$D" add cliff.toml; c 'chore: config'; pushall
+rel
+check "i: 600 KB section -> released" "outs '0.1.0|0.1.0|true'"
+
 # (l) The token is out of git-cliff's environment (postprocessors run commands).
 repo l; c 'chore: init'; c 'feat: x'
 printf '[changelog]\nbody = "## {{ version }}\\n"\npostprocessors = [{ pattern = "##", replace_command = "printf %%s \\"${TOKEN:-}\\" > %s; cat" }]\n[git]\nconventional_commits = true\n' "$T/leak" > "$D/cliff.toml"
@@ -190,6 +210,8 @@ check "k: no expression inside a run block" "! yq '.jobs[].steps[].run | select(
 check "k: checkout full history, persist-credentials false" \
   "[ \"\$(yq -o=json -I0 '.jobs.release.steps[0].with' '$WF')\" = '{\"fetch-depth\":0,\"persist-credentials\":false}' ]"
 check "k: install checks sha256" "step 'Install git-cliff' | grep -q 'sha256sum -c'"
+check "k: TOKEN only on a real release" \
+  "[ \"\$(yq '.jobs.release.steps[] | select(.name == \"Release\") | .env.TOKEN' '$WF')\" = \"\\\${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.token || '' }}\" ]"
 check "k: TOKEN only in the Release step" "[ \"\$(yq '[.jobs.release.steps[] | select(.env.TOKEN) | .name] | join(\",\")' '$WF')\" = Release ]"
 check "k: every fetch and push carries the auth header" \
   "[ \"\$(grep -cE 'git .*(fetch|push) ' '$T/rel.sh')\" = 2 ] && ! grep -E 'git .*(fetch|push) ' '$T/rel.sh' | grep -vq 'http.extraheader=\"\$hdr\"'"
