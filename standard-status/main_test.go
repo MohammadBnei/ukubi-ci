@@ -40,10 +40,29 @@ func TestScan(t *testing.T) {
 	write(t, n, ".github/workflows/trailers.yml", "jobs: {}")
 	write(t, n, "sub/CLAUDE.md", "Tier: service")
 	write(t, n, "CLAUDE.md", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT\nTier:\n\nservice\n**Tier**: service")
+	write(t, n, "main.rs", "tracing_subscriber::fmt().init();\nlet v = resp.json().await;")
+	write(t, n, "s.go", "srv := http.Server{ErrorLog: nil}\nx := y{ErrorLog:\n\tz}")
+	write(t, n, ".env.example", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=")
 	for i, g := range scan(n) {
 		if g != "" {
 			t.Errorf("%s: unexpected %q", checks[i].name, g)
 		}
+	}
+
+	o := t.TempDir() // the other accepted forms
+	write(t, o, "main.rs", "tracing_subscriber::fmt()\n    .with_env_filter(f)\n    .json()\n    .init();")
+	write(t, o, "s.go", "srv := http.Server{ErrorLog: nilLog}")
+	write(t, o, ".github/workflows/a.yaml", "on: [push, pull_request]\n# noreply@anthropic.com")
+	got := scan(o)
+	for i, w := range map[int]string{2: "main.rs", 3: "s.go", 6: ".github/workflows/a.yaml", 7: "inline"} {
+		if got[i] != w {
+			t.Errorf("%s: got %q, want %q", checks[i].name, got[i], w)
+		}
+	}
+	l := t.TempDir()
+	write(t, l, ".github/workflows/b.yml", "on:\n  - push\n  - pull_request\n")
+	if g := scan(l)[6]; g != ".github/workflows/b.yml" {
+		t.Errorf("PR CI list form: got %q", g)
 	}
 }
 
@@ -60,25 +79,28 @@ func TestRender(t *testing.T) {
 	}
 	full[tierIdx] = "service"
 	none := make([]string, len(checks))
+	pipe := make([]string, len(checks))
+	pipe[0] = "a|b_test.go"
 	got := render([]Result{
 		{Repo: "o/a", Head: "main@0123456789ab 2026-10-28", Found: full},
 		{Repo: "o/b", Head: "main@ba9876543210 2026-10-27", Found: none},
 		{Repo: "o/c", Err: "not found"},
+		{Repo: "o/d", Head: "h", Found: pipe},
 	})
 	want := `### §18 Mechanisms
 
 | Mechanism | § | Has it | Not found |
 |---|---|---|---|
-| Env-ban test | §5 | o/a (x) | o/b |
-| Key-registry test | §6 | o/a (x) | o/b |
-| JSON logger | §7 | o/a (x) | o/b |
-| ErrorLog | §7 | o/a (x) | o/b |
-| Traces opt-in | §7 | o/a (x) | o/b |
-| /metrics exposition test | §7 | o/a (x) | o/b |
-| PR CI | §9 | o/a (x) | o/b |
-| Trailer check | §9 | o/a (x) | o/b |
-| Release workflow | B3 | o/a (x) | o/b |
-| Tier line | §19 | o/a (service) | o/b |
+| Env-ban test | §5 | o/a (x), o/d (a\|b_test.go) | o/b |
+| Key-registry test | §6 | o/a (x) | o/b, o/d |
+| JSON logger | §7 | o/a (x) | o/b, o/d |
+| ErrorLog | §7 | o/a (x) | o/b, o/d |
+| Traces opt-in | §7 | o/a (x) | o/b, o/d |
+| /metrics exposition test | §7 | o/a (x) | o/b, o/d |
+| PR CI | §9 | o/a (x) | o/b, o/d |
+| Trailer check | §9 | o/a (x) | o/b, o/d |
+| Release workflow | B3 | o/a (x) | o/b, o/d |
+| Tier line | §19 | o/a (service) | o/b, o/d |
 
 ### §19 Repos
 
@@ -87,6 +109,7 @@ func TestRender(t *testing.T) {
 | o/a | service | main@0123456789ab 2026-10-28 | 10/10 |
 | o/b | - | main@ba9876543210 2026-10-27 | 0/10 |
 | o/c | unreadable | not found | - |
+| o/d | - | h | 1/10 |
 `
 	if got != want {
 		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
