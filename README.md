@@ -147,7 +147,7 @@ LABEL org.opencontainers.image.version=$VERSION
 | output | |
 |---|---|
 | `version` | `X.Y.Z`, no `v`: the release cut, or on a dry run the one that would be; with nothing to release, the last one |
-| `tag` | the tag at the released commit; empty on a dry run, or when nothing was released and the tip is untagged |
+| `tag` | the tag at the released commit; empty on a dry run, or when nothing was released and the tip is untagged. On a real release it is cut from the default branch's tip at release time, which can be ahead of the commit that triggered the run (commits whose CI has not finished yet) |
 | `released` | `true` when this run pushed a new tag |
 
 Rules:
@@ -174,6 +174,10 @@ Rules:
   loop. The token reaches git only on the fetch and the push
   (`http.extraheader`, masked) and is removed from the environment before
   git-cliff runs; the checkout keeps no credentials.
+- Runs queue per repo and ref (`cancel-in-progress: false`), so dry runs
+  never displace a real release. GitHub keeps one pending run per group: a
+  third push to the default branch cancels the pending second one, whose
+  commits the third run then releases (each run releases the tip).
 - `test/release.sh` runs the Release block against local repos only, and
   ukubi-ci is public: real mode on a private repo is first proven by the first
   private caller's run on its default branch.

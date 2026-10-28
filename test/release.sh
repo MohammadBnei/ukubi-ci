@@ -184,6 +184,7 @@ check "j: embedded config == cliff.toml" "diff <(awk \"/<<'CLIFF'/{f=1;next} /^C
 
 # (k) Shape.
 check "k: job permissions exactly contents: write" "[ \"\$(yq -o=json -I0 '.jobs.release.permissions' '$WF')\" = '{\"contents\":\"write\"}' ]"
+check "k: concurrency queues per ref, never cancels" "[ \"\$(yq -o=json -I0 '.jobs.release.concurrency' '$WF')\" = '{\"group\":\"ukubi-ci-release-\${{ github.repository }}-\${{ github.ref }}\",\"cancel-in-progress\":false}' ]"
 # shellcheck disable=SC2016 # a literal ${{, not a shell expansion
 check "k: no expression inside a run block" "! yq '.jobs[].steps[].run | select(. != null)' '$WF' | grep -qF '\${{'"
 check "k: checkout full history, persist-credentials false" \

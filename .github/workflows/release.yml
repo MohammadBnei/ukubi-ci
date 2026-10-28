@@ -45,8 +45,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # Keyed on the ref: a pull_request dry run must not take the one pending
+    # slot and cancel a queued real release on the default branch.
     concurrency:
-      group: ukubi-ci-release-${{ github.repository }}
+      group: ukubi-ci-release-${{ github.repository }}-${{ github.ref }}
       cancel-in-progress: false
     defaults:
       run:
@@ -176,7 +178,7 @@ jobs:
             git -c http.extraheader="$hdr" fetch -q --tags origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
             git reset -q --hard "refs/remotes/origin/$BRANCH"
             n=$(releasable)
-              if [ "$n" = 0 ]; then unchanged; exit 0; fi
+            if [ "$n" = 0 ]; then unchanged; exit 0; fi
             t=$(next)
             touch "$CHANGELOG"
             cliff --unreleased --tag "$t" --prepend "$CHANGELOG"
