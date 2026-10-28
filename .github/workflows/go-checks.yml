@@ -67,11 +67,12 @@ jobs:
           cache-dependency-path: ${{ inputs.working-directory }}/go.sum
 
       # gofmt -l exits 0 on unformatted files, so the output is the check.
-      # -r: no .go files must not hang gofmt on stdin.
+      # -r: no .go files must not hang gofmt on stdin. vendor/ and testdata/
+      # are skipped, as ./... skips them.
       - name: gofmt
         run: |
           set -euo pipefail
-          out=$(git ls-files -z '*.go' | xargs -0 -r gofmt -l)
+          out=$(git ls-files -z -- '*.go' ':!:vendor/*' ':!:testdata/*' ':!:*/testdata/*' | xargs -0 -r gofmt -l)
           [ -z "$out" ] || { echo "::error::not gofmt-clean:"; echo "$out"; exit 1; }
 
       - name: go vet

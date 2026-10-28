@@ -113,7 +113,6 @@ only. `test/reusable.sh` runs their run blocks against throwaway repos, and
 # .github/workflows/checks.yml in the app repo
 on:
   pull_request:
-    types: [opened, edited, synchronize, reopened]   # edited: re-check a title edit
   push:
     branches: [main]
 
@@ -135,6 +134,19 @@ jobs:
       image: hq
       context: app
       dockerfile: app/Dockerfile
+```
+
+```yaml
+# .github/workflows/trailers.yml in the app repo: its own file, so a title or
+# body edit re-runs only this cheap job, not the builds above.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]   # edited: re-check a title edit
+
+permissions:
+  contents: read
+
+jobs:
   trailers:
     uses: MohammadBnei/ukubi-ci/.github/workflows/trailers.yml@<40-char sha>
     with:
@@ -144,7 +156,7 @@ jobs:
 
 ### go-checks.yml
 
-gofmt (over `git ls-files '*.go'`), `go vet ./...`, `go test -race -count=1 ./...`,
+gofmt (over `git ls-files '*.go'`, minus `vendor/` and `testdata/`), `go vet ./...`, `go test -race -count=1 ./...`,
 with Go from the module's `go.mod`.
 
 | input | default | |
@@ -172,11 +184,11 @@ typecheck, test and the package's real build script.
 ### rust-checks.yml
 
 Two jobs. `check`: the toolchain `rust-toolchain.toml` names (required; asserted
-active), `cargo fmt --all --check`, `cargo clippy --locked --all-targets -- -D warnings`,
-`cargo test --locked`. `audit`: cargo-audit 0.22.2 built and run on stable, not
-the repo pin (it reads only `Cargo.lock`), blocking. The fixture crate has no
+active), `cargo fmt --all --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings`,
+`cargo test --locked --workspace`. `audit`: the cargo-audit 0.22.2 release binary, sha256-pinned,
+run without any toolchain (it reads only `Cargo.lock`), blocking. The fixture crate has no
 dependencies, so no advisory is ever hit in CI: the blocking exit and the
-`--ignore` arguments are verified only by `test/reusable.sh` against a fake `cargo`.
+`--ignore` arguments are verified only by `test/reusable.sh` against a fake `cargo-audit`.
 
 | input | default | |
 |---|---|---|

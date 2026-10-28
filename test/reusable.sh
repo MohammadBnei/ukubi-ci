@@ -116,6 +116,10 @@ fresh; c 'feat: ok'; CONV=true; TITLE='feat: add a thing (#12)'; tr_run 0 "squas
 fresh; c 'feat: ok'; TITLE='Add a thing'; tr_run 0 "bad PR title passes when conventional=false"
 fresh; c 'feat: ok'; BODY=$(printf 'Summary\n\nhttps://claude.ai/code/session_x'); tr_run 1 "PR body URL refused" "PR title or body"
 fresh; c 'feat: ok'; BODY=$(printf 'Summary\n\n🤖 Generated with [Claude Code](x)'); tr_run 1 "PR body footer refused" "PR title or body"
+fresh; c 'feat: ok'; BODY="Claude-Session: x"$'\n'"$(head -c 100000 /dev/zero | tr '\0' 'a' | fold -w 100)"
+tr_run 1 "large PR body with a banned first line refused (no SIGPIPE miss)" "PR title or body"
+fresh; c 'feat: ok'; BODY=$'Summary\r\n\r\nCo-Authored-By: ukubi-claude-macbook <noreply@bnei.dev>\r\n'; tr_run 0 "CRLF PR body with the ukubi agent trailer passes"
+fresh; c 'feat: ok'; BODY=$'Summary\r\nClaude-Session: x\r\n'; tr_run 1 "CRLF PR body with a banned line refused" "PR title or body"
 fresh; c 'add a thing'; EV=push; B=''; CONV=true; tr_run 0 "push event is a no-op" "no-op"
 fresh; c 'feat: ok'; B=''; tr_run 1 "empty BASE fails closed" "base and head"
 fresh; c 'feat: ok'; B=0123456789abcdef0123456789abcdef01234567; tr_run 1 "BASE not in the repo fails closed" "cannot list"
@@ -160,7 +164,7 @@ echo 'y' > "$P/dist/index.js"; dist_run 1 "modified tracked file refused"; git -
 echo 'z' > "$P/dist/chunk.js"; dist_run 1 "untracked file in dist refused"; rm "$P/dist/chunk.js"
 echo 'z' > "$P/elsewhere.txt"; dist_run 0 "a change outside dist is not dist's business"
 
-# 4. rust-checks: inputs, and the audit-ignore list (a fake cargo prints its args).
+# 4. rust-checks: inputs, and the audit-ignore list (a fake cargo-audit prints its args).
 extract rust-checks.yml "Check inputs" "$T/rust-in.sh"
 extract rust-checks.yml "Audit" "$T/audit.sh"
 C=$T/crate; mkdir -p "$C" "$T/bin"
@@ -174,21 +178,22 @@ rust_in 0 "apt protobuf-compiler libssl-dev passes" yes 'protobuf-compiler libss
 rust_in 1 "missing rust-toolchain.toml refused" no '' "rust-toolchain.toml is required"
 rust_in 1 "apt name with a ; refused" yes 'protobuf-compiler;id' "bad apt package"
 rust_in 1 "apt option refused" yes '-o Debug::x=1' "bad apt package"
-printf '#!/bin/sh\necho "cargo $*"\n' > "$T/bin/cargo"; chmod +x "$T/bin/cargo"
+: > "$C/src"; rust_in 1 "apt glob refused, not expanded" yes 's*' "bad apt package"; rm -f "$C/src"
+printf '#!/bin/sh\necho "cargo-audit $*"\n' > "$T/bin/cargo-audit"; chmod +x "$T/bin/cargo-audit"
 audit() { # want name ignore-list want-output-or-substring
   local rc=0 out; out=$(PATH="$T/bin:$PATH" AUDIT_IGNORE=$3 bash "$T/audit.sh" 2>&1) || rc=$?
   expect "$1" "audit-ignore: $2" "$rc" "$out" "$4"
   if [ "$1" = 0 ] && [ "$out" != "$4" ]; then bad "audit-ignore: $2: args '$out' want '$4'"; fi
 }
-audit 0 "empty runs plain cargo audit" '' 'cargo +stable audit'
+audit 0 "empty runs plain cargo audit" '' 'cargo-audit audit'
 audit 0 "two ids become --ignore args" "$(printf 'RUSTSEC-2026-0414\nRUSTSEC-2025-0001')" \
-  'cargo +stable audit --ignore RUSTSEC-2026-0414 --ignore RUSTSEC-2025-0001'
-audit 0 "blank lines and spaces skipped" "$(printf '\n  RUSTSEC-2026-0414  \n\n')" 'cargo +stable audit --ignore RUSTSEC-2026-0414'
+  'cargo-audit audit --ignore RUSTSEC-2026-0414 --ignore RUSTSEC-2025-0001'
+audit 0 "blank lines and spaces skipped" "$(printf '\n  RUSTSEC-2026-0414  \n\n')" 'cargo-audit audit --ignore RUSTSEC-2026-0414'
 audit 1 "short id refused" 'RUSTSEC-26-1' 'RUSTSEC-YYYY-NNNN'
 audit 1 "--json injection refused" '--json' 'RUSTSEC-YYYY-NNNN'
 audit 1 "id with a trailing option refused" 'RUSTSEC-2026-0414 --json' 'RUSTSEC-YYYY-NNNN'
 # Blocking control: a cargo that reports RUSTSEC-2026-0414 unless told to ignore it.
-printf '#!/bin/sh\ncase "$*" in *"--ignore RUSTSEC-2026-0414"*) exit 0;; esac\necho "error: 1 vulnerability found"; exit 1\n' > "$T/bin/cargo"
+printf '#!/bin/sh\ncase "$*" in *"--ignore RUSTSEC-2026-0414"*) exit 0;; esac\necho "error: 1 vulnerability found"; exit 1\n' > "$T/bin/cargo-audit"
 audit 1 "an advisory fails the job" '' 'vulnerability found'
 audit 1 "ignoring another id still fails" 'RUSTSEC-2025-0001' 'vulnerability found'
 audit 0 "ignoring that id passes" 'RUSTSEC-2026-0414' ''
@@ -220,6 +225,10 @@ if command -v go >/dev/null && command -v gofmt >/dev/null; then
   printf 'package m\n\nfunc F() int {\nreturn 1\n}\n' > "$M/m.go"
   gofmt_run 1 "unformatted tracked file refused" "m.go"
   printf 'package m\n\nfunc F() int { return 1 }\n' > "$M/m.go"
+  mkdir -p "$M/vendor/x" "$M/a/testdata"
+  printf 'package x\nfunc X(){\n}\n' > "$M/vendor/x/x.go"; printf 'package t\nfunc T(){\n}\n' > "$M/a/testdata/t.go"
+  git -C "$M" add vendor a; gofmt_run 0 "vendor/ and testdata/ skipped"
+  git -C "$M" rm -rq --cached vendor a; rm -rf "$M/vendor" "$M/a"
   vt_run() { local rc=0 out; out=$(cd "$M" && RUNNER_TEMP=$T/rt VETTOOL=golang.org/x/tools/go/analysis/passes/nilness/cmd/nilness@v0.52.0 bash "$T/vettool.sh" 2>&1) || rc=$?; expect "$1" "vettool: $2" "$rc" "$out" "${3:-}"; }
   vt_run 0 "nilness passes on clean code"
   printf 'package m\n\nfunc G(p *int) int {\n\tif p == nil {\n\t\treturn *p\n\t}\n\treturn 0\n}\n' > "$M/g.go"
