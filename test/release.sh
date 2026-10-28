@@ -99,7 +99,7 @@ git -C "$D" tag random; git -C "$D" tag v9.9.9-rc1; rel EVENT=pull_request REF=r
 check "c: tags 'random' and 'v9.9.9-rc1' ignored" "outs '0.3.1||false'"
 
 # (d) Only bot commits since the tag: nothing released, origin unchanged.
-repo d; c 'chore: init'; c 'feat: x'; git -C "$D" tag -a 0.3.0 -m 0.3.0
+repo d; c 'chore: init'; c 'feat: x'; as git -C "$D" tag -a 0.3.0 -m 0.3.0
 c 'chore(deploy): bump d image to 0123456789ab'; c 'chore(release): v0.9.9'; c 'chore: update helm image tag'
 c "Merge 1111111 into 2222222"; pushall; before=$(remote)
 rel
