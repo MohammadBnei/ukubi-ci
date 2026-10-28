@@ -110,7 +110,8 @@ jobs:
           RUNS_ON: ${{ inputs.runs-on }}
         run: |
           set -euo pipefail
-          [ "$EVENT" = pull_request ] || exit 0
+          # pull_request_target too: it runs with secrets, so building PR code there is worse.
+          case "$EVENT" in pull_request|pull_request_target) ;; *) exit 0 ;; esac
           # jq missing or RUNS_ON not a JSON list also refuses (fail closed).
           if ! jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and test("^ubuntu-"; "i"))' <<<"$RUNS_ON" >/dev/null 2>&1; then
             echo "::error::pull_request must build on GitHub-hosted ubuntu-* runners only, not $RUNS_ON"; exit 1
@@ -136,9 +137,12 @@ jobs:
           [[ "$IMAGE" =~ ^[a-z0-9][a-z0-9._/-]*$ ]] || { echo "::error::bad image name: $IMAGE"; exit 1; }
           [[ "$VALUES_KEY" =~ ^(\.[A-Za-z0-9_-]+)+$ ]] || { echo "::error::bad values-key: $VALUES_KEY"; exit 1; }
 
+      # No token in .git/config: the context (often `.`) holds .git, and RUN
+      # steps or a `COPY . .` would see it on the shared box and in the image.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
 
       - name: Compute the image tag
         id: tag

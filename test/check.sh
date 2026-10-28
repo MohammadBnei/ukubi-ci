@@ -6,7 +6,10 @@ set -uo pipefail
 WF=${1:-$(dirname "$0")/../.github/workflows/image.yml}
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 mkdir "$T/bin"
-if ! sed --version >/dev/null 2>&1; then ln -s "$(command -v gsed)" "$T/bin/sed"; fi
+if ! sed --version >/dev/null 2>&1; then
+  g=$(command -v gsed) || { echo "FAIL need GNU sed (gsed)"; exit 1; }
+  ln -s "$g" "$T/bin/sed"
+fi
 export PATH="$T/bin:$PATH"
 fails=0
 ok()   { echo "ok   $1"; }
@@ -39,6 +42,8 @@ pr 1 pull_request '["Self-Hosted","ukubi-build"]' "PR on mixed-case Self-Hosted 
 pr 1 pull_request '["ubuntu-latest","ukubi-build"]' "PR mixing ubuntu and a self-hosted label refused"
 pr 1 pull_request '[]'                            "PR on an empty list refused"
 pr 1 pull_request '"ubuntu-latest"'               "PR on a non-list refused"
+pr 1 pull_request_target '["self-hosted","ukubi-build"]' "pull_request_target on self-hosted refused"
+pr 0 pull_request_target '["ubuntu-latest"]'      "pull_request_target on ubuntu-latest passes"
 pr 0 workflow_dispatch '["ukubi-build"]'          "dispatch on a bare self-hosted label passes"
 
 # 3. The deploy bump. Each case: name, values-key, expected rc, expected

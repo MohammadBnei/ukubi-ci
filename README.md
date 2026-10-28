@@ -73,7 +73,7 @@ Output `tag`: the pushed tag.
 
 Rules:
 
-- On `pull_request`, a GitHub-hosted `guard` job refuses any `runs-on` label
+- On `pull_request` and `pull_request_target`, a GitHub-hosted `guard` job refuses any `runs-on` label
   that is not `ubuntu-*` before the build job is scheduled. It is a tripwire
   against a wrong `runs-on`, not the security boundary: a PR can edit the
   caller's own workflow and skip image.yml. The boundary is the runner and
