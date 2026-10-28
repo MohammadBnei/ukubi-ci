@@ -46,7 +46,10 @@ rel() {
   version=$(sed -n 's/^version=//p' "$T/gh-out"); tag=$(sed -n 's/^tag=//p' "$T/gh-out")
   released=$(sed -n 's/^released=//p' "$T/gh-out")
 }
-outs() { [ "$rc" = 0 ] && [ "$version|$tag|$released" = "$1" ] || { echo "     rc=$rc outputs '$version|$tag|$released' want '$1'"; echo "$out" | tail -5 | sed 's/^/     /'; return 1; }; }
+outs() {
+  if [ "$rc" = 0 ] && [ "$version|$tag|$released" = "$1" ]; then return 0; fi
+  echo "     rc=$rc outputs '$version|$tag|$released' want '$1'"; echo "$out" | tail -5 | sed 's/^/     /'; return 1
+}
 at_origin() { git -C "$O" show "main:${1:-CHANGELOG.md}" 2>/dev/null; }
 
 # (a) First release: no tags, a feat -> v0.1.0, commit + annotated tag on origin.
