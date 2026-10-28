@@ -35,7 +35,8 @@ jobs:
       id-token: write   # the Infisical OIDC login
     uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@<40-char sha>
     with:
-      # PRs build on GitHub-hosted runners; image.yml refuses self-hosted on PRs.
+      # PRs build on GitHub-hosted runners; on pull_request image.yml refuses
+      # any runs-on label that is not ubuntu-*.
       runs-on: ${{ github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["self-hosted","ukubi-build"]' }}
       image: drop
 ```
@@ -71,6 +72,12 @@ Secret `build-secrets` (optional): multiline `id=value`. Each becomes
 Output `tag`: the pushed tag.
 
 Rules:
+
+- On `pull_request`, a GitHub-hosted `guard` job refuses any `runs-on` label
+  that is not `ubuntu-*` before the build job is scheduled. It is a tripwire
+  against a wrong `runs-on`, not the security boundary: a PR can edit the
+  caller's own workflow and skip image.yml. The boundary is the runner and
+  repo configuration (per-repo build runners, fork PR approval).
 
 - Secrets go in `build-secrets`, never in `build-args` (those land in the
   log and the image history).

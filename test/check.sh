@@ -23,15 +23,23 @@ if grep -qwE 'yq|node|npx|apt-get' <<<"$step_runs"; then
   bad "build job: no yq/node/apt-get on the LXC"
 else ok "build job: no yq/node/apt-get on the LXC"; fi
 
-# 2. The pull_request / self-hosted refusal.
-step build "Refuse the self-hosted runner on pull_request" > "$T/pr.sh"
+# 2. The pull_request refusal: an allowlist of GitHub-hosted ubuntu-* labels.
+step guard "Refuse a non-GitHub-hosted runner on pull_request" > "$T/pr.sh"
+[ -s "$T/pr.sh" ] || { echo "FAIL extract guard block"; exit 1; }
 pr() { # want_rc event runs-on name
   local rc=0; EVENT=$2 RUNS_ON=$3 bash "$T/pr.sh" >/dev/null 2>&1 || rc=$?
   if [ "$rc" = "$1" ]; then ok "pr guard: $4"; else bad "pr guard: $4 (rc=$rc)"; fi
 }
 pr 0 pull_request '["ubuntu-latest"]'             "PR on ubuntu-latest passes"
 pr 0 push '["self-hosted","ukubi-build"]'         "push on self-hosted passes"
+pr 0 pull_request '["ubuntu-24.04"]'              "PR on ubuntu-24.04 passes"
 pr 1 pull_request '["self-hosted","ukubi-build"]' "PR on self-hosted refused"
+pr 1 pull_request '["ukubi-build"]'               "PR on a bare self-hosted label refused"
+pr 1 pull_request '["Self-Hosted","ukubi-build"]' "PR on mixed-case Self-Hosted refused"
+pr 1 pull_request '["ubuntu-latest","ukubi-build"]' "PR mixing ubuntu and a self-hosted label refused"
+pr 1 pull_request '[]'                            "PR on an empty list refused"
+pr 1 pull_request '"ubuntu-latest"'               "PR on a non-list refused"
+pr 0 workflow_dispatch '["ukubi-build"]'          "dispatch on a bare self-hosted label passes"
 
 # 3. The deploy bump. Each case: name, values-key, expected rc, expected
 #    error substring (or ""), file content; TAG is always 0123456789ab.

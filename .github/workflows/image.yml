@@ -93,7 +93,31 @@ env:
   INFISICAL_IDENTITY_ID: 19807471-d73a-48d4-9e58-1dc34255ef77
 
 jobs:
+  # Its own GitHub-hosted job, so a refused PR never lands on the shared box.
+  # An allowlist: a self-hosted runner matches on any of its labels (e.g.
+  # just "ukubi-build", or "Self-Hosted": labels are case-insensitive), so on
+  # pull_request every label must be a GitHub-hosted ubuntu-* one. This is a
+  # tripwire, not the boundary: a PR can edit the caller's app.yml to skip
+  # image.yml entirely. The boundary is the runner and repo settings
+  # (build-runner-ops: per-repo runners, fork PR approval).
+  guard:
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Refuse a non-GitHub-hosted runner on pull_request
+        env:
+          EVENT: ${{ github.event_name }}
+          RUNS_ON: ${{ inputs.runs-on }}
+        run: |
+          set -euo pipefail
+          [ "$EVENT" = pull_request ] || exit 0
+          # jq missing or RUNS_ON not a JSON list also refuses (fail closed).
+          if ! jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and test("^ubuntu-"; "i"))' <<<"$RUNS_ON" >/dev/null 2>&1; then
+            echo "::error::pull_request must build on GitHub-hosted ubuntu-* runners only, not $RUNS_ON"; exit 1
+          fi
+
   build:
+    needs: guard
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     concurrency:
       group: ukubi-ci-image-${{ inputs.image }}-${{ github.ref }}
@@ -104,18 +128,6 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.value }}
     steps:
-      # Before checkout: a PR's Dockerfile must never run as root on the
-      # shared box, whatever runs-on expression the caller wrote.
-      - name: Refuse the self-hosted runner on pull_request
-        env:
-          EVENT: ${{ github.event_name }}
-          RUNS_ON: ${{ inputs.runs-on }}
-        run: |
-          set -euo pipefail
-          if [ "$EVENT" = pull_request ] && [[ "$RUNS_ON" == *self-hosted* ]]; then
-            echo "::error::pull_request must build on a GitHub-hosted runner, not $RUNS_ON"; exit 1
-          fi
-
       - name: Check inputs
         env:
           VALUES_KEY: ${{ inputs.values-key }}
