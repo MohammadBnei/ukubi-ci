@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0 - 2026-10-28
+
+### Features
+
+- Standard status generator for §18/§19 (#4)
+
 ## 0.1.0 - 2026-10-28
 
 ### Features
