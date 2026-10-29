@@ -92,12 +92,13 @@ jobs:
           SCRIPT: ${{ inputs.build-script }}
         run: bun run "$SCRIPT"
 
-      # Porcelain also lists untracked files, so a new chunk not committed fails.
+      # Porcelain lists untracked and (--ignored) ignored files, so a new chunk
+      # not committed fails even when dist/ is gitignored and force-added.
       - name: Dist is fresh
         if: inputs.dist != ''
         env:
           DIST: ${{ inputs.dist }}
         run: |
           set -euo pipefail
-          out=$(git status --porcelain -- "$DIST")
+          out=$(git status --porcelain --ignored -- "$DIST")
           [ -z "$out" ] || { echo "::error::$DIST is stale; run the build and commit it:"; echo "$out"; exit 1; }
