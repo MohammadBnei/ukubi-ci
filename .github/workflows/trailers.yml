@@ -26,7 +26,7 @@ on:
         type: string
         default: ''
       agent-trailers:
-        description: "any (no rule), forbid (no agent Co-Authored-By or Agent-Session at all), pair (both well formed, or neither)."
+        description: "any (no rule), forbid (no agent Co-Authored-By or Agent-Session at all), pair (both well formed: ukubi-claude-<host> or ukubi-agent, or neither)."
         type: string
         default: any
       extra-banned:
@@ -127,11 +127,11 @@ jobs:
             who=$(git log -1 --format='%an <%ae>%n%cn <%ce>' "$c")
             if banned "$msg"$'\n'"$who"; then echo "::error::$c carries vendor attribution"; rc=1; fi
             co=0 ses=0
-            grep -Eiq '^co-authored-by:.*(claude|anthropic)' <<<"$msg" && co=1
+            grep -Eiq '^co-authored-by:(.*(claude|anthropic)| *ukubi-)' <<<"$msg" && co=1
             grep -Eiq '^agent-session:' <<<"$msg" && ses=1
             case "$AGENT_TRAILERS" in
               forbid) [ $((co + ses)) = 0 ] || { echo "::error::$c carries an agent trailer; this repo forbids them"; rc=1; } ;;
-              pair) if [ $((co + ses)) -gt 0 ] && ! { grep -Eq '^Co-Authored-By: ukubi-claude-[A-Za-z0-9-]+ <noreply@bnei\.dev>$' <<<"$msg" \
+              pair) if [ $((co + ses)) -gt 0 ] && ! { grep -Eq '^Co-Authored-By: ukubi-(claude-[A-Za-z0-9-]+|agent) <noreply@bnei\.dev>$' <<<"$msg" \
                         && grep -Eq '^Agent-Session: [^[:space:]]+$' <<<"$msg"; }; then
                       echo "::error::$c is an agent commit without both well-formed trailers"; rc=1
                     fi ;;
