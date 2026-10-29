@@ -103,6 +103,8 @@ jobs:
       build-secrets: probe=from-build-secrets
 
   # This PR's own commits, with this repo's rule. On push it is the no-op path.
+  # ponytail: ci.yml has no `edited` trigger, so the title check here is point
+  # in time; a title edited after the last push is not re-checked.
   trailers-self-test:
     permissions:
       contents: read
