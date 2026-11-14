@@ -69,7 +69,7 @@ hq-style layout (Dockerfile and context in a subdirectory):
 Secret `build-secrets` (optional): multiline `id=value`. Each becomes
 `--secret id=<id>`, read in the Dockerfile with
 `RUN --mount=type=secret,id=<id>`. Example: `build-secrets: github_token=${{ github.token }}`.
-Output `tag`: the pushed tag.
+Outputs: `tag`, the pushed tag; `digest`, the pushed manifest digest.
 
 Rules:
 
@@ -87,8 +87,13 @@ Rules:
 - A version label: pass it as a build-arg and set `ARG VERSION` +
   `LABEL org.opencontainers.image.version=$VERSION` in the Dockerfile.
 - The deploy job runs on `push` and `workflow_dispatch` on the default
-  branch only. A re-run where the values already hold the tag is a green
-  no-op. The bump changes exactly one line (no `yq -i`, which reformats).
+  branch only. It pins `<sha>@sha256:<digest>` (the chart renders
+  `repository:<value>`, which the kubelet pulls by digest), so a rebuild of
+  the same commit (base image CVE fix) rolls out. Builds are not
+  reproducible, so every rebuild (re-run all jobs, a second dispatch) gets a
+  new digest and redeploys; only re-running the deploy job alone, where the
+  values already hold that value, is a green no-op. An empty digest fails the
+  deploy. On a re-run (attempt > 1) the deploy is skipped (green, with a notice) when the commit already pinned in the values is a strict descendant of the built commit, so re-running an old run cannot roll back; a fresh dispatch always deploys, so a deliberate rollback is a dispatch with `ref`; an unknown pin deploys. Rare case: a stale re-run can displace a pending newer deploy in the concurrency group; dispatch again. Output `commit` is the full built sha. The bump changes exactly one line (no `yq -i`, which reformats).
 
 Prerequisites per caller repo (infra-bootstrap
 `.claude/skills/build-runner-ops/SKILL.md`):

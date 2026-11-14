@@ -47,15 +47,18 @@ pr 0 pull_request_target '["ubuntu-latest"]'      "pull_request_target on ubuntu
 pr 0 workflow_dispatch '["ukubi-build"]'          "dispatch on a bare self-hosted label passes"
 
 # 3. The deploy bump. Each case: name, values-key, expected rc, expected
-#    error substring (or ""), file content; TAG is always 0123456789ab.
+#    error substring (or ""), file content; TAG is 0123456789ab and DIGEST $D
+#    unless the optional 6th arg overrides the digest.
+D=sha256:$(printf 'a%.0s' {1..64})
 step deploy "Bump the pinned image tag" > "$T/bump.sh"
 [ -s "$T/bump.sh" ] || { echo "FAIL extract bump block"; exit 1; }
-bump() { # name key want_rc want_msg content
+bump() { # name key want_rc want_msg content [digest]
+  local dg=${6-$D} want="0123456789ab@${6-$D}"
   local d="$T/case" out rc; rm -rf "$d"; mkdir -p "$d"; [ "$5" = - ] || printf '%s' "$5" > "$d/values.yaml"
-  out=$(cd "$d" && TAG=0123456789ab VALUES_FILE=values.yaml VALUES_KEY=$2 bash "$T/bump.sh" 2>&1); rc=$?
+  out=$(cd "$d" && TAG=0123456789ab DIGEST=$dg VALUES_FILE=values.yaml VALUES_KEY=$2 bash "$T/bump.sh" 2>&1); rc=$?
   if [ "$rc" != "$3" ]; then bad "bump $1: rc=$rc want $3 ($out)"; return; fi
   if [ -n "$4" ] && [[ "$out" != *"$4"* ]]; then bad "bump $1: want '$4', got '$out'"; return; fi
-  if [ "$3" = 0 ] && [ "$(yq "$2" "$d/values.yaml")" != 0123456789ab ]; then bad "bump $1: tag not set"; return; fi
+  if [ "$3" = 0 ] && [ "$(yq "$2" "$d/values.yaml")" != "$want" ]; then bad "bump $1: tag not set"; return; fi
   ok "bump $1"
 }
 bump "head comments, blank lines, trailing comment" .image.tag 0 "" '# Values for the app.
@@ -70,9 +73,9 @@ image:
 service:
   port: 8080
 '
-bump "already at TAG stays green (re-run)" .image.tag 0 "already 0123456789ab" 'image:
-  tag: "0123456789ab"
-'
+bump "already at TAG stays green (re-run)" .image.tag 0 "already 0123456789ab@$D" "image:
+  tag: \"0123456789ab@$D\"
+"
 bump "depth-2 key .api.image.tag (indent derived from the key)" .api.image.tag 0 "" 'api:
   image:
     tag: "aaaaaaaaaaaa"
@@ -96,6 +99,52 @@ image:
   tag: aaaaaaaaaaaa
 '
 bump "missing file refused" .image.tag 1 "not found" -
+bump "same sha, new digest bumps" .image.tag 0 "" "image:
+  tag: \"0123456789ab@sha256:$(printf 'b%.0s' {1..64})\"
+"
+bump "old bare-sha value bumps to sha@digest" .image.tag 0 "" 'image:
+  tag: "0123456789ab"
+'
+bump "empty digest fails" .image.tag 1 "digest missing or malformed" 'image:
+  tag: "x"
+' ""
+bump "uppercase digest refused" .image.tag 1 "digest missing or malformed" 'image:
+  tag: "x"
+' "sha256:$(printf 'A%.0s' {1..64})"
+bump "63-hex digest refused" .image.tag 1 "digest missing or malformed" 'image:
+  tag: "x"
+' "sha256:$(printf 'a%.0s' {1..63})"
+bump "sha512 digest refused" .image.tag 1 "digest missing or malformed" 'image:
+  tag: "x"
+' "sha512:$(printf 'a%.0s' {1..64})"
+
+# 4. The stale-run guard, against a throwaway remote. History: A, B (built
+#    commits), a docs commit, then the bot's bump commit pinning B.
+step deploy "Skip a stale run" > "$T/fresh.sh"
+[ -s "$T/fresh.sh" ] || { echo "FAIL extract guard block"; exit 1; }
+g="$T/g"; git init -q --bare "$g/remote.git" -b main; git clone -q "$g/remote.git" "$g/w" 2>/dev/null
+c() { git -C "$g/w" commit -q --allow-empty -m "$1"; git -C "$g/w" rev-parse HEAD; }
+git -C "$g/w" config user.name t; git -C "$g/w" config user.email t@t; git -C "$g/w" checkout -q -b main
+A=$(c "feat: a"); B=$(c "feat: b"); DOC=$(c "docs: x")
+pin() { printf 'image:\n  tag: "%s"\n' "$1" > "$g/w/values.yaml"; }
+pin "${B:0:12}@$D"; c "chore(deploy): bump app image" >/dev/null; git -C "$g/w" push -q origin main
+guard() { # name built-sha pinned-value want [attempt] [clone]
+  local w="${6:-$g/w}" bt=$2; : > "$T/out"; pin "$3"; [ "$w" = "$g/w" ] || cp "$g/w/values.yaml" "$w/"
+  (cd "$w" && BUILT=$bt GITHUB_RUN_ATTEMPT=${5:-2} BRANCH=main VALUES_FILE=values.yaml VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >/dev/null 2>&1)
+  if grep -qx "ok=$4" "$T/out"; then ok "guard $1"; else bad "guard $1: $(cat "$T/out")"; fi
+}
+git clone -q --depth 1 "file://$g/remote.git" "$g/shallow" 2>/dev/null
+for w in "$g/w" "$g/shallow"; do
+  n=$([ "$w" = "$g/w" ] && echo full || echo shallow)
+  guard "[$n] dispatch with HEAD on a bump commit deploys (same commit, new digest)" "$B" "${B:0:12}@sha256:$(printf 'c%.0s' {1..64})" true 2 "$w"
+  guard "[$n] docs commit after the built sha deploys" "$DOC" "${B:0:12}@$D" true 2 "$w"
+  guard "[$n] old run re-run (attempt 2, pinned is a descendant) skips" "$A" "${B:0:12}@$D" false 2 "$w"
+  guard "[$n] fresh dispatch of an old sha (attempt 1) deploys" "$A" "${B:0:12}@$D" true 1 "$w"
+  guard "[$n] unknown pin deploys" "$B" "ffffffffffff@$D" true 2 "$w"
+done
+: > "$T/out"; pin "${B:0:12}@$D"
+if (cd "$g/w" && BUILT=abc BRANCH=main VALUES_FILE=values.yaml VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >"$T/m" 2>&1); then bad "guard malformed BUILT must fail"
+elif grep -q "built commit missing or malformed" "$T/m"; then ok "guard malformed BUILT fails closed"; else bad "guard malformed BUILT: $(cat "$T/m")"; fi
 
 echo "failures: $fails"
 [ "$fails" = 0 ]
