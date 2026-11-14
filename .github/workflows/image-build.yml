@@ -87,6 +87,7 @@ jobs:
           [ "$LAYERS" = true ] && args+=(--layers)
           [ "$PULL_NEWER" = true ] && args+=(--pull=newer)
           [ -n "$TARGET" ] && args+=(--target "$TARGET")
+          [ -n "${VERSION_ARG:-}" ] && args+=(--build-arg "$VERSION_ARG")
           while IFS= read -r a; do
             [ -n "$a" ] && args+=(--build-arg "$a")
           done <<< "$BUILD_ARGS"

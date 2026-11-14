@@ -62,7 +62,11 @@ hq-style layout (Dockerfile and context in a subdirectory):
 | `build-args` | | multiline `KEY=VALUE`; logged, never a secret |
 | `layers` | `true` | `--layers` (large images may want `false`: layers stay on the shared disk until the weekly prune) |
 | `pull-newer` | `true` | `--pull=newer` |
-| `values-file` | `helm/values.yaml` | empty skips the deploy job |
+| `values-file` | `helm/values.yaml` | empty (with `values-files` empty) skips the deploy job |
+| `values-files` | | several values files, newline or space separated, each pinning `values-key`; one bump commit. Replaces `values-file` when set. The stale-run guard reads the first; a file already at the pin is skipped, and no file changed means no commit |
+| `version-arg` | `false` | pass `--build-arg VERSION`: `X.Y.Z` when `ref` is a release tag, else `X.Y.Z+<sha12>` on the default branch, else `X.Y.Z-dev+<sha12>` (`0.0.0` before the first release) |
+| `version` | | release.yml's `version` output; needs `version-arg`. Must be `X.Y.Z`, or empty with an empty `ref` |
+| `cancel-in-progress` | `true` | build concurrency; `false` queues builds (release callers: the tag is pushed before the image builds). The deploy group never cancels |
 | `values-key` | `.image.tag` | yq path; the value must be double-quoted, two-space indented |
 | `registry` | `registry.bnei.lan:5000` | |
 
@@ -136,7 +140,8 @@ jobs:
       runs-on: ${{ github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["self-hosted","ukubi-build"]' }}
       image: drop
       ref: ${{ needs.release.outputs.tag }}            # empty on a dry run: the triggering commit
-      build-args: VERSION=${{ needs.release.outputs.version }}
+      version-arg: true
+      version: ${{ needs.release.outputs.version }}
 ```
 
 ```dockerfile

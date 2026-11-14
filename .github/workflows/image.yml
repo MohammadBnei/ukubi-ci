@@ -59,9 +59,33 @@ on:
         type: boolean
         default: true
       values-file:
-        description: Helm values file to bump on the default branch. Empty skips the deploy job.
+        description: Helm values file to bump on the default branch. Empty (with values-files empty) skips the deploy job.
         type: string
         default: helm/values.yaml
+      values-files:
+        description: >-
+          Several values files, newline or space separated, each pinning the same
+          values-key; bumped in one commit. When set it replaces values-file. The
+          stale-run guard reads the pin from the first one.
+        type: string
+        default: ''
+      version:
+        description: >-
+          The release version (X.Y.Z, release.yml's `version` output) for the
+          VERSION build arg. Used only with version-arg; empty is valid only
+          with an empty ref (no release exists yet).
+        type: string
+        default: ''
+      version-arg:
+        description: >-
+          Pass --build-arg VERSION: ref's release as X.Y.Z, else X.Y.Z+sha12 on
+          the default branch, else X.Y.Z-dev+sha12 (0.0.0 before the first release).
+        type: boolean
+        default: false
+      cancel-in-progress:
+        description: Cancel an older build of the same image and ref when a newer one starts. false queues (a release callers' tag is pushed before the build).
+        type: boolean
+        default: true
       values-key:
         description: yq path of the quoted tag value, two-space indented YAML.
         type: string
@@ -128,7 +152,7 @@ jobs:
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     concurrency:
       group: ukubi-ci-image-${{ inputs.image }}-${{ github.ref }}
-      cancel-in-progress: true
+      cancel-in-progress: ${{ inputs.cancel-in-progress }}
     permissions:
       contents: read
       id-token: write # the Infisical OIDC login
@@ -161,6 +185,33 @@ jobs:
         id: commit
         run: echo "value=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      # Mirrors drop/hq/wird/stt: an empty or misnamed version would ship
+      # VERSION "" silently, so it must be X.Y.Z, or empty with no release ref.
+      # Read by the Build step through GITHUB_ENV (its text must stay identical
+      # to image-build.yml's, which has no such step).
+      - name: Compute the build version
+        if: inputs.version-arg
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+          VERSION: ${{ inputs.version }}
+          RELEASE_TAG: ${{ inputs.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || ( -z "$VERSION" && -z "$RELEASE_TAG" ) ]] \
+            || { echo "::error::bad version '$VERSION' (ref '$RELEASE_TAG'): pass release.yml's version output"; exit 1; }
+          # No release ref: this commit is not a release. On the default branch
+          # VERSION is the last release, so X.Y.Z+<sha>, or 0.0.0+<sha> before
+          # the first. Elsewhere it is a dry run: X.Y.Z-dev+<sha>.
+          if [ -z "$RELEASE_TAG" ]; then
+            if [ "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH" ]; then
+              VERSION="${VERSION:-0.0.0}+$TAG"
+            else
+              VERSION="${VERSION:-0.0.0}-dev+$TAG"
+            fi
+          fi
+          echo "VERSION_ARG=VERSION=$VERSION" >> "$GITHUB_ENV"
+
       # The runner cannot install tools (sudo is buildah-only); the playbook does.
       - name: Check buildah
         run: command -v buildah || { echo "::error::buildah is not installed on this runner"; exit 1; }
@@ -181,6 +232,7 @@ jobs:
           [ "$LAYERS" = true ] && args+=(--layers)
           [ "$PULL_NEWER" = true ] && args+=(--pull=newer)
           [ -n "$TARGET" ] && args+=(--target "$TARGET")
+          [ -n "${VERSION_ARG:-}" ] && args+=(--build-arg "$VERSION_ARG")
           while IFS= read -r a; do
             [ -n "$a" ] && args+=(--build-arg "$a")
           done <<< "$BUILD_ARGS"
@@ -260,7 +312,7 @@ jobs:
     if: >-
       always() && needs.build.result == 'success'
       && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-      && inputs.values-file != ''
+      && (inputs.values-files != '' || inputs.values-file != '')
       && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     concurrency:
@@ -272,7 +324,7 @@ jobs:
       TAG: ${{ needs.build.outputs.tag }}
       DIGEST: ${{ needs.build.outputs.digest }}
       BUILT: ${{ needs.build.outputs.commit }}
-      VALUES_FILE: ${{ inputs.values-file }}
+      VALUES_FILES: ${{ inputs.values-files != '' && inputs.values-files || inputs.values-file }}
       VALUES_KEY: ${{ inputs.values-key }}
       BRANCH: ${{ github.event.repository.default_branch }}
     steps:
@@ -291,7 +343,8 @@ jobs:
           set -euo pipefail
           [[ "$BUILT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::built commit missing or malformed ('$BUILT')"; exit 1; }
           [ "$(git rev-parse --is-shallow-repository)" = true ] && git fetch -q --unshallow origin "$BRANCH" || true
-          p=$(yq "$VALUES_KEY" "$VALUES_FILE" 2>/dev/null || true); p=${p%%@*}
+          read -ra files <<< "${VALUES_FILES//$'\n'/ }"
+          p=$(yq "$VALUES_KEY" "${files[0]}" 2>/dev/null || true); p=${p%%@*}
           pc=$(git rev-parse -q --verify "$p^{commit}" 2>/dev/null || true)
           if [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ] && [ -n "$pc" ] && [ "$pc" != "$BUILT" ] && git merge-base --is-ancestor "$BUILT" "$pc"; then
             echo "ok=false" >> "$GITHUB_OUTPUT"
@@ -316,24 +369,30 @@ jobs:
             || { echo "::error::push digest missing or malformed ('$DIGEST'): the build job's digest output was empty or dropped"; exit 1; }
           TAG="$TAG@$DIGEST"
           echo "PINNED=$TAG" >> "${GITHUB_ENV:-/dev/null}"
-          [ -f "$VALUES_FILE" ] || { echo "::error::$VALUES_FILE not found"; exit 1; }
-          # Same sha and digest: nothing to bump. buildah bud is not reproducible
-          # (created timestamp), so any rebuild gets a new digest and redeploys;
-          # only re-running this deploy job alone lands here.
-          if [ "$(yq "$VALUES_KEY" "$VALUES_FILE")" = "$TAG" ]; then
-            echo "::notice::$VALUES_FILE $VALUES_KEY is already $TAG"; exit 0
-          fi
+          read -ra files <<< "${VALUES_FILES//$'\n'/ }"
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::no values file"; exit 1; }
           leaf=${VALUES_KEY##*.}
           dots=${VALUES_KEY//[^.]/}
           indent=$(printf '%*s' $(( (${#dots} - 1) * 2 )) '')
-          orig=$(mktemp); cp "$VALUES_FILE" "$orig"
-          sed -i -E "s/^(${indent}${leaf}: \")[^\"]+(\")/\1${TAG}\2/" "$VALUES_FILE"
-          # Exactly one line changed: catches a no-op sed (green deploy, old
-          # image) and a second same-named key elsewhere.
-          [ "$(diff "$orig" "$VALUES_FILE" | grep -c '^[<>]')" = 2 ] \
-            || { echo "::error::tag bump must change exactly one line of $VALUES_FILE"; exit 1; }
-          [ "$(yq "$VALUES_KEY" "$VALUES_FILE")" = "$TAG" ] \
-            || { echo "::error::tag bump did not land on $VALUES_KEY in $VALUES_FILE"; exit 1; }
+          for f in "${files[@]}"; do
+            [[ "$f" =~ ^[A-Za-z0-9._/-]+$ && "$f" != /* && "/$f/" != *"/../"* ]] \
+              || { echo "::error::bad values file: '$f'"; exit 1; }
+            [ -f "$f" ] || { echo "::error::$f not found"; exit 1; }
+            # Same sha and digest: nothing to bump. buildah bud is not reproducible
+            # (created timestamp), so any rebuild gets a new digest and redeploys;
+            # only re-running this deploy job alone lands here.
+            if [ "$(yq "$VALUES_KEY" "$f")" = "$TAG" ]; then
+              echo "::notice::$f $VALUES_KEY is already $TAG"; continue
+            fi
+            orig=$(mktemp); cp "$f" "$orig"
+            sed -i -E "s/^(${indent}${leaf}: \")[^\"]+(\")/\1${TAG}\2/" "$f"
+            # Exactly one line changed: catches a no-op sed (green deploy, old
+            # image) and a second same-named key elsewhere.
+            [ "$(diff "$orig" "$f" | grep -c '^[<>]')" = 2 ] \
+              || { echo "::error::tag bump must change exactly one line of $f"; exit 1; }
+            [ "$(yq "$VALUES_KEY" "$f")" = "$TAG" ] \
+              || { echo "::error::tag bump did not land on $VALUES_KEY in $f"; exit 1; }
+          done
 
       - name: Commit and push
         if: steps.fresh.outputs.ok == 'true'
@@ -341,7 +400,8 @@ jobs:
           set -euo pipefail
           git config user.name "$IMAGE-ci"
           git config user.email "noreply@bnei.dev"
-          git add "$VALUES_FILE"
+          read -ra files <<< "${VALUES_FILES//$'\n'/ }"
+          git add -- "${files[@]}"
           git diff --cached --quiet && exit 0
           git commit -m "chore(deploy): bump $IMAGE image to $PINNED"
           # The default branch also takes local pushes; retry if it moves.
