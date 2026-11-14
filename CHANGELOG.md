@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.0 - 2026-11-14
+
+### Features
+
+- **image:** Push-default-branch-only and extra-tags inputs (#11)
+
 ## 0.5.0 - 2026-11-14
 
 ### Features
