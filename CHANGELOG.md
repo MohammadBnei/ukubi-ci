@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0 - 2026-11-14
+
+### Features
+
+- **image:** Version build arg, cancel-in-progress and values-files inputs (#7)
+
 ## 0.2.2 - 2026-11-14
 
 ### Fixes
