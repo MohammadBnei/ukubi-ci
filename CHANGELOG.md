@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0 - 2026-11-14
+
+### Features
+
+- **checks:** Govulncheck input for go-checks, lint-script input for bun-checks (#9)
+
+### Fixes
+
+- **image:** Cap job runtimes and keep only the registry password (#8)
+
 ## 0.3.0 - 2026-11-14
 
 ### Features
