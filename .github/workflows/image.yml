@@ -77,6 +77,9 @@ on:
       tag:
         description: The pushed image tag (12-character short sha).
         value: ${{ jobs.build.outputs.tag }}
+      digest:
+        description: The pushed manifest digest (sha256:...); empty when nothing was pushed.
+        value: ${{ jobs.build.outputs.digest }}
 
 env:
   REGISTRY: ${{ inputs.registry }}
@@ -128,6 +131,7 @@ jobs:
       id-token: write # the Infisical OIDC login
     outputs:
       tag: ${{ steps.tag.outputs.value }}
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - name: Check inputs
         env:
@@ -215,13 +219,18 @@ jobs:
             --username "$REGISTRY_USER" \
             --password-stdin "$REGISTRY"
 
+      # The digest is what the deploy pins: a rebuild of the same commit (base
+      # image CVE fix) keeps the sha tag but gets a new digest.
       - name: Push
+        id: push
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         env:
           TAG: ${{ steps.tag.outputs.value }}
         run: |
+          set -euo pipefail
           sudo -n buildah push --authfile "$RUNNER_TEMP/registry-auth.json" \
-            --tls-verify=false "$REGISTRY/$IMAGE:$TAG"
+            --tls-verify=false --digestfile "$RUNNER_TEMP/digest" "$REGISTRY/$IMAGE:$TAG"
+          echo "digest=$(cat "$RUNNER_TEMP/digest")" >> "$GITHUB_OUTPUT"
 
       # Its own step, so a failed push does not leave the tag in the shared store.
       - name: Remove the local image
@@ -250,7 +259,10 @@ jobs:
     permissions:
       contents: write
     env:
-      TAG: ${{ needs.build.outputs.tag }}
+      # <sha>@<digest>: the chart renders repository:<this>, a valid reference
+      # that the kubelet pulls by digest, so a same-sha rebuild rolls out even
+      # under pullPolicy IfNotPresent. Empty digest (nothing pushed) = bare sha.
+      TAG: ${{ needs.build.outputs.tag }}${{ needs.build.outputs.digest && format('@{0}', needs.build.outputs.digest) || '' }}
       VALUES_FILE: ${{ inputs.values-file }}
       VALUES_KEY: ${{ inputs.values-key }}
       BRANCH: ${{ github.event.repository.default_branch }}
@@ -265,9 +277,9 @@ jobs:
       - name: Bump the pinned image tag
         run: |
           set -euo pipefail
-          [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::bad image tag: '$TAG'"; exit 1; }
+          [[ "$TAG" =~ ^[A-Za-z0-9._-]+(@sha256:[0-9a-f]{64})?$ ]] || { echo "::error::bad image tag: '$TAG'"; exit 1; }
           [ -f "$VALUES_FILE" ] || { echo "::error::$VALUES_FILE not found"; exit 1; }
-          # Re-run or rebuild of the deployed commit: nothing to bump, stay green.
+          # Re-run of the deployed build (same sha and digest): nothing to bump, stay green.
           if [ "$(yq "$VALUES_KEY" "$VALUES_FILE")" = "$TAG" ]; then
             echo "::notice::$VALUES_FILE $VALUES_KEY is already $TAG"; exit 0
           fi

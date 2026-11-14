@@ -69,7 +69,7 @@ hq-style layout (Dockerfile and context in a subdirectory):
 Secret `build-secrets` (optional): multiline `id=value`. Each becomes
 `--secret id=<id>`, read in the Dockerfile with
 `RUN --mount=type=secret,id=<id>`. Example: `build-secrets: github_token=${{ github.token }}`.
-Output `tag`: the pushed tag.
+Outputs: `tag`, the pushed tag; `digest`, the pushed manifest digest.
 
 Rules:
 
@@ -87,8 +87,10 @@ Rules:
 - A version label: pass it as a build-arg and set `ARG VERSION` +
   `LABEL org.opencontainers.image.version=$VERSION` in the Dockerfile.
 - The deploy job runs on `push` and `workflow_dispatch` on the default
-  branch only. A re-run where the values already hold the tag is a green
-  no-op. The bump changes exactly one line (no `yq -i`, which reformats).
+  branch only. It pins `<sha>@sha256:<digest>` (the chart renders
+  `repository:<value>`, which the kubelet pulls by digest), so a rebuild of
+  the same commit (base image CVE fix) rolls out. A re-run where the values
+  already hold that value is a green no-op. The bump changes exactly one line (no `yq -i`, which reformats).
 
 Prerequisites per caller repo (infra-bootstrap
 `.claude/skills/build-runner-ops/SKILL.md`):
