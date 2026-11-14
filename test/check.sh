@@ -47,15 +47,18 @@ pr 0 pull_request_target '["ubuntu-latest"]'      "pull_request_target on ubuntu
 pr 0 workflow_dispatch '["ukubi-build"]'          "dispatch on a bare self-hosted label passes"
 
 # 3. The deploy bump. Each case: name, values-key, expected rc, expected
-#    error substring (or ""), file content; TAG is always 0123456789ab.
+#    error substring (or ""), file content; TAG is 0123456789ab and DIGEST $D
+#    unless the optional 6th/7th args override them.
+D=sha256:$(printf 'a%.0s' {1..64})
 step deploy "Bump the pinned image tag" > "$T/bump.sh"
 [ -s "$T/bump.sh" ] || { echo "FAIL extract bump block"; exit 1; }
-bump() { # name key want_rc want_msg content
+bump() { # name key want_rc want_msg content [digest [tag-set]]
+  local dg=${6-$D} want="0123456789ab@${6-$D}"
   local d="$T/case" out rc; rm -rf "$d"; mkdir -p "$d"; [ "$5" = - ] || printf '%s' "$5" > "$d/values.yaml"
-  out=$(cd "$d" && TAG=0123456789ab VALUES_FILE=values.yaml VALUES_KEY=$2 bash "$T/bump.sh" 2>&1); rc=$?
+  out=$(cd "$d" && TAG=0123456789ab DIGEST=$dg VALUES_FILE=values.yaml VALUES_KEY=$2 bash "$T/bump.sh" 2>&1); rc=$?
   if [ "$rc" != "$3" ]; then bad "bump $1: rc=$rc want $3 ($out)"; return; fi
   if [ -n "$4" ] && [[ "$out" != *"$4"* ]]; then bad "bump $1: want '$4', got '$out'"; return; fi
-  if [ "$3" = 0 ] && [ "$(yq "$2" "$d/values.yaml")" != 0123456789ab ]; then bad "bump $1: tag not set"; return; fi
+  if [ "$3" = 0 ] && [ "$(yq "$2" "$d/values.yaml")" != "$want" ]; then bad "bump $1: tag not set"; return; fi
   ok "bump $1"
 }
 bump "head comments, blank lines, trailing comment" .image.tag 0 "" '# Values for the app.
@@ -70,9 +73,9 @@ image:
 service:
   port: 8080
 '
-bump "already at TAG stays green (re-run)" .image.tag 0 "already 0123456789ab" 'image:
-  tag: "0123456789ab"
-'
+bump "already at TAG stays green (re-run)" .image.tag 0 "already 0123456789ab@$D" "image:
+  tag: \"0123456789ab@$D\"
+"
 bump "depth-2 key .api.image.tag (indent derived from the key)" .api.image.tag 0 "" 'api:
   image:
     tag: "aaaaaaaaaaaa"
@@ -96,6 +99,24 @@ image:
   tag: aaaaaaaaaaaa
 '
 bump "missing file refused" .image.tag 1 "not found" -
+bump "same sha, new digest bumps" .image.tag 0 "" "image:
+  tag: \"0123456789ab@sha256:$(printf 'b%.0s' {1..64})\"
+"
+bump "old bare-sha value bumps to sha@digest" .image.tag 0 "" 'image:
+  tag: "0123456789ab"
+'
+bump "empty digest fails" .image.tag 1 "digest missing or malformed" 'image:
+  tag: "x"
+' ""
+bump "uppercase digest refused" .image.tag 1 "digest missing or malformed" 'image:
+  tag: "x"
+' "sha256:$(printf 'A%.0s' {1..64})"
+bump "63-hex digest refused" .image.tag 1 "digest missing or malformed" 'image:
+  tag: "x"
+' "sha256:$(printf 'a%.0s' {1..63})"
+bump "sha512 digest refused" .image.tag 1 "digest missing or malformed" 'image:
+  tag: "x"
+' "sha512:$(printf 'a%.0s' {1..64})"
 
 echo "failures: $fails"
 [ "$fails" = 0 ]

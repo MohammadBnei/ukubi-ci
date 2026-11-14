@@ -259,10 +259,8 @@ jobs:
     permissions:
       contents: write
     env:
-      # <sha>@<digest>: the chart renders repository:<this>, a valid reference
-      # that the kubelet pulls by digest, so a same-sha rebuild rolls out even
-      # under pullPolicy IfNotPresent. Empty digest (nothing pushed) = bare sha.
-      TAG: ${{ needs.build.outputs.tag }}${{ needs.build.outputs.digest && format('@{0}', needs.build.outputs.digest) || '' }}
+      TAG: ${{ needs.build.outputs.tag }}
+      DIGEST: ${{ needs.build.outputs.digest }}
       VALUES_FILE: ${{ inputs.values-file }}
       VALUES_KEY: ${{ inputs.values-key }}
       BRANCH: ${{ github.event.repository.default_branch }}
@@ -277,9 +275,18 @@ jobs:
       - name: Bump the pinned image tag
         run: |
           set -euo pipefail
-          [[ "$TAG" =~ ^[A-Za-z0-9._-]+(@sha256:[0-9a-f]{64})?$ ]] || { echo "::error::bad image tag: '$TAG'"; exit 1; }
+          [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::bad image tag: '$TAG'"; exit 1; }
+          # Pin <sha>@<digest>: the chart renders repository:<this>, a valid
+          # reference the kubelet pulls by digest, so a rebuild rolls out even
+          # under pullPolicy IfNotPresent. No bare-sha fallback: an empty digest
+          # (e.g. the runner dropped the output) must fail, not silently skip.
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::push digest missing or malformed ('$DIGEST'): the build job's digest output was empty or dropped"; exit 1; }
+          TAG="$TAG@$DIGEST"
           [ -f "$VALUES_FILE" ] || { echo "::error::$VALUES_FILE not found"; exit 1; }
-          # Re-run of the deployed build (same sha and digest): nothing to bump, stay green.
+          # Same sha and digest: nothing to bump. buildah bud is not reproducible
+          # (created timestamp), so any rebuild gets a new digest and redeploys;
+          # only re-running this deploy job alone lands here.
           if [ "$(yq "$VALUES_KEY" "$VALUES_FILE")" = "$TAG" ]; then
             echo "::notice::$VALUES_FILE $VALUES_KEY is already $TAG"; exit 0
           fi

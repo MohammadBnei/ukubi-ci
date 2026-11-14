@@ -89,8 +89,11 @@ Rules:
 - The deploy job runs on `push` and `workflow_dispatch` on the default
   branch only. It pins `<sha>@sha256:<digest>` (the chart renders
   `repository:<value>`, which the kubelet pulls by digest), so a rebuild of
-  the same commit (base image CVE fix) rolls out. A re-run where the values
-  already hold that value is a green no-op. The bump changes exactly one line (no `yq -i`, which reformats).
+  the same commit (base image CVE fix) rolls out. Builds are not
+  reproducible, so every rebuild (re-run all jobs, a second dispatch) gets a
+  new digest and redeploys; only re-running the deploy job alone, where the
+  values already hold that value, is a green no-op. An empty digest fails the
+  deploy. The bump changes exactly one line (no `yq -i`, which reformats).
 
 Prerequisites per caller repo (infra-bootstrap
 `.claude/skills/build-runner-ops/SKILL.md`):
