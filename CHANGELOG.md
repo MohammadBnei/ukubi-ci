@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0 - 2026-11-14
+
+### Features
+
+- **image:** Deploy input and deploy.yml for atomic multi-image bumps (#10)
+
 ## 0.4.0 - 2026-11-14
 
 ### Features
