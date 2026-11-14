@@ -66,7 +66,7 @@ on:
         description: >-
           Several values files of THIS image only (one call per image), newline or
           space separated, each pinning the same values-key; bumped in one commit. When set it replaces values-file. The
-          stale-run guard reads the pin from the first one.
+          stale-run guard skips when any file's pin descends from the built commit.
         type: string
         default: ''
       version:
@@ -422,11 +422,15 @@ jobs:
           files=(); vals=()
           while read -r f v extra; do
             [ -n "$f" ] || continue
-            [[ "$f" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ && "/$f/" != *"/../"* ]] \
+            # No ., .. or empty segment: one spelling per file, so the twice check holds.
+            [[ "$f" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ && "/$f/" != *"/./"* && "/$f/" != *"/../"* && "/$f/" != *"//"* ]] \
               || { echo "::error::bad values file: '$f'"; exit 1; }
             [ ! -L "$f" ] || { echo "::error::values file is a symlink: '$f'"; exit 1; }
             [[ "$v" =~ ^[0-9a-f]{12,40}@sha256:[0-9a-f]{64}$ && -z "$extra" ]] \
               || { echo "::error::bad pin for $f: '$v${extra:+ $extra}' (want <sha12>@sha256:<64 hex>)"; exit 1; }
+            # Every image from the built commit: one rollout, one protocol.
+            [[ "$BUILT" == "${v%%@*}"* ]] \
+              || { echo "::error::pin for $f is not of the built commit '$BUILT': '$v'"; exit 1; }
             [[ " ${files[*]-} " != *" $f "* ]] || { echo "::error::values file listed twice: '$f'"; exit 1; }
             files+=("$f"); vals+=("$v")
           done <<< "$PINS"
@@ -458,11 +462,15 @@ jobs:
           files=(); vals=()
           while read -r f v extra; do
             [ -n "$f" ] || continue
-            [[ "$f" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ && "/$f/" != *"/../"* ]] \
+            # No ., .. or empty segment: one spelling per file, so the twice check holds.
+            [[ "$f" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ && "/$f/" != *"/./"* && "/$f/" != *"/../"* && "/$f/" != *"//"* ]] \
               || { echo "::error::bad values file: '$f'"; exit 1; }
             [ ! -L "$f" ] || { echo "::error::values file is a symlink: '$f'"; exit 1; }
             [[ "$v" =~ ^[0-9a-f]{12,40}@sha256:[0-9a-f]{64}$ && -z "$extra" ]] \
               || { echo "::error::bad pin for $f: '$v${extra:+ $extra}' (want <sha12>@sha256:<64 hex>)"; exit 1; }
+            # Every image from the built commit: one rollout, one protocol.
+            [[ "$BUILT" == "${v%%@*}"* ]] \
+              || { echo "::error::pin for $f is not of the built commit '$BUILT': '$v'"; exit 1; }
             [[ " ${files[*]-} " != *" $f "* ]] || { echo "::error::values file listed twice: '$f'"; exit 1; }
             files+=("$f"); vals+=("$v")
           done <<< "$PINS"
