@@ -194,14 +194,16 @@ step build "Compute the build version" > "$T/ver.sh"
 [ -s "$T/ver.sh" ] || { echo "FAIL extract version block"; exit 1; }
 step build "Build" > "$T/build.sh"
 [ -s "$T/build.sh" ] || { echo "FAIL extract Build block"; exit 1; }
-mkdir -p "$T/fake"; printf '#!/bin/sh\nshift; shift; echo "$@" > "$FAKE_OUT"\n' > "$T/fake/sudo"; chmod +x "$T/fake/sudo"
+mkdir -p "$T/fake"
+# shellcheck disable=SC2016 # a literal $@, the fake's own script
+printf '#!/bin/sh\nshift; shift; echo "$@" > "$FAKE_OUT"\n' > "$T/fake/sudo"; chmod +x "$T/fake/sudo"
 ver() { # name want_rc want-VERSION_ARG-or-substring version ref github_ref
   local out rc genv="$T/genv"; : > "$genv"
   out=$(TAG=0123456789ab VERSION=$4 RELEASE_TAG=$5 GITHUB_REF=$6 DEFAULT_BRANCH=main GITHUB_ENV=$genv bash "$T/ver.sh" 2>&1); rc=$?
   if [ "$rc" != "$2" ]; then bad "version $1: rc=$rc ($out)"; return; fi
   if [ "$2" = 0 ]; then
-    [ "$(cat "$genv")" = "VERSION_ARG=VERSION=$3" ] && ok "version $1" || bad "version $1: got '$(cat "$genv")'"
-  else [[ "$out" == *"$3"* ]] && ok "version $1" || bad "version $1: want '$3' in '$out'"; fi
+    if [ "$(cat "$genv")" = "VERSION_ARG=VERSION=$3" ]; then ok "version $1"; else bad "version $1: got '$(cat "$genv")'"; fi
+  elif [[ "$out" == *"$3"* ]]; then ok "version $1"; else bad "version $1: want '$3' in '$out'"; fi
 }
 ver "release ref: the bare X.Y.Z" 0 1.2.3 1.2.3 v1.2.3 refs/heads/main
 ver "default branch, no ref: X.Y.Z+sha" 0 1.2.3+0123456789ab 1.2.3 '' refs/heads/main
@@ -211,15 +213,15 @@ ver "other branch, nothing released: 0.0.0-dev+sha" 0 0.0.0-dev+0123456789ab '' 
 ver "empty version with a release ref refused" 1 "bad version" '' v1.2.3 refs/heads/main
 ver "misnamed version refused" 1 "bad version" v1.2.3 '' refs/heads/main
 ver "version with a flag refused" 1 "bad version" '1.2.3 --x' '' refs/heads/main
-build_args() { # VERSION_ARG value (may be unset with "-")
+build_args() { # VERSION_ARG value; empty means unset
   local out="$T/bargs"; : > "$out"
-  if [ "$1" = - ]; then env -u VERSION_ARG PATH="$T/fake:$PATH" FAKE_OUT="$out" TAG=t CONTEXT=. DOCKERFILE=Dockerfile TARGET= BUILD_ARGS=A=b LAYERS=true PULL_NEWER=true BUILD_SECRETS= REGISTRY=r IMAGE=i bash "$T/build.sh" >/dev/null 2>&1
-  else VERSION_ARG=$1 PATH="$T/fake:$PATH" FAKE_OUT="$out" TAG=t CONTEXT=. DOCKERFILE=Dockerfile TARGET= BUILD_ARGS=A=b LAYERS=true PULL_NEWER=true BUILD_SECRETS= REGISTRY=r IMAGE=i bash "$T/build.sh" >/dev/null 2>&1; fi
+  env -u VERSION_ARG ${1:+VERSION_ARG="$1"} PATH="$T/fake:$PATH" FAKE_OUT="$out" TAG=t CONTEXT=. DOCKERFILE=Dockerfile TARGET='' \
+    BUILD_ARGS=A=b LAYERS=true PULL_NEWER=true BUILD_SECRETS='' REGISTRY=r IMAGE=i bash "$T/build.sh" >/dev/null 2>&1
   cat "$out"
 }
 a=$(build_args VERSION=1.2.3+0123456789ab)
 if [[ "$a" == *"--build-arg VERSION=1.2.3+0123456789ab"* && "$a" == *"--build-arg A=b"* ]]; then ok "Build passes --build-arg VERSION next to build-args"; else bad "Build with VERSION_ARG: '$a'"; fi
-a=$(build_args -)
+a=$(build_args '')
 if [[ "$a" == *"--build-arg A=b"* && "$a" != *VERSION* ]]; then ok "Build without VERSION_ARG adds no VERSION arg"; else bad "Build without VERSION_ARG: '$a'"; fi
 
 echo "failures: $fails"
