@@ -38,6 +38,10 @@ on:
         description: Pass --pull=newer.
         type: boolean
         default: true
+      build-timeout-minutes:
+        description: Cap for the build job.
+        type: number
+        default: 60
     secrets:
       build-secrets:
         description: Multiline id=value; each becomes `--secret id=<id>` (RUN --mount=type=secret,id=<id>).
@@ -50,6 +54,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.build-timeout-minutes }}
     permissions:
       contents: read
     steps:

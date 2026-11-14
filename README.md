@@ -66,6 +66,8 @@ hq-style layout (Dockerfile and context in a subdirectory):
 | `values-files` | | several values files, newline or space separated, each pinning `values-key` for this same image only (one call per image: wird's adminweb file does not go in the api call); one bump commit. Replaces `values-file` when set. The stale-run guard skips when any file's pin descends from the built commit; a file already at the pin is skipped, and no file changed means no commit |
 | `version-arg` | `false` | pass `--build-arg VERSION`: `X.Y.Z` when `ref` is a release tag, else `X.Y.Z+<sha12>` on the default branch, else `X.Y.Z-dev+<sha12>` (`0.0.0` before the first release) |
 | `version` | | release.yml's `version` output; needs `version-arg`. Must be `X.Y.Z`, or empty with an empty `ref` |
+| `build-timeout-minutes` | `60` | build job cap (callers cannot set `timeout-minutes` on a `uses:` job; guard is 5, deploy 10). Slowest observed build is about 7 min |
+| `registry-secret-path` | `/` | Infisical folder of `REGISTRY_PASSWORD`. Only that key reaches the build job's env, but the action fetches the whole folder; point this at a folder holding just the password (e.g. `/registry`) to stop app secrets being fetched at all |
 | `cancel-in-progress` | `true` | build concurrency; `false` never cancels a running build (release callers: a cancel leaves a pushed tag with no image); GitHub still keeps one pending run per group, and a newer push replaces a pending one. The deploy group never cancels |
 | `values-key` | `.image.tag` | yq path; the value must be double-quoted, two-space indented |
 | `registry` | `registry.bnei.lan:5000` | |
@@ -325,7 +327,7 @@ The image build as a PR check: image.yml's tag and Build steps byte for byte
 (`sudo -n buildah bud --isolation chroot`, build-args, build-secrets), tagged
 `localhost/<image>:<sha>`, with no login and no push. Inputs `image`
 (required), `context`, `dockerfile`, `target`, `build-args`, `layers`,
-`pull-newer` and secret `build-secrets`, as in image.yml.
+`pull-newer`, `build-timeout-minutes` and secret `build-secrets`, as in image.yml.
 
 ### trailers.yml
 
