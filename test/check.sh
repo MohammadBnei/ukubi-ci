@@ -55,7 +55,7 @@ step deploy "Bump the pinned image tag" > "$T/bump.sh"
 bump() { # name key want_rc want_msg content [digest]
   local dg=${6-$D} want="0123456789ab@${6-$D}"
   local d="$T/case" out rc; rm -rf "$d"; mkdir -p "$d"; [ "$5" = - ] || printf '%s' "$5" > "$d/values.yaml"
-  out=$(cd "$d" && TAG=0123456789ab DIGEST=$dg VALUES_FILE=values.yaml VALUES_KEY=$2 bash "$T/bump.sh" 2>&1); rc=$?
+  out=$(cd "$d" && TAG=0123456789ab DIGEST=$dg VALUES_FILES=values.yaml VALUES_KEY=$2 bash "$T/bump.sh" 2>&1); rc=$?
   if [ "$rc" != "$3" ]; then bad "bump $1: rc=$rc want $3 ($out)"; return; fi
   if [ -n "$4" ] && [[ "$out" != *"$4"* ]]; then bad "bump $1: want '$4', got '$out'"; return; fi
   if [ "$3" = 0 ] && [ "$(yq "$2" "$d/values.yaml")" != "$want" ]; then bad "bump $1: tag not set"; return; fi
@@ -118,6 +118,46 @@ bump "sha512 digest refused" .image.tag 1 "digest missing or malformed" 'image:
   tag: "x"
 ' "sha512:$(printf 'a%.0s' {1..64})"
 
+# 3b. Several values files: one commit, a no-op only when every file holds the pin.
+step deploy "Commit and push" > "$T/commit.sh"
+[ -s "$T/commit.sh" ] || { echo "FAIL extract commit block"; exit 1; }
+PIN="0123456789ab@$D"
+multi() { # name want_commits files-of-commit(0|1|2) a-tag b-tag
+  local d="$T/multi" r="$T/multi-remote.git"; rm -rf "$d" "$r"; mkdir -p "$d"; git init -q --bare -b main "$r"
+  printf 'image:\n  tag: "%s"\n' "$4" > "$d/a.yaml"; printf 'image:\n  tag: "%s"\n' "$5" > "$d/b.yaml"
+  git -C "$d" init -q -b main; git -C "$d" remote add origin "$r"; git -C "$d" add .
+  git -C "$d" -c user.name=t -c user.email=t@t commit -qm init; git -C "$d" push -q origin main
+  local out rc; out=$(cd "$d" && TAG=0123456789ab DIGEST=$D VALUES_FILES=$'a.yaml\n b.yaml' VALUES_KEY=.image.tag bash "$T/bump.sh" 2>&1); rc=$?
+  [ "$rc" = 0 ] || { bad "multi $1: bump rc=$rc ($out)"; return; }
+  [ "$(yq .image.tag "$d/a.yaml")" = "$PIN" ] && [ "$(yq .image.tag "$d/b.yaml")" = "$PIN" ] || { bad "multi $1: a file not pinned"; return; }
+  (cd "$d" && IMAGE=app PINNED=$PIN BRANCH=main VALUES_FILES=$'a.yaml\n b.yaml' bash "$T/commit.sh" >/dev/null 2>&1) || { bad "multi $1: commit step failed"; return; }
+  local n f; n=$(git -C "$d" rev-list --count HEAD); f=$(git -C "$d" show --format= --name-only HEAD | grep -c yaml)
+  if [ "$n" != "$2" ] || { [ "$2" = 2 ] && [ "$f" != "$3" ]; }; then bad "multi $1: $n commits, last touches $f files; want $2, $3"; return; fi
+  ok "multi $1"
+}
+multi "both stale: one commit touching both files" 2 2 aaaaaaaaaaaa bbbbbbbbbbbb
+multi "one file already pinned: bump still lands, one commit" 2 1 "$PIN" bbbbbbbbbbbb
+multi "first file pinned, second stale (order does not matter)" 2 1 aaaaaaaaaaaa "$PIN"
+multi "every file already pinned: no commit" 1 0 "$PIN" "$PIN"
+vbump() { # name want_rc want_msg files
+  local d="$T/vb"; rm -rf "$d"; mkdir -p "$d"; printf 'image:\n  tag: "x"\n' > "$d/a.yaml"; printf 'image:\n  tag: "x"\n' > "$d/b.yaml"
+  local out rc; out=$(cd "$d" && TAG=0123456789ab DIGEST=$D VALUES_FILES=$4 VALUES_KEY=.image.tag bash "$T/bump.sh" 2>&1); rc=$?
+  if [ "$rc" != "$2" ] || { [ -n "$3" ] && [[ "$out" != *"$3"* ]]; }; then bad "multi $1: rc=$rc ($out)"; else ok "multi $1"; fi
+}
+vbump "single file in VALUES_FILES works (values-file alias)" 0 "" a.yaml
+vbump "space separated files work" 0 "" "a.yaml b.yaml"
+vbump "second file missing refused" 1 "nope.yaml not found" "a.yaml nope.yaml"
+vbump "parent-dir path refused" 1 "bad values file" "a.yaml ../x.yaml"
+vbump "absolute path refused" 1 "bad values file" "/etc/passwd"
+vbump "glob refused, not expanded" 1 "bad values file" "*.yaml"
+vbump "empty list refused" 1 "no values file" ""
+vbump "blank list refused" 1 "no values file" " "
+vbump "leading dash refused" 1 "bad values file" "-a.yaml"
+vbump_link() { local d="$T/vb"; mkdir -p "$d"; printf 'image:\n  tag: "x"\n' > "$d/real.yaml"; ln -sf real.yaml "$d/l.yaml"
+  local out rc; out=$(cd "$d" && TAG=0123456789ab DIGEST=$D VALUES_FILES=l.yaml VALUES_KEY=.image.tag bash "$T/bump.sh" 2>&1); rc=$?
+  if [ "$rc" = 1 ] && [[ "$out" == *symlink* ]]; then ok "multi symlink refused"; else bad "multi symlink: rc=$rc ($out)"; fi; }
+vbump_link
+
 # 4. The stale-run guard, against a throwaway remote. History: A, B (built
 #    commits), a docs commit, then the bot's bump commit pinning B.
 step deploy "Skip a stale run" > "$T/fresh.sh"
@@ -130,7 +170,7 @@ pin() { printf 'image:\n  tag: "%s"\n' "$1" > "$g/w/values.yaml"; }
 pin "${B:0:12}@$D"; c "chore(deploy): bump app image" >/dev/null; git -C "$g/w" push -q origin main
 guard() { # name built-sha pinned-value want [attempt] [clone]
   local w="${6:-$g/w}" bt=$2; : > "$T/out"; pin "$3"; [ "$w" = "$g/w" ] || cp "$g/w/values.yaml" "$w/"
-  (cd "$w" && BUILT=$bt GITHUB_RUN_ATTEMPT=${5:-2} BRANCH=main VALUES_FILE=values.yaml VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >/dev/null 2>&1)
+  (cd "$w" && BUILT=$bt GITHUB_RUN_ATTEMPT=${5:-2} BRANCH=main VALUES_FILES=values.yaml VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >/dev/null 2>&1)
   if grep -qx "ok=$4" "$T/out"; then ok "guard $1"; else bad "guard $1: $(cat "$T/out")"; fi
 }
 git clone -q --depth 1 "file://$g/remote.git" "$g/shallow" 2>/dev/null
@@ -143,8 +183,76 @@ for w in "$g/w" "$g/shallow"; do
   guard "[$n] unknown pin deploys" "$B" "ffffffffffff@$D" true 2 "$w"
 done
 : > "$T/out"; pin "${B:0:12}@$D"
-if (cd "$g/w" && BUILT=abc BRANCH=main VALUES_FILE=values.yaml VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >"$T/m" 2>&1); then bad "guard malformed BUILT must fail"
+if (cd "$g/w" && BUILT=abc BRANCH=main VALUES_FILES=values.yaml VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >"$T/m" 2>&1); then bad "guard malformed BUILT must fail"
 elif grep -q "built commit missing or malformed" "$T/m"; then ok "guard malformed BUILT fails closed"; else bad "guard malformed BUILT: $(cat "$T/m")"; fi
+
+# The guard skips when ANY file's pin descends from BUILT, in either order.
+printf 'image:\n  tag: "ffffffffffff@%s"\n' "$D" > "$g/w/other.yaml"; pin "${B:0:12}@$D"
+gm() { # name want files [built]
+  : > "$T/out"
+  (cd "$g/w" && BUILT=${4:-$A} GITHUB_RUN_ATTEMPT=2 BRANCH=main VALUES_FILES=$3 VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >"$T/gm" 2>&1)
+  if grep -qx "ok=$2" "$T/out"; then ok "guard $1"; else bad "guard $1: $(cat "$T/out" "$T/gm")"; fi
+}
+gm "several files: a stale one first skips" false "values.yaml other.yaml"
+gm "several files: a stale one second skips" false "other.yaml values.yaml"
+gm "several files: no pin descends, deploys" true "other.yaml other.yaml"
+gm_fail() { # name files substring
+  (cd "$g/w" && BUILT=$A BRANCH=main VALUES_FILES=$2 VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >"$T/gm" 2>&1) \
+    && { bad "guard $1 must fail"; return; }
+  if grep -q "$3" "$T/gm"; then ok "guard $1"; else bad "guard $1: $(cat "$T/gm")"; fi
+}
+gm_fail "blank values-files fails early" " " "values-files is blank"
+gm_fail "path with .. refused before reading" "../x.yaml" "bad values file"
+gm_fail "leading dash refused" "-x.yaml" "bad values file"
+ln -sf values.yaml "$g/w/link.yaml"; gm_fail "symlink refused" "link.yaml" "symlink"; unlink "$g/w/link.yaml"
+
+# 4b. Version inputs sanity in the build job's Check inputs step.
+step build "Check inputs" > "$T/ci.sh"
+[ -s "$T/ci.sh" ] || { echo "FAIL extract Check inputs"; exit 1; }
+cin() { # name want_rc want_msg version-arg version build-args
+  local out rc; out=$(IMAGE=app VALUES_KEY=.image.tag VERSION_ARG_ON=$4 VERSION_IN=$5 BUILD_ARGS_IN=$6 bash "$T/ci.sh" 2>&1); rc=$?
+  if [ "$rc" = "$2" ] && { [ -z "$3" ] || [[ "$out" == *"$3"* ]]; }; then ok "check inputs: $1"; else bad "check inputs: $1: rc=$rc ($out)"; fi
+}
+cin "version without version-arg warns" 0 "::warning::version is set" false 1.2.3 ""
+cin "no version, no arg: silent" 0 "" false "" "A=b"
+cin "version-arg with a VERSION= build-arg fails" 1 "already sets VERSION" true 1.2.3 $'A=b\nVERSION=9'
+cin "version-arg with an unrelated build-arg passes" 0 "" true 1.2.3 "MYVERSION=9"
+
+# 5. The version build arg: the version step computes it, the Build step passes it
+#    (a fake sudo records buildah's args; no buildah needed).
+step build "Compute the build version" > "$T/ver.sh"
+[ -s "$T/ver.sh" ] || { echo "FAIL extract version block"; exit 1; }
+step build "Build" > "$T/build.sh"
+[ -s "$T/build.sh" ] || { echo "FAIL extract Build block"; exit 1; }
+mkdir -p "$T/fake"
+# shellcheck disable=SC2016 # a literal $@, the fake's own script
+printf '#!/bin/sh\nshift; shift; echo "$@" > "$FAKE_OUT"\n' > "$T/fake/sudo"; chmod +x "$T/fake/sudo"
+ver() { # name want_rc want-VERSION_ARG-or-substring version ref github_ref
+  local out rc genv="$T/genv"; : > "$genv"
+  out=$(TAG=0123456789ab VERSION=$4 RELEASE_TAG=$5 GITHUB_REF=$6 DEFAULT_BRANCH=main GITHUB_ENV=$genv bash "$T/ver.sh" 2>&1); rc=$?
+  if [ "$rc" != "$2" ]; then bad "version $1: rc=$rc ($out)"; return; fi
+  if [ "$2" = 0 ]; then
+    if [ "$(cat "$genv")" = "VERSION_ARG=VERSION=$3" ]; then ok "version $1"; else bad "version $1: got '$(cat "$genv")'"; fi
+  elif [[ "$out" == *"$3"* ]]; then ok "version $1"; else bad "version $1: want '$3' in '$out'"; fi
+}
+ver "release ref: the bare X.Y.Z" 0 1.2.3 1.2.3 v1.2.3 refs/heads/main
+ver "default branch, no ref: X.Y.Z+sha" 0 1.2.3+0123456789ab 1.2.3 '' refs/heads/main
+ver "default branch, nothing released yet: 0.0.0+sha" 0 0.0.0+0123456789ab '' '' refs/heads/main
+ver "other branch, no ref: X.Y.Z-dev+sha" 0 1.2.3-dev+0123456789ab 1.2.3 '' refs/heads/feat
+ver "other branch, nothing released: 0.0.0-dev+sha" 0 0.0.0-dev+0123456789ab '' '' refs/heads/feat
+ver "empty version with a release ref refused" 1 "bad version" '' v1.2.3 refs/heads/main
+ver "misnamed version refused" 1 "bad version" v1.2.3 '' refs/heads/main
+ver "version with a flag refused" 1 "bad version" '1.2.3 --x' '' refs/heads/main
+build_args() { # VERSION_ARG value; empty means unset
+  local out="$T/bargs"; : > "$out"
+  env -u VERSION_ARG ${1:+VERSION_ARG="$1"} PATH="$T/fake:$PATH" FAKE_OUT="$out" TAG=t CONTEXT=. DOCKERFILE=Dockerfile TARGET='' \
+    BUILD_ARGS=A=b LAYERS=true PULL_NEWER=true BUILD_SECRETS='' REGISTRY=r IMAGE=i bash "$T/build.sh" >/dev/null 2>&1
+  cat "$out"
+}
+a=$(build_args VERSION=1.2.3+0123456789ab)
+if [[ "$a" == *"--build-arg VERSION=1.2.3+0123456789ab"* && "$a" == *"--build-arg A=b"* ]]; then ok "Build passes --build-arg VERSION next to build-args"; else bad "Build with VERSION_ARG: '$a'"; fi
+a=$(build_args '')
+if [[ "$a" == *"--build-arg A=b"* && "$a" != *VERSION* ]]; then ok "Build without VERSION_ARG adds no VERSION arg"; else bad "Build without VERSION_ARG: '$a'"; fi
 
 echo "failures: $fails"
 [ "$fails" = 0 ]
