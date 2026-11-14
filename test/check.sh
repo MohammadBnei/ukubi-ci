@@ -118,21 +118,25 @@ bump "sha512 digest refused" .image.tag 1 "digest missing or malformed" 'image:
   tag: "x"
 ' "sha512:$(printf 'a%.0s' {1..64})"
 
-# 4. The stale-run guard, against a throwaway remote.
+# 4. The stale-run guard, against a throwaway remote. History: A, B (built
+#    commits), a docs commit, then the bot's bump commit pinning B.
 step deploy "Skip a stale run" > "$T/fresh.sh"
 [ -s "$T/fresh.sh" ] || { echo "FAIL extract guard block"; exit 1; }
 g="$T/g"; git init -q --bare "$g/remote.git" -b main; git clone -q "$g/remote.git" "$g/w" 2>/dev/null
-(cd "$g/w" && git config user.name t && git config user.email t@t && git checkout -q -b main &&
- for m in "feat: one" "feat: two" "chore(deploy): bump app image to x" "chore(release): v1"; do git commit -q --allow-empty -m "$m"; done &&
- git push -q origin main)
-one=$(git -C "$g/w" rev-parse HEAD~3); two=$(git -C "$g/w" rev-parse HEAD~2)
-guard() { # name sha want
-  rm -f "$T/out"; touch "$T/out"
-  (cd "$g/w" && GITHUB_SHA=$2 BRANCH=main GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >/dev/null 2>&1)
-  if grep -qx "ok=$3" "$T/out"; then ok "guard $1"; else bad "guard $1: $(cat "$T/out")"; fi
+c() { git -C "$g/w" commit -q --allow-empty -m "$1"; git -C "$g/w" rev-parse HEAD; }
+git -C "$g/w" config user.name t; git -C "$g/w" config user.email t@t; git -C "$g/w" checkout -q -b main
+A=$(c "feat: a"); B=$(c "feat: b"); DOC=$(c "docs: x")
+pin() { printf 'image:\n  tag: "%s"\n' "$1" > "$g/w/values.yaml"; }
+pin "${B:0:12}@$D"; c "chore(deploy): bump app image" >/dev/null; git -C "$g/w" push -q origin main
+guard() { # name built-sha pinned-value want
+  : > "$T/out"; pin "$3"
+  (cd "$g/w" && BUILT=$2 BRANCH=main VALUES_FILE=values.yaml VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >/dev/null 2>&1)
+  if grep -qx "ok=$4" "$T/out"; then ok "guard $1"; else bad "guard $1: $(cat "$T/out")"; fi
 }
-guard "newest non-bot commit deploys" "$two" true
-guard "old sha skipped (no rollback)" "$one" false
+guard "dispatch with HEAD on a bump commit deploys (same commit, new digest)" "$B" "${B:0:12}@sha256:$(printf 'c%.0s' {1..64})" true
+guard "docs commit after the built sha deploys" "$DOC" "${B:0:12}@$D" true
+guard "old run re-run (pinned is a descendant) skips" "$A" "${B:0:12}@$D" false
+guard "unknown pin deploys" "$B" "ffffffffffff@$D" true
 
 echo "failures: $fails"
 [ "$fails" = 0 ]

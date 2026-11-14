@@ -77,6 +77,9 @@ on:
       tag:
         description: The pushed image tag (12-character short sha).
         value: ${{ jobs.build.outputs.tag }}
+      commit:
+        description: The full sha of the built commit.
+        value: ${{ jobs.build.outputs.commit }}
       digest:
         description: The pushed manifest digest (sha256:...); empty when nothing was pushed.
         value: ${{ jobs.build.outputs.digest }}
@@ -131,6 +134,7 @@ jobs:
       id-token: write # the Infisical OIDC login
     outputs:
       tag: ${{ steps.tag.outputs.value }}
+      commit: ${{ steps.commit.outputs.value }}
       digest: ${{ steps.push.outputs.digest }}
     steps:
       - name: Check inputs
@@ -151,6 +155,11 @@ jobs:
       - name: Compute the image tag
         id: tag
         run: echo "value=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      # The commit actually built (inputs.ref may be a release tag).
+      - name: Record the built commit
+        id: commit
+        run: echo "value=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       # The runner cannot install tools (sudo is buildah-only); the playbook does.
       - name: Check buildah
@@ -262,6 +271,7 @@ jobs:
     env:
       TAG: ${{ needs.build.outputs.tag }}
       DIGEST: ${{ needs.build.outputs.digest }}
+      BUILT: ${{ needs.build.outputs.commit }}
       VALUES_FILE: ${{ inputs.values-file }}
       VALUES_KEY: ${{ inputs.values-key }}
       BRANCH: ${{ github.event.repository.default_branch }}
@@ -270,19 +280,23 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
 
-      # Re-running all jobs of an OLD push run would roll the values back to that
-      # sha. Deploy only when the triggering commit is the newest one on the
-      # default branch, not counting the bot's own bump and release commits.
+      # Re-running all jobs of an OLD run would roll the values back. Skip only
+      # when the commit already pinned in the values is a strict descendant of
+      # the built one (the tag is a 12-char sha; unknown or ambiguous deploys).
       # test/check.sh runs this block verbatim; keep the name.
       - name: Skip a stale run
         id: fresh
         run: |
           set -euo pipefail
-          git fetch -q --depth=50 origin "$BRANCH"
-          newest=$(git log -1 --format=%H --invert-grep --grep='^chore(deploy): bump ' --grep='^chore(release): ' FETCH_HEAD)
-          if [ "$newest" = "$GITHUB_SHA" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"; exit 0; fi
-          echo "ok=false" >> "$GITHUB_OUTPUT"
-          echo "::notice::skipping deploy: $GITHUB_SHA is not the newest commit on $BRANCH ($newest); a re-run of an old run must not roll back"
+          git fetch -q --unshallow origin "$BRANCH" || true
+          p=$(yq "$VALUES_KEY" "$VALUES_FILE" 2>/dev/null || true); p=${p%%@*}
+          pc=$(git rev-parse -q --verify "$p^{commit}" 2>/dev/null || true)
+          if [ -n "$pc" ] && [ "$pc" != "$BUILT" ] && git merge-base --is-ancestor "$BUILT" "$pc"; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::skipping deploy: pinned $pc is newer than built $BUILT; a re-run of an old run must not roll back"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
 
       # test/check.sh runs this block verbatim against fixtures; keep the name.
       # yq -i would reformat most values files (drops blank lines), so a
