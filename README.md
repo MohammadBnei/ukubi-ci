@@ -93,7 +93,7 @@ Rules:
   reproducible, so every rebuild (re-run all jobs, a second dispatch) gets a
   new digest and redeploys; only re-running the deploy job alone, where the
   values already hold that value, is a green no-op. An empty digest fails the
-  deploy. The bump changes exactly one line (no `yq -i`, which reformats).
+  deploy. The deploy is skipped (green, with a notice) unless the triggering commit is the newest on the default branch (bump and release commits aside), so re-running an old run cannot roll back. The bump changes exactly one line (no `yq -i`, which reformats).
 
 Prerequisites per caller repo (infra-bootstrap
 `.claude/skills/build-runner-ops/SKILL.md`):

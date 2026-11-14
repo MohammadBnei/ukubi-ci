@@ -48,11 +48,11 @@ pr 0 workflow_dispatch '["ukubi-build"]'          "dispatch on a bare self-hoste
 
 # 3. The deploy bump. Each case: name, values-key, expected rc, expected
 #    error substring (or ""), file content; TAG is 0123456789ab and DIGEST $D
-#    unless the optional 6th/7th args override them.
+#    unless the optional 6th arg overrides the digest.
 D=sha256:$(printf 'a%.0s' {1..64})
 step deploy "Bump the pinned image tag" > "$T/bump.sh"
 [ -s "$T/bump.sh" ] || { echo "FAIL extract bump block"; exit 1; }
-bump() { # name key want_rc want_msg content [digest [tag-set]]
+bump() { # name key want_rc want_msg content [digest]
   local dg=${6-$D} want="0123456789ab@${6-$D}"
   local d="$T/case" out rc; rm -rf "$d"; mkdir -p "$d"; [ "$5" = - ] || printf '%s' "$5" > "$d/values.yaml"
   out=$(cd "$d" && TAG=0123456789ab DIGEST=$dg VALUES_FILE=values.yaml VALUES_KEY=$2 bash "$T/bump.sh" 2>&1); rc=$?
@@ -117,6 +117,22 @@ bump "63-hex digest refused" .image.tag 1 "digest missing or malformed" 'image:
 bump "sha512 digest refused" .image.tag 1 "digest missing or malformed" 'image:
   tag: "x"
 ' "sha512:$(printf 'a%.0s' {1..64})"
+
+# 4. The stale-run guard, against a throwaway remote.
+step deploy "Skip a stale run" > "$T/fresh.sh"
+[ -s "$T/fresh.sh" ] || { echo "FAIL extract guard block"; exit 1; }
+g="$T/g"; git init -q --bare "$g/remote.git" -b main; git clone -q "$g/remote.git" "$g/w" 2>/dev/null
+(cd "$g/w" && git config user.name t && git config user.email t@t && git checkout -q -b main &&
+ for m in "feat: one" "feat: two" "chore(deploy): bump app image to x" "chore(release): v1"; do git commit -q --allow-empty -m "$m"; done &&
+ git push -q origin main)
+one=$(git -C "$g/w" rev-parse HEAD~3); two=$(git -C "$g/w" rev-parse HEAD~2)
+guard() { # name sha want
+  rm -f "$T/out"; touch "$T/out"
+  (cd "$g/w" && GITHUB_SHA=$2 BRANCH=main GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >/dev/null 2>&1)
+  if grep -qx "ok=$3" "$T/out"; then ok "guard $1"; else bad "guard $1: $(cat "$T/out")"; fi
+}
+guard "newest non-bot commit deploys" "$two" true
+guard "old sha skipped (no rollback)" "$one" false
 
 echo "failures: $fails"
 [ "$fails" = 0 ]

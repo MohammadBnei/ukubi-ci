@@ -230,7 +230,8 @@ jobs:
           set -euo pipefail
           sudo -n buildah push --authfile "$RUNNER_TEMP/registry-auth.json" \
             --tls-verify=false --digestfile "$RUNNER_TEMP/digest" "$REGISTRY/$IMAGE:$TAG"
-          echo "digest=$(cat "$RUNNER_TEMP/digest")" >> "$GITHUB_OUTPUT"
+          d=$(cat "$RUNNER_TEMP/digest")
+          echo "digest=$d" >> "$GITHUB_OUTPUT"
 
       # Its own step, so a failed push does not leave the tag in the shared store.
       - name: Remove the local image
@@ -269,10 +270,25 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
 
+      # Re-running all jobs of an OLD push run would roll the values back to that
+      # sha. Deploy only when the triggering commit is the newest one on the
+      # default branch, not counting the bot's own bump and release commits.
+      # test/check.sh runs this block verbatim; keep the name.
+      - name: Skip a stale run
+        id: fresh
+        run: |
+          set -euo pipefail
+          git fetch -q --depth=50 origin "$BRANCH"
+          newest=$(git log -1 --format=%H --invert-grep --grep='^chore(deploy): bump ' --grep='^chore(release): ' FETCH_HEAD)
+          if [ "$newest" = "$GITHUB_SHA" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+          echo "::notice::skipping deploy: $GITHUB_SHA is not the newest commit on $BRANCH ($newest); a re-run of an old run must not roll back"
+
       # test/check.sh runs this block verbatim against fixtures; keep the name.
       # yq -i would reformat most values files (drops blank lines), so a
       # one-line sed does the edit and yq only reads it back.
       - name: Bump the pinned image tag
+        if: steps.fresh.outputs.ok == 'true'
         run: |
           set -euo pipefail
           [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::bad image tag: '$TAG'"; exit 1; }
@@ -283,6 +299,7 @@ jobs:
           [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
             || { echo "::error::push digest missing or malformed ('$DIGEST'): the build job's digest output was empty or dropped"; exit 1; }
           TAG="$TAG@$DIGEST"
+          echo "PINNED=$TAG" >> "${GITHUB_ENV:-/dev/null}"
           [ -f "$VALUES_FILE" ] || { echo "::error::$VALUES_FILE not found"; exit 1; }
           # Same sha and digest: nothing to bump. buildah bud is not reproducible
           # (created timestamp), so any rebuild gets a new digest and redeploys;
@@ -303,13 +320,14 @@ jobs:
             || { echo "::error::tag bump did not land on $VALUES_KEY in $VALUES_FILE"; exit 1; }
 
       - name: Commit and push
+        if: steps.fresh.outputs.ok == 'true'
         run: |
           set -euo pipefail
           git config user.name "$IMAGE-ci"
           git config user.email "noreply@bnei.dev"
           git add "$VALUES_FILE"
           git diff --cached --quiet && exit 0
-          git commit -m "chore(deploy): bump $IMAGE image to $TAG"
+          git commit -m "chore(deploy): bump $IMAGE image to $PINNED"
           # The default branch also takes local pushes; retry if it moves.
           for _ in 1 2 3; do
             git pull --rebase origin "$BRANCH" && git push origin "HEAD:$BRANCH" && exit 0
