@@ -93,6 +93,19 @@ on:
           deploy.yml from this workflow's tag, digest and commit outputs.
         type: boolean
         default: true
+      push-default-branch-only:
+        description: >-
+          Build everywhere, but log in and push (and so deploy) only on the
+          default branch. For a registry that keeps few tags per repo, where a
+          branch dispatch would evict the rollback image.
+        type: boolean
+        default: false
+      extra-tags:
+        description: >-
+          Extra tags pushed next to the sha tag with the same digest, one per
+          line (e.g. latest). Never pinned by the deploy job.
+        type: string
+        default: ''
       values-key:
         description: yq path of the quoted tag value, two-space indented YAML.
         type: string
@@ -187,6 +200,7 @@ jobs:
           VERSION_ARG_ON: ${{ inputs.version-arg }}
           VERSION_IN: ${{ inputs.version }}
           BUILD_ARGS_IN: ${{ inputs.build-args }}
+          EXTRA_TAGS_IN: ${{ inputs.extra-tags }}
         run: |
           set -euo pipefail
           if [ "$VERSION_ARG_ON" != true ] && [ -n "$VERSION_IN" ]; then
@@ -197,6 +211,9 @@ jobs:
           fi
           [[ "$IMAGE" =~ ^[a-z0-9][a-z0-9._/-]*$ ]] || { echo "::error::bad image name: $IMAGE"; exit 1; }
           [[ "$VALUES_KEY" =~ ^(\.[A-Za-z0-9_-]+)+$ ]] || { echo "::error::bad values-key: $VALUES_KEY"; exit 1; }
+          while IFS= read -r t; do
+            [ -z "$t" ] || [[ "$t" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || { echo "::error::bad extra-tags line: '$t'"; exit 1; }
+          done <<< "$EXTRA_TAGS_IN"
 
       # No token in .git/config: the context (often `.`) holds .git, and RUN
       # steps or a `COPY . .` would see it on the shared box and in the image.
@@ -283,7 +300,9 @@ jobs:
       # bound claims allow push and workflow_dispatch only, so nothing else asks.
       # A dedicated folder (input registry-secret-path) stops them being fetched.
       - name: Read the registry password from Infisical
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: >-
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+          && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
         uses: Infisical/secrets-action@a663da43e1541832614bfd9dcf9ab67381ea2b98 # v1.0.12
         with:
           method: oidc
@@ -301,7 +320,9 @@ jobs:
       # reaches GITHUB_ENV, and the file is deleted either way.
       # test/check.sh runs this block verbatim; keep the name.
       - name: Keep only the registry password
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: >-
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+          && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
         run: |
           set -euo pipefail
           f="$GITHUB_WORKSPACE/.infisical-secrets"
@@ -321,7 +342,9 @@ jobs:
         run: rm -f "$GITHUB_WORKSPACE/.infisical-secrets"
 
       - name: Registry login
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: >-
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+          && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
         run: |
           set -euo pipefail
           [ -n "${REGISTRY_PASSWORD:-}" ] || { echo "::error::Infisical returned no REGISTRY_PASSWORD"; exit 1; }
@@ -335,26 +358,53 @@ jobs:
       # image CVE fix) keeps the sha tag but gets a new digest.
       - name: Push
         id: push
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: >-
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+          && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
         env:
           TAG: ${{ steps.tag.outputs.value }}
+          EXTRA_TAGS: ${{ inputs.extra-tags }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           sudo -n buildah push --authfile "$RUNNER_TEMP/registry-auth.json" \
             --tls-verify=false --digestfile "$RUNNER_TEMP/digest" "$REGISTRY/$IMAGE:$TAG"
           d=$(cat "$RUNNER_TEMP/digest")
           echo "digest=$d" >> "$GITHUB_OUTPUT"
+          # Extra tags only from the default branch (a branch build must not move `latest`, and
+          # concurrent refs would race it). A failure here only warns: the sha tag and digest are
+          # pushed, and the deploy must still run. Same local image, so the same manifest.
+          [ "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH" ] || exit 0
+          while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            rm -f "$RUNNER_TEMP/digest-extra"
+            if sudo -n buildah tag "$REGISTRY/$IMAGE:$TAG" "$REGISTRY/$IMAGE:$t" \
+              && sudo -n buildah push --authfile "$RUNNER_TEMP/registry-auth.json" \
+                --tls-verify=false --digestfile "$RUNNER_TEMP/digest-extra" "$REGISTRY/$IMAGE:$t"; then
+              [ "$(cat "$RUNNER_TEMP/digest-extra" 2>/dev/null)" = "$d" ] || echo "::warning::$t pushed a different digest than $TAG"
+            else
+              echo "::warning::extra tag $t was not pushed; $TAG is"
+            fi
+          done <<< "$EXTRA_TAGS"
 
       # Its own step, so a failed push does not leave the tag in the shared store.
       - name: Remove the local image
         if: always() && steps.tag.outputs.value != ''
         env:
           TAG: ${{ steps.tag.outputs.value }}
-        run: sudo -n buildah rmi "$REGISTRY/$IMAGE:$TAG" || true
+          EXTRA_TAGS: ${{ inputs.extra-tags }}
+        run: |
+          # Extra tags first: removing the last tag removes the image.
+          while IFS= read -r t; do
+            [ -z "$t" ] || sudo -n buildah rmi "$REGISTRY/$IMAGE:$t" || true
+          done <<< "$EXTRA_TAGS"
+          sudo -n buildah rmi "$REGISTRY/$IMAGE:$TAG" || true
 
       # The runner user cannot sudo rm, but buildah can clear its own entry.
       - name: Registry logout
-        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        if: >-
+          always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+          && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
         run: sudo -n buildah logout --authfile "$RUNNER_TEMP/registry-auth.json" "$REGISTRY" || true
 
   deploy:

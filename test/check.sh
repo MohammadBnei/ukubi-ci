@@ -301,13 +301,62 @@ else bad "deploy.yml event/branch gate differs from image.yml"; fi
 step build "Check inputs" > "$T/ci.sh"
 [ -s "$T/ci.sh" ] || { echo "FAIL extract Check inputs"; exit 1; }
 cin() { # name want_rc want_msg version-arg version build-args
-  local out rc; out=$(IMAGE=app VALUES_KEY=.image.tag VERSION_ARG_ON=$4 VERSION_IN=$5 BUILD_ARGS_IN=$6 bash "$T/ci.sh" 2>&1); rc=$?
+  local out rc; out=$(IMAGE=app VALUES_KEY=.image.tag VERSION_ARG_ON=$4 VERSION_IN=$5 BUILD_ARGS_IN=$6 EXTRA_TAGS_IN=${7-} bash "$T/ci.sh" 2>&1); rc=$?
   if [ "$rc" = "$2" ] && { [ -z "$3" ] || [[ "$out" == *"$3"* ]]; }; then ok "check inputs: $1"; else bad "check inputs: $1: rc=$rc ($out)"; fi
 }
 cin "version without version-arg warns" 0 "::warning::version is set" false 1.2.3 ""
 cin "no version, no arg: silent" 0 "" false "" "A=b"
 cin "version-arg with a VERSION= build-arg fails" 1 "already sets VERSION" true 1.2.3 $'A=b\nVERSION=9'
 cin "version-arg with an unrelated build-arg passes" 0 "" true 1.2.3 "MYVERSION=9"
+cin "extra-tags: latest and a second tag pass" 0 "" false "" "" $'latest\nstable-1.2'
+cin "extra-tags: a bad line refused" 1 "bad extra-tags line" false "" "" $'latest\n-x'
+cin "extra-tags: a flag-like line refused" 1 "bad extra-tags line" false "" "" 'a --force'
+cin "extra-tags: a colon (image ref) refused" 1 "bad extra-tags line" false "" "" 'img:latest'
+
+# 5a. extra-tags and push-default-branch-only: the Push step tags and pushes each
+#     extra tag after the sha tag; the build-only gate sits on every registry step.
+step build "Push" > "$T/push.sh"
+[ -s "$T/push.sh" ] || { echo "FAIL extract Push block"; exit 1; }
+mkdir -p "$T/fake"
+cat > "$T/fake/sudo" <<'FAKE'
+#!/bin/bash
+shift; echo "$*" >> "$FAKE_OUT"
+last=${*: -1}
+[ -z "${FAKE_FAIL:-}" ] || [ "$last" != "$FAKE_FAIL" ] || exit 1
+d=$FAKE_DIGEST; case $last in *:0123456789ab) ;; *) d=${FAKE_EXTRA_DIGEST:-$FAKE_DIGEST} ;; esac
+while [ $# -gt 0 ]; do if [ "$1" = --digestfile ]; then printf '%s' "$d" > "$2"; fi; shift; done
+FAKE
+chmod +x "$T/fake/sudo"
+pushes() { # extra-tags [digest-for-extras]
+  local out="$T/pargs" rt="$T/rt" go="$T/pgo"; rm -rf "$rt"; mkdir "$rt"; : > "$out"; : > "$go"
+  PATH="$T/fake:$PATH" FAKE_OUT="$out" FAKE_DIGEST=$D RUNNER_TEMP=$rt GITHUB_OUTPUT=$go \
+    GITHUB_REF=${PREF:-refs/heads/main} DEFAULT_BRANCH=main \
+    TAG=0123456789ab EXTRA_TAGS=$1 REGISTRY=r IMAGE=i bash "$T/push.sh" > "$T/pmsg" 2>&1
+  cat "$out"
+}
+a=$(pushes "")
+if [ "$(grep -c . <<<"$a")" = 1 ] && [[ "$a" == "buildah push "*" r/i:0123456789ab" ]] && grep -qx "digest=$D" "$T/pgo"; then ok "push: no extra-tags pushes the sha tag only"; else bad "push without extra-tags: '$a'"; fi
+a=$(pushes $'latest\nstable')
+want=$'buildah push --authfile '"$T"$'/rt/registry-auth.json --tls-verify=false --digestfile '"$T"$'/rt/digest r/i:0123456789ab\nbuildah tag r/i:0123456789ab r/i:latest'
+if [[ "$a" == "$want"$'\n'*"r/i:latest"$'\n'*"buildah tag r/i:0123456789ab r/i:stable"$'\n'*" r/i:stable" ]] && [ "$(grep -c '^buildah push' <<<"$a")" = 3 ]; then ok "push: extra tags tagged and pushed after the sha tag"; else bad "push with extra-tags: '$a'"; fi
+if [ "$(grep -c digest= "$T/pgo")" = 1 ] && grep -qx "digest=$D" "$T/pgo"; then ok "push: digest output is the sha tag's, one line"; else bad "push digest output: $(cat "$T/pgo")"; fi
+a=$(FAKE_EXTRA_DIGEST=sha256:$(printf 'b%.0s' {1..64}) pushes latest)
+if grep -q '::warning::latest pushed a different digest' "$T/pmsg" && grep -qx "digest=$D" "$T/pgo"; then ok "push: extra-tag digest mismatch only warns"; else bad "push mismatch: $(cat "$T/pmsg")"; fi
+if FAKE_FAIL=r/i:latest pushes latest >/dev/null && grep -q '::warning::extra tag latest was not pushed' "$T/pmsg" && grep -qx "digest=$D" "$T/pgo"; then ok "push: a failing extra-tag push only warns, sha digest kept"; else bad "push extra failure: $(cat "$T/pmsg")"; fi
+a=$(PREF=refs/heads/feat pushes latest)
+if [ "$(grep -c . <<<"$a")" = 1 ] && [[ "$a" == "buildah push "*" r/i:0123456789ab" ]]; then ok "push: extra tags skipped off the default branch"; else bad "push extras off default branch: '$a'"; fi
+step build "Remove the local image" > "$T/rmi.sh"
+[ -s "$T/rmi.sh" ] || { echo "FAIL extract rmi block"; exit 1; }
+: > "$T/pargs"; PATH="$T/fake:$PATH" FAKE_OUT="$T/pargs" TAG=0123456789ab EXTRA_TAGS=$'latest' REGISTRY=r IMAGE=i bash "$T/rmi.sh" >/dev/null 2>&1
+if [ "$(cat "$T/pargs")" = $'buildah rmi r/i:latest\nbuildah rmi r/i:0123456789ab' ]; then ok "rmi: extra tags removed before the sha tag"; else bad "rmi: '$(cat "$T/pargs")'"; fi
+for in in push-default-branch-only extra-tags; do
+  case $in in push-default-branch-only) want=false ;; *) want='""' ;; esac
+  if [ "$(yq ".on.workflow_call.inputs.\"$in\".default" "$WF")" = "${want//\"/}" ]; then ok "image.yml $in is off by default"; else bad "image.yml $in default"; fi
+done
+gate="!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"
+for sn in "Read the registry password from Infisical" "Keep only the registry password" "Registry login" "Push" "Registry logout"; do
+  if [[ "$(yq ".jobs.build.steps[] | select(.name == \"$sn\") | .if" "$WF")" == *"$gate"* ]]; then ok "gate on '$sn'"; else bad "no push-default-branch-only gate on '$sn'"; fi
+done
 
 # 5. The version build arg: the version step computes it, the Build step passes it
 #    (a fake sudo records buildah's args; no buildah needed).
