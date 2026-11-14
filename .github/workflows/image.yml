@@ -300,9 +300,18 @@ jobs:
           f="$GITHUB_WORKSPACE/.infisical-secrets"
           line=$(grep -m1 "^REGISTRY_PASSWORD='" "$f" || true); rm -f "$f"
           [ -n "$line" ] || { echo "::error::Infisical returned no REGISTRY_PASSWORD"; exit 1; }
+          # A multi-line password would leave this line without its closing quote.
+          [[ "$line" == REGISTRY_PASSWORD=\'*\' && ${#line} -gt 19 ]] \
+            || { echo "::error::REGISTRY_PASSWORD is empty or not a single line"; exit 1; }
           pw=${line#REGISTRY_PASSWORD=\'}; pw=${pw%\'}
           echo "::add-mask::$pw"
           echo "REGISTRY_PASSWORD=$pw" >> "$GITHUB_ENV"
+
+      # A cancel or timeout between fetch and keep must not leave the file on
+      # the self-hosted workspace.
+      - name: Remove the Infisical secrets file
+        if: always()
+        run: rm -f "$GITHUB_WORKSPACE/.infisical-secrets"
 
       - name: Registry login
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
