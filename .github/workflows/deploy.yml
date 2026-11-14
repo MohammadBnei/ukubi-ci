@@ -1,0 +1,170 @@
+# Pin several images in the caller's helm values in ONE commit, so ArgoCD rolls
+# them out together (ukubi-game's game and realm must speak the same protocol).
+# The caller builds each with image.yml `deploy: false`, then calls this with
+# their outputs. The stale-run guard, bump and commit steps are image.yml's
+# deploy steps, byte-identical (test/reusable.sh checks it).
+#
+# The caller's job must grant `contents: write`.
+# Inputs reach scripts through env only, never inline ${{ }}.
+name: deploy
+
+on:
+  workflow_call:
+    inputs:
+      pins:
+        description: >-
+          One "<values file> <sha12>@sha256:<64 hex>" per line (image.yml's
+          tag and digest outputs joined by @). Each file once; all land in one
+          commit.
+        type: string
+        required: true
+      built-commit:
+        description: The full sha the images were built from (image.yml's commit output), for the stale-run guard.
+        type: string
+        required: true
+      values-key:
+        description: yq path of the quoted tag value in every file, two-space indented YAML.
+        type: string
+        default: .image.tag
+      runs-on:
+        description: JSON list of runner labels; needs git and yq.
+        type: string
+        default: '["ubuntu-latest"]'
+      commit-author:
+        description: Bump commit author name. Empty is "<repo>-ci".
+        type: string
+        default: ''
+
+jobs:
+  deploy:
+    # Only push/dispatch on the default branch deploys, as in image.yml.
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 10
+    concurrency:
+      group: ukubi-ci-deploy-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      PINS: ${{ inputs.pins }}
+      BUILT: ${{ inputs.built-commit }}
+      VALUES_KEY: ${{ inputs.values-key }}
+      BRANCH: ${{ github.event.repository.default_branch }}
+      AUTHOR: ${{ inputs.commit-author != '' && inputs.commit-author || format('{0}-ci', github.event.repository.name) }}
+      MESSAGE: 'chore(deploy): bump ${{ github.event.repository.name }} images'
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Check inputs
+        run: |
+          set -euo pipefail
+          [[ "$VALUES_KEY" =~ ^(\.[A-Za-z0-9_-]+)+$ ]] || { echo "::error::bad values-key: $VALUES_KEY"; exit 1; }
+
+      # Re-running all jobs of an OLD run would roll the values back. Skip only
+      # on a re-run (attempt > 1; a fresh dispatch, even a rollback, deploys),
+      # when the commit already pinned in ANY file is a strict descendant of
+      # the built one (the tag is a 12-char sha; unknown or ambiguous deploys).
+      # This step, the bump and the commit are byte-identical in image.yml and
+      # deploy.yml (test/reusable.sh). test/check.sh runs it verbatim; keep the name.
+      - name: Skip a stale run
+        id: fresh
+        run: |
+          set -euo pipefail
+          [[ "$BUILT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::built commit missing or malformed ('$BUILT')"; exit 1; }
+          [ "$(git rev-parse --is-shallow-repository)" = true ] && git fetch -q --unshallow origin "$BRANCH" || true
+          # PINS: one "<values file> <sha12>@sha256:<64 hex>" per line.
+          files=(); vals=()
+          while read -r f v extra; do
+            [ -n "$f" ] || continue
+            [[ "$f" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ && "/$f/" != *"/../"* ]] \
+              || { echo "::error::bad values file: '$f'"; exit 1; }
+            [ ! -L "$f" ] || { echo "::error::values file is a symlink: '$f'"; exit 1; }
+            [[ "$v" =~ ^[0-9a-f]{12,40}@sha256:[0-9a-f]{64}$ && -z "$extra" ]] \
+              || { echo "::error::bad pin for $f: '$v${extra:+ $extra}' (want <sha12>@sha256:<64 hex>)"; exit 1; }
+            [[ " ${files[*]-} " != *" $f "* ]] || { echo "::error::values file listed twice: '$f'"; exit 1; }
+            files+=("$f"); vals+=("$v")
+          done <<< "$PINS"
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::no values file (no pins)"; exit 1; }
+          stale=
+          for f in "${files[@]}"; do
+            p=$(yq "$VALUES_KEY" "$f" 2>/dev/null || true); p=${p%%@*}
+            pc=$(git rev-parse -q --verify "$p^{commit}" 2>/dev/null || true)
+            if [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ] && [ -n "$pc" ] && [ "$pc" != "$BUILT" ] && git merge-base --is-ancestor "$BUILT" "$pc"; then
+              stale=$pc
+            fi
+          done
+          if [ -n "$stale" ]; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::skipping deploy: pinned $stale is newer than built $BUILT; a re-run of an old run must not roll back"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # test/check.sh runs this block verbatim against fixtures; keep the name.
+      # yq -i would reformat most values files (drops blank lines), so a
+      # one-line sed does the edit and yq only reads it back. The pin is
+      # <sha>@<digest>: the chart renders repository:<this>, which the kubelet
+      # pulls by digest, so a rebuild rolls out even under IfNotPresent.
+      - name: Bump the pinned image tag
+        if: steps.fresh.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          files=(); vals=()
+          while read -r f v extra; do
+            [ -n "$f" ] || continue
+            [[ "$f" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ && "/$f/" != *"/../"* ]] \
+              || { echo "::error::bad values file: '$f'"; exit 1; }
+            [ ! -L "$f" ] || { echo "::error::values file is a symlink: '$f'"; exit 1; }
+            [[ "$v" =~ ^[0-9a-f]{12,40}@sha256:[0-9a-f]{64}$ && -z "$extra" ]] \
+              || { echo "::error::bad pin for $f: '$v${extra:+ $extra}' (want <sha12>@sha256:<64 hex>)"; exit 1; }
+            [[ " ${files[*]-} " != *" $f "* ]] || { echo "::error::values file listed twice: '$f'"; exit 1; }
+            files+=("$f"); vals+=("$v")
+          done <<< "$PINS"
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::no values file (no pins)"; exit 1; }
+          leaf=${VALUES_KEY##*.}
+          dots=${VALUES_KEY//[^.]/}
+          indent=$(printf '%*s' $(( (${#dots} - 1) * 2 )) '')
+          for i in "${!files[@]}"; do
+            f=${files[$i]}; TAG=${vals[$i]}
+            [ -f "$f" ] || { echo "::error::$f not found"; exit 1; }
+            # Same sha and digest: nothing to bump. buildah bud is not reproducible
+            # (created timestamp), so any rebuild gets a new digest and redeploys;
+            # only re-running this deploy job alone lands here.
+            if [ "$(yq "$VALUES_KEY" "$f")" = "$TAG" ]; then
+              echo "::notice::$f $VALUES_KEY is already $TAG"; continue
+            fi
+            orig=$(mktemp); cp "$f" "$orig"
+            sed -i -E "s/^(${indent}${leaf}: \")[^\"]+(\")/\1${TAG}\2/" "$f"
+            # Exactly one line changed: catches a no-op sed (green deploy, old
+            # image) and a second same-named key elsewhere.
+            [ "$(diff "$orig" "$f" | grep -c '^[<>]')" = 2 ] \
+              || { echo "::error::tag bump must change exactly one line of $f"; exit 1; }
+            [ "$(yq "$VALUES_KEY" "$f")" = "$TAG" ] \
+              || { echo "::error::tag bump did not land on $VALUES_KEY in $f"; exit 1; }
+          done
+
+      # One commit for every file: a multi-image rollout lands atomically.
+      - name: Commit and push
+        if: steps.fresh.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "$AUTHOR"
+          git config user.email "noreply@bnei.dev"
+          files=()
+          while read -r f _; do
+            if [ -n "$f" ]; then files+=("$f"); fi
+          done <<< "$PINS"
+          git add -- "${files[@]}"
+          git diff --cached --quiet && exit 0
+          git commit -m "$MESSAGE" -m "$PINS"
+          # The default branch also takes local pushes; retry if it moves.
+          for _ in 1 2 3; do
+            git pull --rebase origin "$BRANCH" && git push origin "HEAD:$BRANCH" && exit 0
+            sleep 5
+          done
+          echo "::error::could not push the tag bump"; exit 1
