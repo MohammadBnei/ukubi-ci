@@ -281,6 +281,7 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
 
       # Re-running all jobs of an OLD run would roll the values back. Skip only
+      # on a re-run (attempt > 1; a fresh dispatch, even a rollback, deploys),
       # when the commit already pinned in the values is a strict descendant of
       # the built one (the tag is a 12-char sha; unknown or ambiguous deploys).
       # test/check.sh runs this block verbatim; keep the name.
@@ -288,10 +289,11 @@ jobs:
         id: fresh
         run: |
           set -euo pipefail
-          git fetch -q --unshallow origin "$BRANCH" || true
+          [[ "$BUILT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::built commit missing or malformed ('$BUILT')"; exit 1; }
+          [ "$(git rev-parse --is-shallow-repository)" = true ] && git fetch -q --unshallow origin "$BRANCH" || true
           p=$(yq "$VALUES_KEY" "$VALUES_FILE" 2>/dev/null || true); p=${p%%@*}
           pc=$(git rev-parse -q --verify "$p^{commit}" 2>/dev/null || true)
-          if [ -n "$pc" ] && [ "$pc" != "$BUILT" ] && git merge-base --is-ancestor "$BUILT" "$pc"; then
+          if [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ] && [ -n "$pc" ] && [ "$pc" != "$BUILT" ] && git merge-base --is-ancestor "$BUILT" "$pc"; then
             echo "ok=false" >> "$GITHUB_OUTPUT"
             echo "::notice::skipping deploy: pinned $pc is newer than built $BUILT; a re-run of an old run must not roll back"
           else

@@ -128,15 +128,23 @@ git -C "$g/w" config user.name t; git -C "$g/w" config user.email t@t; git -C "$
 A=$(c "feat: a"); B=$(c "feat: b"); DOC=$(c "docs: x")
 pin() { printf 'image:\n  tag: "%s"\n' "$1" > "$g/w/values.yaml"; }
 pin "${B:0:12}@$D"; c "chore(deploy): bump app image" >/dev/null; git -C "$g/w" push -q origin main
-guard() { # name built-sha pinned-value want
-  : > "$T/out"; pin "$3"
-  (cd "$g/w" && BUILT=$2 BRANCH=main VALUES_FILE=values.yaml VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >/dev/null 2>&1)
+guard() { # name built-sha pinned-value want [attempt] [clone]
+  local w="${6:-$g/w}" bt=$2; : > "$T/out"; pin "$3"; [ "$w" = "$g/w" ] || cp "$g/w/values.yaml" "$w/"
+  (cd "$w" && BUILT=$bt GITHUB_RUN_ATTEMPT=${5:-2} BRANCH=main VALUES_FILE=values.yaml VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >/dev/null 2>&1)
   if grep -qx "ok=$4" "$T/out"; then ok "guard $1"; else bad "guard $1: $(cat "$T/out")"; fi
 }
-guard "dispatch with HEAD on a bump commit deploys (same commit, new digest)" "$B" "${B:0:12}@sha256:$(printf 'c%.0s' {1..64})" true
-guard "docs commit after the built sha deploys" "$DOC" "${B:0:12}@$D" true
-guard "old run re-run (pinned is a descendant) skips" "$A" "${B:0:12}@$D" false
-guard "unknown pin deploys" "$B" "ffffffffffff@$D" true
+git clone -q --depth 1 "file://$g/remote.git" "$g/shallow" 2>/dev/null
+for w in "$g/w" "$g/shallow"; do
+  n=$([ "$w" = "$g/w" ] && echo full || echo shallow)
+  guard "[$n] dispatch with HEAD on a bump commit deploys (same commit, new digest)" "$B" "${B:0:12}@sha256:$(printf 'c%.0s' {1..64})" true 2 "$w"
+  guard "[$n] docs commit after the built sha deploys" "$DOC" "${B:0:12}@$D" true 2 "$w"
+  guard "[$n] old run re-run (attempt 2, pinned is a descendant) skips" "$A" "${B:0:12}@$D" false 2 "$w"
+  guard "[$n] fresh dispatch of an old sha (attempt 1) deploys" "$A" "${B:0:12}@$D" true 1 "$w"
+  guard "[$n] unknown pin deploys" "$B" "ffffffffffff@$D" true 2 "$w"
+done
+: > "$T/out"; pin "${B:0:12}@$D"
+if (cd "$g/w" && BUILT=abc BRANCH=main VALUES_FILE=values.yaml VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >"$T/m" 2>&1); then bad "guard malformed BUILT must fail"
+elif grep -q "built commit missing or malformed" "$T/m"; then ok "guard malformed BUILT fails closed"; else bad "guard malformed BUILT: $(cat "$T/m")"; fi
 
 echo "failures: $fails"
 [ "$fails" = 0 ]
