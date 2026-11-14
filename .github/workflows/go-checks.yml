@@ -28,6 +28,10 @@ on:
         description: A shell command run at the repo root before go test, e.g. 'docker compose up -d --wait postgres'.
         type: string
         default: ''
+      govulncheck:
+        description: Run govulncheck ./... (pinned v1.9.0). Fails only on vulnerabilities the code calls, not on unreachable module advisories.
+        type: boolean
+        default: false
 
 jobs:
   go:
@@ -116,3 +120,13 @@ jobs:
             echo "::error::expected one binary from $VETTOOL"; exit 1
           fi
           go vet -vettool="$tool" ./...
+
+      # Default symbol mode: exit 3 only when a vulnerable symbol is reachable.
+      # Built with the module's own toolchain, so a stdlib advisory is judged
+      # against the go.mod version (bump it to take the fix).
+      - name: govulncheck
+        if: inputs.govulncheck
+        run: |
+          set -euo pipefail
+          GOBIN="$RUNNER_TEMP/govulncheck" go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          "$RUNNER_TEMP/govulncheck/govulncheck" ./...

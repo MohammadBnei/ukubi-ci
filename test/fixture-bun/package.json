@@ -7,6 +7,7 @@
   "scripts": {
     "build": "rm -rf dist && bun build src/index.ts --outdir dist --target browser --format esm",
     "typecheck": "tsc -p tsconfig.json",
+    "lint": "tsc -p tsconfig.json --noEmit",
     "test": "bun test ./src"
   },
   "devDependencies": {
