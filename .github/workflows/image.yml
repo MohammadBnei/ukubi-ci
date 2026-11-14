@@ -364,19 +364,27 @@ jobs:
         env:
           TAG: ${{ steps.tag.outputs.value }}
           EXTRA_TAGS: ${{ inputs.extra-tags }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           sudo -n buildah push --authfile "$RUNNER_TEMP/registry-auth.json" \
             --tls-verify=false --digestfile "$RUNNER_TEMP/digest" "$REGISTRY/$IMAGE:$TAG"
           d=$(cat "$RUNNER_TEMP/digest")
           echo "digest=$d" >> "$GITHUB_OUTPUT"
-          # Same local image, so the same manifest: the extra tags carry the digest above.
+          # Extra tags only from the default branch (a branch build must not move `latest`, and
+          # concurrent refs would race it). A failure here only warns: the sha tag and digest are
+          # pushed, and the deploy must still run. Same local image, so the same manifest.
+          [ "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH" ] || exit 0
           while IFS= read -r t; do
             [ -n "$t" ] || continue
-            sudo -n buildah tag "$REGISTRY/$IMAGE:$TAG" "$REGISTRY/$IMAGE:$t"
-            sudo -n buildah push --authfile "$RUNNER_TEMP/registry-auth.json" \
-              --tls-verify=false --digestfile "$RUNNER_TEMP/digest-extra" "$REGISTRY/$IMAGE:$t"
-            [ "$(cat "$RUNNER_TEMP/digest-extra")" = "$d" ] || echo "::warning::$t pushed a different digest than $TAG"
+            rm -f "$RUNNER_TEMP/digest-extra"
+            if sudo -n buildah tag "$REGISTRY/$IMAGE:$TAG" "$REGISTRY/$IMAGE:$t" \
+              && sudo -n buildah push --authfile "$RUNNER_TEMP/registry-auth.json" \
+                --tls-verify=false --digestfile "$RUNNER_TEMP/digest-extra" "$REGISTRY/$IMAGE:$t"; then
+              [ "$(cat "$RUNNER_TEMP/digest-extra" 2>/dev/null)" = "$d" ] || echo "::warning::$t pushed a different digest than $TAG"
+            else
+              echo "::warning::extra tag $t was not pushed; $TAG is"
+            fi
           done <<< "$EXTRA_TAGS"
 
       # Its own step, so a failed push does not leave the tag in the shared store.

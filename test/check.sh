@@ -321,12 +321,16 @@ mkdir -p "$T/fake"
 cat > "$T/fake/sudo" <<'FAKE'
 #!/bin/bash
 shift; echo "$*" >> "$FAKE_OUT"
-while [ $# -gt 0 ]; do [ "$1" = --digestfile ] && printf '%s' "${FAKE_DIGEST}" > "$2"; shift; done
+last=${*: -1}
+[ -z "${FAKE_FAIL:-}" ] || [ "$last" != "$FAKE_FAIL" ] || exit 1
+d=$FAKE_DIGEST; case $last in *:0123456789ab) ;; *) d=${FAKE_EXTRA_DIGEST:-$FAKE_DIGEST} ;; esac
+while [ $# -gt 0 ]; do if [ "$1" = --digestfile ]; then printf '%s' "$d" > "$2"; fi; shift; done
 FAKE
 chmod +x "$T/fake/sudo"
 pushes() { # extra-tags [digest-for-extras]
   local out="$T/pargs" rt="$T/rt" go="$T/pgo"; rm -rf "$rt"; mkdir "$rt"; : > "$out"; : > "$go"
   PATH="$T/fake:$PATH" FAKE_OUT="$out" FAKE_DIGEST=$D RUNNER_TEMP=$rt GITHUB_OUTPUT=$go \
+    GITHUB_REF=${PREF:-refs/heads/main} DEFAULT_BRANCH=main \
     TAG=0123456789ab EXTRA_TAGS=$1 REGISTRY=r IMAGE=i bash "$T/push.sh" > "$T/pmsg" 2>&1
   cat "$out"
 }
@@ -336,6 +340,11 @@ a=$(pushes $'latest\nstable')
 want=$'buildah push --authfile '"$T"$'/rt/registry-auth.json --tls-verify=false --digestfile '"$T"$'/rt/digest r/i:0123456789ab\nbuildah tag r/i:0123456789ab r/i:latest'
 if [[ "$a" == "$want"$'\n'*"r/i:latest"$'\n'*"buildah tag r/i:0123456789ab r/i:stable"$'\n'*" r/i:stable" ]] && [ "$(grep -c '^buildah push' <<<"$a")" = 3 ]; then ok "push: extra tags tagged and pushed after the sha tag"; else bad "push with extra-tags: '$a'"; fi
 if [ "$(grep -c digest= "$T/pgo")" = 1 ] && grep -qx "digest=$D" "$T/pgo"; then ok "push: digest output is the sha tag's, one line"; else bad "push digest output: $(cat "$T/pgo")"; fi
+a=$(FAKE_EXTRA_DIGEST=sha256:$(printf 'b%.0s' {1..64}) pushes latest)
+if grep -q '::warning::latest pushed a different digest' "$T/pmsg" && grep -qx "digest=$D" "$T/pgo"; then ok "push: extra-tag digest mismatch only warns"; else bad "push mismatch: $(cat "$T/pmsg")"; fi
+if FAKE_FAIL=r/i:latest pushes latest >/dev/null && grep -q '::warning::extra tag latest was not pushed' "$T/pmsg" && grep -qx "digest=$D" "$T/pgo"; then ok "push: a failing extra-tag push only warns, sha digest kept"; else bad "push extra failure: $(cat "$T/pmsg")"; fi
+a=$(PREF=refs/heads/feat pushes latest)
+if [ "$(grep -c . <<<"$a")" = 1 ] && [[ "$a" == "buildah push "*" r/i:0123456789ab" ]]; then ok "push: extra tags skipped off the default branch"; else bad "push extras off default branch: '$a'"; fi
 step build "Remove the local image" > "$T/rmi.sh"
 [ -s "$T/rmi.sh" ] || { echo "FAIL extract rmi block"; exit 1; }
 : > "$T/pargs"; PATH="$T/fake:$PATH" FAKE_OUT="$T/pargs" TAG=0123456789ab EXTRA_TAGS=$'latest' REGISTRY=r IMAGE=i bash "$T/rmi.sh" >/dev/null 2>&1
