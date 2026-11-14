@@ -66,7 +66,7 @@ on:
         description: >-
           Several values files of THIS image only (one call per image), newline or
           space separated, each pinning the same values-key; bumped in one commit. When set it replaces values-file. The
-          stale-run guard reads the pin from the first one.
+          stale-run guard skips when any file's pin descends from the built commit.
         type: string
         default: ''
       version:
@@ -84,6 +84,13 @@ on:
         default: false
       cancel-in-progress:
         description: Cancel an older build of the same image and ref when a newer one starts. false queues (a release callers' tag is pushed before the build).
+        type: boolean
+        default: true
+      deploy:
+        description: >-
+          Run the deploy job (bump the values files). false builds and pushes
+          only, for a caller that bumps several images in one commit with
+          deploy.yml from this workflow's tag, digest and commit outputs.
         type: boolean
         default: true
       values-key:
@@ -353,8 +360,9 @@ jobs:
   deploy:
     needs: build
     # Only push/dispatch on the default branch deploys; a branch dispatch builds.
+    # deploy: false leaves the bump to deploy.yml (several images, one commit).
     if: >-
-      always() && needs.build.result == 'success'
+      always() && needs.build.result == 'success' && inputs.deploy
       && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
       && (inputs.values-files != '' || inputs.values-file != '')
       && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
@@ -372,30 +380,61 @@ jobs:
       VALUES_FILES: ${{ inputs.values-files != '' && inputs.values-files || inputs.values-file }}
       VALUES_KEY: ${{ inputs.values-key }}
       BRANCH: ${{ github.event.repository.default_branch }}
+      AUTHOR: ${{ inputs.image }}-ci
+      MESSAGE: 'chore(deploy): bump ${{ inputs.image }} image to ${{ needs.build.outputs.tag }}@${{ needs.build.outputs.digest }}'
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.repository.default_branch }}
 
+      # Turns this image's tag and digest into PINS (one "<file> <pin>" line per
+      # values file) for the shared steps below. No bare-sha fallback: an empty
+      # digest (e.g. the runner dropped the output) must fail, not silently skip.
+      # test/check.sh runs this block verbatim; keep the name.
+      - name: Pin the pushed digest
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^[0-9a-f]{12,40}$ ]] || { echo "::error::bad image tag: '$TAG'"; exit 1; }
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::push digest missing or malformed ('$DIGEST'): the build job's digest output was empty or dropped"; exit 1; }
+          read -ra files <<< "${VALUES_FILES//$'\n'/ }"
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::no values file (values-files is blank)"; exit 1; }
+          # Every line ends in the pin, so none can equal the delimiter.
+          {
+            echo 'PINS<<PINS_EOF'
+            for f in "${files[@]}"; do echo "$f $TAG@$DIGEST"; done
+            echo 'PINS_EOF'
+          } >> "$GITHUB_ENV"
+
       # Re-running all jobs of an OLD run would roll the values back. Skip only
       # on a re-run (attempt > 1; a fresh dispatch, even a rollback, deploys),
-      # when the commit already pinned in the values is a strict descendant of
+      # when the commit already pinned in ANY file is a strict descendant of
       # the built one (the tag is a 12-char sha; unknown or ambiguous deploys).
-      # test/check.sh runs this block verbatim; keep the name.
+      # This step, the bump and the commit are byte-identical in image.yml and
+      # deploy.yml (test/reusable.sh). test/check.sh runs it verbatim; keep the name.
       - name: Skip a stale run
         id: fresh
         run: |
           set -euo pipefail
           [[ "$BUILT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::built commit missing or malformed ('$BUILT')"; exit 1; }
           [ "$(git rev-parse --is-shallow-repository)" = true ] && git fetch -q --unshallow origin "$BRANCH" || true
-          read -ra files <<< "${VALUES_FILES//$'\n'/ }"
-          [ "${#files[@]}" -gt 0 ] || { echo "::error::no values file (values-files is blank)"; exit 1; }
-          for f in "${files[@]}"; do
-            [[ "$f" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ && "/$f/" != *"/../"* ]] \
+          # PINS: one "<values file> <sha12>@sha256:<64 hex>" per line.
+          files=(); vals=()
+          while read -r f v extra; do
+            [ -n "$f" ] || continue
+            # No ., .. or empty segment: one spelling per file, so the twice check holds.
+            [[ "$f" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ && "/$f/" != *"/./"* && "/$f/" != *"/../"* && "/$f/" != *"//"* ]] \
               || { echo "::error::bad values file: '$f'"; exit 1; }
             [ ! -L "$f" ] || { echo "::error::values file is a symlink: '$f'"; exit 1; }
-          done
-          # Stale if ANY file's pin strictly descends from the built commit.
+            [[ "$v" =~ ^[0-9a-f]{12,40}@sha256:[0-9a-f]{64}$ && -z "$extra" ]] \
+              || { echo "::error::bad pin for $f: '$v${extra:+ $extra}' (want <sha12>@sha256:<64 hex>)"; exit 1; }
+            # Every image from the built commit: one rollout, one protocol.
+            [[ "$BUILT" == "${v%%@*}"* ]] \
+              || { echo "::error::pin for $f is not of the built commit '$BUILT': '$v'"; exit 1; }
+            [[ " ${files[*]-} " != *" $f "* ]] || { echo "::error::values file listed twice: '$f'"; exit 1; }
+            files+=("$f"); vals+=("$v")
+          done <<< "$PINS"
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::no values file (no pins)"; exit 1; }
           stale=
           for f in "${files[@]}"; do
             p=$(yq "$VALUES_KEY" "$f" 2>/dev/null || true); p=${p%%@*}
@@ -413,31 +452,34 @@ jobs:
 
       # test/check.sh runs this block verbatim against fixtures; keep the name.
       # yq -i would reformat most values files (drops blank lines), so a
-      # one-line sed does the edit and yq only reads it back.
+      # one-line sed does the edit and yq only reads it back. The pin is
+      # <sha>@<digest>: the chart renders repository:<this>, which the kubelet
+      # pulls by digest, so a rebuild rolls out even under IfNotPresent.
       - name: Bump the pinned image tag
         if: steps.fresh.outputs.ok == 'true'
         run: |
           set -euo pipefail
-          [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::bad image tag: '$TAG'"; exit 1; }
-          # Pin <sha>@<digest>: the chart renders repository:<this>, a valid
-          # reference the kubelet pulls by digest, so a rebuild rolls out even
-          # under pullPolicy IfNotPresent. No bare-sha fallback: an empty digest
-          # (e.g. the runner dropped the output) must fail, not silently skip.
-          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
-            || { echo "::error::push digest missing or malformed ('$DIGEST'): the build job's digest output was empty or dropped"; exit 1; }
-          TAG="$TAG@$DIGEST"
-          echo "PINNED=$TAG" >> "${GITHUB_ENV:-/dev/null}"
-          read -ra files <<< "${VALUES_FILES//$'\n'/ }"
-          [ "${#files[@]}" -gt 0 ] || { echo "::error::no values file (values-files is blank)"; exit 1; }
-          for f in "${files[@]}"; do
-            [[ "$f" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ && "/$f/" != *"/../"* ]] \
+          files=(); vals=()
+          while read -r f v extra; do
+            [ -n "$f" ] || continue
+            # No ., .. or empty segment: one spelling per file, so the twice check holds.
+            [[ "$f" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ && "/$f/" != *"/./"* && "/$f/" != *"/../"* && "/$f/" != *"//"* ]] \
               || { echo "::error::bad values file: '$f'"; exit 1; }
             [ ! -L "$f" ] || { echo "::error::values file is a symlink: '$f'"; exit 1; }
-          done
+            [[ "$v" =~ ^[0-9a-f]{12,40}@sha256:[0-9a-f]{64}$ && -z "$extra" ]] \
+              || { echo "::error::bad pin for $f: '$v${extra:+ $extra}' (want <sha12>@sha256:<64 hex>)"; exit 1; }
+            # Every image from the built commit: one rollout, one protocol.
+            [[ "$BUILT" == "${v%%@*}"* ]] \
+              || { echo "::error::pin for $f is not of the built commit '$BUILT': '$v'"; exit 1; }
+            [[ " ${files[*]-} " != *" $f "* ]] || { echo "::error::values file listed twice: '$f'"; exit 1; }
+            files+=("$f"); vals+=("$v")
+          done <<< "$PINS"
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::no values file (no pins)"; exit 1; }
           leaf=${VALUES_KEY##*.}
           dots=${VALUES_KEY//[^.]/}
           indent=$(printf '%*s' $(( (${#dots} - 1) * 2 )) '')
-          for f in "${files[@]}"; do
+          for i in "${!files[@]}"; do
+            f=${files[$i]}; TAG=${vals[$i]}
             [ -f "$f" ] || { echo "::error::$f not found"; exit 1; }
             # Same sha and digest: nothing to bump. buildah bud is not reproducible
             # (created timestamp), so any rebuild gets a new digest and redeploys;
@@ -455,16 +497,20 @@ jobs:
               || { echo "::error::tag bump did not land on $VALUES_KEY in $f"; exit 1; }
           done
 
+      # One commit for every file: a multi-image rollout lands atomically.
       - name: Commit and push
         if: steps.fresh.outputs.ok == 'true'
         run: |
           set -euo pipefail
-          git config user.name "$IMAGE-ci"
+          git config user.name "$AUTHOR"
           git config user.email "noreply@bnei.dev"
-          read -ra files <<< "${VALUES_FILES//$'\n'/ }"
+          files=()
+          while read -r f _; do
+            if [ -n "$f" ]; then files+=("$f"); fi
+          done <<< "$PINS"
           git add -- "${files[@]}"
           git diff --cached --quiet && exit 0
-          git commit -m "chore(deploy): bump $IMAGE image to $PINNED"
+          git commit -m "$MESSAGE" -m "$PINS"
           # The default branch also takes local pushes; retry if it moves.
           for _ in 1 2 3; do
             git pull --rebase origin "$BRANCH" && git push origin "HEAD:$BRANCH" && exit 0

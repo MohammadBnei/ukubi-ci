@@ -62,6 +62,19 @@ if d=$(diff <(yq -o=json -I0 "$sel" "$W/image.yml") <(yq -o=json -I0 "$sel" "$W/
   ok "image-build: tag and Build steps == image.yml"
 else bad "image-build: tag and Build steps drifted from image.yml: $d"; fi
 
+# 1b. deploy.yml's guard, bump and commit steps are image.yml's deploy steps, env and if included.
+sel='.jobs.deploy.steps[] | select(.name == "Skip a stale run" or .name == "Bump the pinned image tag" or .name == "Commit and push")'
+n=$(yq "[$sel] | length" "$W/deploy.yml")
+if [ "$n" = 3 ] && d=$(diff <(yq -o=json -I0 "$sel" "$W/image.yml") <(yq -o=json -I0 "$sel" "$W/deploy.yml")); then
+  ok "deploy: stale guard, bump and commit steps == image.yml"
+else bad "deploy: shared steps drifted from image.yml ($n found): ${d:-}"; fi
+for f in image deploy; do
+  # shellcheck disable=SC2016 # a literal ${{, not a shell expansion
+  if yq '.jobs[].steps[].run | select(. != null)' "$W/$f.yml" | grep -qF '${{'; then
+    bad "$f: an expression inside a run block"
+  else ok "$f: no expression inside a run block"; fi
+done
+
 # 2. trailers. One repo: BASE0 is itself dirty (the base side is never scanned).
 extract trailers.yml "Check commits and PR text" "$T/trailers.sh"
 R=$T/repo; git init -q -b main "$R"

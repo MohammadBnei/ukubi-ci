@@ -63,19 +63,21 @@ hq-style layout (Dockerfile and context in a subdirectory):
 | `layers` | `true` | `--layers` (large images may want `false`: layers stay on the shared disk until the weekly prune) |
 | `pull-newer` | `true` | `--pull=newer` |
 | `values-file` | `helm/values.yaml` | empty (with `values-files` empty) skips the deploy job |
-| `values-files` | | several values files, newline or space separated, each pinning `values-key` for this same image only (one call per image: wird's adminweb file does not go in the api call); one bump commit. Replaces `values-file` when set. The stale-run guard skips when any file's pin descends from the built commit; a file already at the pin is skipped, and no file changed means no commit |
+| `values-files` | | several values files, newline or space separated, each pinning `values-key` for this same image only (one call per image: wird's adminweb file does not go in the api call), each once; one bump commit. Several images in one commit: `deploy: false` plus [deploy.yml](#deployyml). Replaces `values-file` when set. The stale-run guard skips when any file's pin descends from the built commit; a file already at the pin is skipped, and no file changed means no commit |
 | `version-arg` | `false` | pass `--build-arg VERSION`: `X.Y.Z` when `ref` is a release tag, else `X.Y.Z+<sha12>` on the default branch, else `X.Y.Z-dev+<sha12>` (`0.0.0` before the first release) |
 | `version` | | release.yml's `version` output; needs `version-arg`. Must be `X.Y.Z`, or empty with an empty `ref` |
 | `build-timeout-minutes` | `60` | build job cap (callers cannot set `timeout-minutes` on a `uses:` job; guard is 5, deploy 10). Slowest observed build is about 7 min |
 | `registry-secret-path` | `/` | Infisical folder of `REGISTRY_PASSWORD`. Only that key reaches the build job's env, but the action fetches the whole folder; point this at a folder holding just the password (e.g. `/registry`) to stop app secrets being fetched at all |
 | `cancel-in-progress` | `true` | build concurrency; `false` never cancels a running build (release callers: a cancel leaves a pushed tag with no image); GitHub still keeps one pending run per group, and a newer push replaces a pending one. The deploy group never cancels |
 | `values-key` | `.image.tag` | yq path; the value must be double-quoted, two-space indented |
+| `deploy` | `true` | `false` skips the deploy job (build and push only); bump with [deploy.yml](#deployyml) instead, to roll several images out in one commit |
 | `registry` | `registry.bnei.lan:5000` | |
 
 Secret `build-secrets` (optional): multiline `id=value`. Each becomes
 `--secret id=<id>`, read in the Dockerfile with
 `RUN --mount=type=secret,id=<id>`. Example: `build-secrets: github_token=${{ github.token }}`.
-Outputs: `tag`, the pushed tag; `digest`, the pushed manifest digest.
+Outputs: `tag`, the pushed tag; `digest`, the pushed manifest digest;
+`commit`, the full built sha (set with `deploy: false` too).
 
 Rules:
 
@@ -111,6 +113,71 @@ Prerequisites per caller repo (infra-bootstrap
 - The repo on the `ci-oidc` identity's bound `repository` list. Under
   `workflow_call` the OIDC claims are the caller's. ukubi-ci itself must
   never be added there, and must never get a build runner.
+
+## deploy.yml
+
+Pins several images in the caller's helm values in **one** commit, so ArgoCD
+rolls them out together. For a repo that ships images that must match (ukubi-game's
+game and realm speak one protocol): build each with image.yml `deploy: false`,
+then one deploy.yml job pins them all. Its stale-run guard, bump and commit
+steps are image.yml's deploy steps byte for byte (`test/reusable.sh` checks),
+so the rules above hold: `<sha>@sha256:<digest>` pins, one line changed per
+file, a re-run of an old run is skipped, no commit when every file already
+holds its pin, `git pull --rebase` retries. Runs on `push` and
+`workflow_dispatch` on the default branch only, like image.yml's deploy job.
+
+```yaml
+# .github/workflows/app.yml in ukubi-game
+jobs:
+  game:
+    permissions:
+      contents: write   # checked on nested jobs even with deploy: false
+      id-token: write
+    uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@<40-char sha>
+    with:
+      runs-on: ${{ github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["self-hosted","ukubi-build"]' }}
+      image: ukubi-game
+      build-args: BIN=game
+      deploy: false
+    secrets:
+      build-secrets: mountain_token=${{ secrets.MOUNTAIN_READ_TOKEN }}
+  realm:
+    permissions:
+      contents: write
+      id-token: write
+    uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@<40-char sha>
+    with:
+      runs-on: ${{ github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["self-hosted","ukubi-build"]' }}
+      image: ukubi-realm
+      build-args: BIN=realm
+      deploy: false
+    secrets:
+      build-secrets: mountain_token=${{ secrets.MOUNTAIN_READ_TOKEN }}
+  deploy:
+    # Skipped unless both builds succeed: never one image without the other.
+    needs: [game, realm]
+    permissions:
+      contents: write
+    uses: MohammadBnei/ukubi-ci/.github/workflows/deploy.yml@<40-char sha>
+    with:
+      built-commit: ${{ needs.game.outputs.commit }}
+      pins: |
+        helm/values.yaml ${{ needs.game.outputs.tag }}@${{ needs.game.outputs.digest }}
+        helm/public.yaml ${{ needs.game.outputs.tag }}@${{ needs.game.outputs.digest }}
+        helm/realm.yaml ${{ needs.realm.outputs.tag }}@${{ needs.realm.outputs.digest }}
+```
+
+| input | default | |
+|---|---|---|
+| `pins` | required | one `<values file> <sha12>@sha256:<64 hex>` per line; each file once, every file must exist (no skip-if-missing), paths relative to the repo root, no `..`, no symlink |
+| `built-commit` | required | full sha the images were built from (image.yml's `commit`); all images come from one commit |
+| `values-key` | `.image.tag` | yq path in every file, as in image.yml |
+| `runs-on` | `["ubuntu-latest"]` | JSON list; the runner needs git and yq |
+| `commit-author` | `<repo>-ci` | bump commit author name |
+
+The commit subject is `chore(deploy): bump <repo> images`; its body lists the
+pins. A malformed line (bare sha, empty digest on a PR build, a third field)
+fails before any file is edited.
 
 ## release.yml
 

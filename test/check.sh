@@ -47,15 +47,18 @@ pr 0 pull_request_target '["ubuntu-latest"]'      "pull_request_target on ubuntu
 pr 0 workflow_dispatch '["ukubi-build"]'          "dispatch on a bare self-hosted label passes"
 
 # 3. The deploy bump. Each case: name, values-key, expected rc, expected
-#    error substring (or ""), file content; TAG is 0123456789ab and DIGEST $D
-#    unless the optional 6th arg overrides the digest.
+#    error substring (or ""), file content; the pin is 0123456789ab@$D unless
+#    the optional 6th arg overrides it.
 D=sha256:$(printf 'a%.0s' {1..64})
+PIN="0123456789ab@$D"
+# The commit every pin below was built from (the bump checks the tag is its prefix).
+export BUILT=0123456789ab0123456789ab0123456789abcdef
 step deploy "Bump the pinned image tag" > "$T/bump.sh"
 [ -s "$T/bump.sh" ] || { echo "FAIL extract bump block"; exit 1; }
-bump() { # name key want_rc want_msg content [digest]
-  local dg=${6-$D} want="0123456789ab@${6-$D}"
+bump() { # name key want_rc want_msg content [pin]
+  local want=${6-$PIN}
   local d="$T/case" out rc; rm -rf "$d"; mkdir -p "$d"; [ "$5" = - ] || printf '%s' "$5" > "$d/values.yaml"
-  out=$(cd "$d" && TAG=0123456789ab DIGEST=$dg VALUES_FILES=values.yaml VALUES_KEY=$2 bash "$T/bump.sh" 2>&1); rc=$?
+  out=$(cd "$d" && PINS="values.yaml $want" VALUES_KEY=$2 bash "$T/bump.sh" 2>&1); rc=$?
   if [ "$rc" != "$3" ]; then bad "bump $1: rc=$rc want $3 ($out)"; return; fi
   if [ -n "$4" ] && [[ "$out" != *"$4"* ]]; then bad "bump $1: want '$4', got '$out'"; return; fi
   if [ "$3" = 0 ] && [ "$(yq "$2" "$d/values.yaml")" != "$want" ]; then bad "bump $1: tag not set"; return; fi
@@ -73,8 +76,8 @@ image:
 service:
   port: 8080
 '
-bump "already at TAG stays green (re-run)" .image.tag 0 "already 0123456789ab@$D" "image:
-  tag: \"0123456789ab@$D\"
+bump "already at the pin stays green (re-run)" .image.tag 0 "already $PIN" "image:
+  tag: \"$PIN\"
 "
 bump "depth-2 key .api.image.tag (indent derived from the key)" .api.image.tag 0 "" 'api:
   image:
@@ -105,43 +108,63 @@ bump "same sha, new digest bumps" .image.tag 0 "" "image:
 bump "old bare-sha value bumps to sha@digest" .image.tag 0 "" 'image:
   tag: "0123456789ab"
 '
-bump "empty digest fails" .image.tag 1 "digest missing or malformed" 'image:
+for p in "" "0123456789ab" "0123456789ab@" "0123456789ab@sha256:$(printf 'A%.0s' {1..64})" \
+         "0123456789ab@sha256:$(printf 'a%.0s' {1..63})" "0123456789ab@sha512:$(printf 'a%.0s' {1..64})" \
+         "0123456789a@$D" "0123456789AB@$D" "0123456789ab@$D extra" "x/y@$D" "ffffffffffff@$D"; do
+  bump "malformed pin '${p:0:24}...' refused" .image.tag 1 "pin" 'image:
   tag: "x"
-' ""
-bump "uppercase digest refused" .image.tag 1 "digest missing or malformed" 'image:
-  tag: "x"
-' "sha256:$(printf 'A%.0s' {1..64})"
-bump "63-hex digest refused" .image.tag 1 "digest missing or malformed" 'image:
-  tag: "x"
-' "sha256:$(printf 'a%.0s' {1..63})"
-bump "sha512 digest refused" .image.tag 1 "digest missing or malformed" 'image:
-  tag: "x"
-' "sha512:$(printf 'a%.0s' {1..64})"
+' "$p"
+done
 
-# 3b. Several values files: one commit, a no-op only when every file holds the pin.
+# 3a. image.yml's prep step: tag and digest become PINS, one line per values file.
+step deploy "Pin the pushed digest" > "$T/prep.sh"
+[ -s "$T/prep.sh" ] || { echo "FAIL extract prep block"; exit 1; }
+pins_of() { sed -n '/^PINS<<PINS_EOF$/,/^PINS_EOF$/{//!p;}' "$1"; }
+prep() { # name want_rc want_msg values-files [digest] [tag]
+  local out rc; : > "$T/penv"
+  out=$(TAG=${6-0123456789ab} DIGEST=${5-$D} VALUES_FILES=$4 GITHUB_ENV=$T/penv bash "$T/prep.sh" 2>&1); rc=$?
+  if [ "$rc" = "$2" ] && { [ -z "$3" ] || [[ "$out" == *"$3"* ]]; }; then ok "prep $1"; else bad "prep $1: rc=$rc ($out)"; fi
+}
+prep "two files, newline separated" 0 "" $'a.yaml\n b.yaml'
+if [ "$(pins_of "$T/penv")" = "a.yaml $PIN"$'\n'"b.yaml $PIN" ]; then ok "prep: PINS holds one line per file"; else bad "prep: PINS '$(cat "$T/penv")'"; fi
+prep "empty digest fails" 1 "digest missing or malformed" a.yaml ""
+prep "uppercase digest refused" 1 "digest missing or malformed" a.yaml "sha256:$(printf 'A%.0s' {1..64})"
+prep "63-hex digest refused" 1 "digest missing or malformed" a.yaml "sha256:$(printf 'a%.0s' {1..63})"
+prep "sha512 digest refused" 1 "digest missing or malformed" a.yaml "sha512:$(printf 'a%.0s' {1..64})"
+prep "bad tag refused" 1 "bad image tag" a.yaml "$D" "v1.2.3"
+prep "blank values-files refused" 1 "values-files is blank" " "
+
+# 3b. Several values files: one commit, a no-op only when every file holds its pin.
 step deploy "Commit and push" > "$T/commit.sh"
 [ -s "$T/commit.sh" ] || { echo "FAIL extract commit block"; exit 1; }
-PIN="0123456789ab@$D"
-multi() { # name want_commits files-of-commit(0|1|2) a-tag b-tag
-  local d="$T/multi" r="$T/multi-remote.git"; rm -rf "$d" "$r"; mkdir -p "$d"; git init -q --bare -b main "$r"
-  printf 'image:\n  tag: "%s"\n' "$4" > "$d/a.yaml"; printf 'image:\n  tag: "%s"\n' "$5" > "$d/b.yaml"
+# repo <dir> <a-tag> <b-tag>: a work tree with a.yaml and b.yaml, pushed to a bare remote.
+repo() {
+  local d=$1 r="$1-remote.git"; rm -rf "$d" "$r"; mkdir -p "$d"; git init -q --bare -b main "$r"
+  printf 'image:\n  tag: "%s"\n' "$2" > "$d/a.yaml"; printf 'image:\n  tag: "%s"\n' "$3" > "$d/b.yaml"
   git -C "$d" init -q -b main; git -C "$d" remote add origin "$r"; git -C "$d" add .
   git -C "$d" -c user.name=t -c user.email=t@t commit -qm init; git -C "$d" push -q origin main
-  local out rc; out=$(cd "$d" && TAG=0123456789ab DIGEST=$D VALUES_FILES=$'a.yaml\n b.yaml' VALUES_KEY=.image.tag bash "$T/bump.sh" 2>&1); rc=$?
+}
+multi() { # name want_commits files-of-commit(0|1|2) a-tag b-tag
+  local d="$T/multi" pins; repo "$d" "$4" "$5"; pins="a.yaml $PIN"$'\n'"b.yaml $PIN"
+  local out rc; out=$(cd "$d" && PINS=$pins VALUES_KEY=.image.tag bash "$T/bump.sh" 2>&1); rc=$?
   [ "$rc" = 0 ] || { bad "multi $1: bump rc=$rc ($out)"; return; }
   [ "$(yq .image.tag "$d/a.yaml")" = "$PIN" ] && [ "$(yq .image.tag "$d/b.yaml")" = "$PIN" ] || { bad "multi $1: a file not pinned"; return; }
-  (cd "$d" && IMAGE=app PINNED=$PIN BRANCH=main VALUES_FILES=$'a.yaml\n b.yaml' bash "$T/commit.sh" >/dev/null 2>&1) || { bad "multi $1: commit step failed"; return; }
+  (cd "$d" && AUTHOR=app-ci MESSAGE="chore(deploy): bump app image to $PIN" PINS=$pins BRANCH=main bash "$T/commit.sh" >/dev/null 2>&1) || { bad "multi $1: commit step failed"; return; }
   local n f; n=$(git -C "$d" rev-list --count HEAD); f=$(git -C "$d" show --format= --name-only HEAD | grep -c yaml)
   if [ "$n" != "$2" ] || { [ "$2" = 2 ] && [ "$f" != "$3" ]; }; then bad "multi $1: $n commits, last touches $f files; want $2, $3"; return; fi
+  if [ "$2" = 2 ] && [ "$(git -C "$d" log -1 --format=%an%n%s)" != "app-ci"$'\n'"chore(deploy): bump app image to $PIN" ]; then bad "multi $1: author or subject"; return; fi
   ok "multi $1"
 }
 multi "both stale: one commit touching both files" 2 2 aaaaaaaaaaaa bbbbbbbbbbbb
 multi "one file already pinned: bump still lands, one commit" 2 1 "$PIN" bbbbbbbbbbbb
 multi "first file pinned, second stale (order does not matter)" 2 1 aaaaaaaaaaaa "$PIN"
 multi "every file already pinned: no commit" 1 0 "$PIN" "$PIN"
+# vbump: image.yml's values-files through the prep step, then the bump.
 vbump() { # name want_rc want_msg files
   local d="$T/vb"; rm -rf "$d"; mkdir -p "$d"; printf 'image:\n  tag: "x"\n' > "$d/a.yaml"; printf 'image:\n  tag: "x"\n' > "$d/b.yaml"
-  local out rc; out=$(cd "$d" && TAG=0123456789ab DIGEST=$D VALUES_FILES=$4 VALUES_KEY=.image.tag bash "$T/bump.sh" 2>&1); rc=$?
+  : > "$T/venv"; local out rc
+  out=$(TAG=0123456789ab DIGEST=$D VALUES_FILES=$4 GITHUB_ENV=$T/venv bash "$T/prep.sh" 2>&1 \
+    && cd "$d" && PINS=$(pins_of "$T/venv") VALUES_KEY=.image.tag bash "$T/bump.sh" 2>&1); rc=$?
   if [ "$rc" != "$2" ] || { [ -n "$3" ] && [[ "$out" != *"$3"* ]]; }; then bad "multi $1: rc=$rc ($out)"; else ok "multi $1"; fi
 }
 vbump "single file in VALUES_FILES works (values-file alias)" 0 "" a.yaml
@@ -153,8 +176,9 @@ vbump "glob refused, not expanded" 1 "bad values file" "*.yaml"
 vbump "empty list refused" 1 "no values file" ""
 vbump "blank list refused" 1 "no values file" " "
 vbump "leading dash refused" 1 "bad values file" "-a.yaml"
+vbump "same file twice refused" 1 "listed twice" "a.yaml a.yaml"
 vbump_link() { local d="$T/vb"; mkdir -p "$d"; printf 'image:\n  tag: "x"\n' > "$d/real.yaml"; ln -sf real.yaml "$d/l.yaml"
-  local out rc; out=$(cd "$d" && TAG=0123456789ab DIGEST=$D VALUES_FILES=l.yaml VALUES_KEY=.image.tag bash "$T/bump.sh" 2>&1); rc=$?
+  local out rc; out=$(cd "$d" && PINS="l.yaml $PIN" VALUES_KEY=.image.tag bash "$T/bump.sh" 2>&1); rc=$?
   if [ "$rc" = 1 ] && [[ "$out" == *symlink* ]]; then ok "multi symlink refused"; else bad "multi symlink: rc=$rc ($out)"; fi; }
 vbump_link
 
@@ -170,7 +194,7 @@ pin() { printf 'image:\n  tag: "%s"\n' "$1" > "$g/w/values.yaml"; }
 pin "${B:0:12}@$D"; c "chore(deploy): bump app image" >/dev/null; git -C "$g/w" push -q origin main
 guard() { # name built-sha pinned-value want [attempt] [clone]
   local w="${6:-$g/w}" bt=$2; : > "$T/out"; pin "$3"; [ "$w" = "$g/w" ] || cp "$g/w/values.yaml" "$w/"
-  (cd "$w" && BUILT=$bt GITHUB_RUN_ATTEMPT=${5:-2} BRANCH=main VALUES_FILES=values.yaml VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >/dev/null 2>&1)
+  (cd "$w" && BUILT=$bt GITHUB_RUN_ATTEMPT=${5:-2} BRANCH=main PINS="values.yaml ${bt:0:12}@$D" VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >/dev/null 2>&1)
   if grep -qx "ok=$4" "$T/out"; then ok "guard $1"; else bad "guard $1: $(cat "$T/out")"; fi
 }
 git clone -q --depth 1 "file://$g/remote.git" "$g/shallow" 2>/dev/null
@@ -183,28 +207,95 @@ for w in "$g/w" "$g/shallow"; do
   guard "[$n] unknown pin deploys" "$B" "ffffffffffff@$D" true 2 "$w"
 done
 : > "$T/out"; pin "${B:0:12}@$D"
-if (cd "$g/w" && BUILT=abc BRANCH=main VALUES_FILES=values.yaml VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >"$T/m" 2>&1); then bad "guard malformed BUILT must fail"
+if (cd "$g/w" && BUILT=abc BRANCH=main PINS="values.yaml $PIN" VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >"$T/m" 2>&1); then bad "guard malformed BUILT must fail"
 elif grep -q "built commit missing or malformed" "$T/m"; then ok "guard malformed BUILT fails closed"; else bad "guard malformed BUILT: $(cat "$T/m")"; fi
 
 # The guard skips when ANY file's pin descends from BUILT, in either order.
-printf 'image:\n  tag: "ffffffffffff@%s"\n' "$D" > "$g/w/other.yaml"; pin "${B:0:12}@$D"
-gm() { # name want files [built]
+printf 'image:\n  tag: "ffffffffffff@%s"\n' "$D" > "$g/w/other.yaml"; cp "$g/w/other.yaml" "$g/w/third.yaml"; pin "${B:0:12}@$D"
+lines() { local f; for f in $1; do echo "$f ${2:0:12}@$D"; done; } # files built
+gm() { # name want files [built] [guard script]
   : > "$T/out"
-  (cd "$g/w" && BUILT=${4:-$A} GITHUB_RUN_ATTEMPT=2 BRANCH=main VALUES_FILES=$3 VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >"$T/gm" 2>&1)
+  (cd "$g/w" && BUILT=${4:-$A} GITHUB_RUN_ATTEMPT=2 BRANCH=main PINS=$(lines "$3" "${4:-$A}") VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "${5:-$T/fresh.sh}" >"$T/gm" 2>&1)
   if grep -qx "ok=$2" "$T/out"; then ok "guard $1"; else bad "guard $1: $(cat "$T/out" "$T/gm")"; fi
 }
 gm "several files: a stale one first skips" false "values.yaml other.yaml"
 gm "several files: a stale one second skips" false "other.yaml values.yaml"
-gm "several files: no pin descends, deploys" true "other.yaml other.yaml"
-gm_fail() { # name files substring
-  (cd "$g/w" && BUILT=$A BRANCH=main VALUES_FILES=$2 VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >"$T/gm" 2>&1) \
+gm "several files: no pin descends, deploys" true "other.yaml third.yaml"
+gm_fail() { # name pins substring
+  (cd "$g/w" && BUILT=$A BRANCH=main PINS=$2 VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >"$T/gm" 2>&1) \
     && { bad "guard $1 must fail"; return; }
   if grep -q "$3" "$T/gm"; then ok "guard $1"; else bad "guard $1: $(cat "$T/gm")"; fi
 }
-gm_fail "blank values-files fails early" " " "values-files is blank"
-gm_fail "path with .. refused before reading" "../x.yaml" "bad values file"
-gm_fail "leading dash refused" "-x.yaml" "bad values file"
-ln -sf values.yaml "$g/w/link.yaml"; gm_fail "symlink refused" "link.yaml" "symlink"; unlink "$g/w/link.yaml"
+gm_fail "blank pins fails early" " " "no pins"
+AP="${A:0:12}@$D"
+gm_fail "path with .. refused before reading" "../x.yaml $AP" "bad values file"
+gm_fail "leading dash refused" "-x.yaml $AP" "bad values file"
+gm_fail "malformed pin refused" "values.yaml ${A:0:12}" "bad pin"
+gm_fail "pin of another commit refused" "values.yaml ${B:0:12}@$D" "not of the built commit"
+gm_fail "same file twice refused" "$(lines "values.yaml values.yaml" "$A")" "listed twice"
+gm_fail "same file as ./ spelling refused" "values.yaml $AP"$'\n'"./values.yaml $AP" "bad values file"
+ln -sf values.yaml "$g/w/link.yaml"; gm_fail "symlink refused" "link.yaml $AP" "symlink"; unlink "$g/w/link.yaml"
+
+# 4a. deploy.yml: several images, one commit. Its shared steps are image.yml's
+#     byte for byte (test/reusable.sh); these run deploy.yml's own copy.
+DWF=$(dirname "$WF")/deploy.yml
+dstep() { yq ".jobs.deploy.steps[] | select(.name == \"$1\") | .run" "$DWF"; }
+dstep "Skip a stale run" > "$T/dfresh.sh"; dstep "Bump the pinned image tag" > "$T/dbump.sh"; dstep "Commit and push" > "$T/dcommit.sh"
+dstep "Check inputs" > "$T/dcheck.sh"
+for f in dfresh dbump dcommit dcheck; do [ -s "$T/$f.sh" ] || { echo "FAIL extract deploy.yml $f"; exit 1; }; done
+GAME="0123456789ab@$D"; REALM="0123456789ab@sha256:$(printf 'b%.0s' {1..64})"
+atomic() { # name want_commits a-tag b-tag [files in the bump commit]
+  local d="$T/atomic" pins out rc; repo "$d" "$3" "$4"; pins="a.yaml $GAME"$'\n'"b.yaml $REALM"
+  out=$(cd "$d" && PINS=$pins VALUES_KEY=.image.tag bash "$T/dbump.sh" 2>&1 \
+    && AUTHOR=game-ci MESSAGE="chore(deploy): bump game images" PINS=$pins BRANCH=main bash "$T/dcommit.sh" 2>&1); rc=$?
+  [ "$rc" = 0 ] || { bad "deploy.yml $1: rc=$rc ($out)"; return; }
+  [ "$(yq .image.tag "$d/a.yaml")" = "$GAME" ] && [ "$(yq .image.tag "$d/b.yaml")" = "$REALM" ] || { bad "deploy.yml $1: a file not at its own pin"; return; }
+  local n; n=$(git -C "$d-remote.git" rev-list --count main)
+  [ "$n" = "$2" ] || { bad "deploy.yml $1: $n commits on the remote, want $2"; return; }
+  if [ "$2" = 2 ]; then
+    [ "$(git -C "$d" show --format= --name-only HEAD | sort | tr '\n' ' ')" = "${5:-a.yaml b.yaml} " ] || { bad "deploy.yml $1: bump commit files"; return; }
+    [ "$(git -C "$d" log -1 --format=%b | grep -c '@sha256:')" = 2 ] || { bad "deploy.yml $1: body does not list both pins"; return; }
+  fi
+  ok "deploy.yml $1"
+}
+atomic "two files, different pins: one commit holding both" 2 aaaaaaaaaaaa bbbbbbbbbbbb
+atomic "one file already at its pin: still one commit" 2 "$GAME" bbbbbbbbbbbb b.yaml
+atomic "every file already at its pin: no-op, no commit" 1 "$GAME" "$REALM"
+dfail() { # name pins substring
+  local d="$T/atomic" out rc; repo "$d" x x
+  out=$(cd "$d" && PINS=$2 VALUES_KEY=.image.tag bash "$T/dbump.sh" 2>&1); rc=$?
+  if [ "$rc" != 0 ] && [[ "$out" == *"$3"* ]] && [ "$(yq .image.tag "$d/a.yaml")" = x ]; then ok "deploy.yml $1"; else bad "deploy.yml $1: rc=$rc ($out)"; fi
+}
+dfail "pin without a digest refused" "a.yaml 0123456789ab" "bad pin"
+dfail "line without a pin refused" "a.yaml" "bad pin"
+dfail "third field refused" "a.yaml $GAME b.yaml" "bad pin"
+dfail "a malformed second line refuses before any edit" "a.yaml $GAME"$'\n'"b.yaml $GAME junk" "bad pin"
+dfail "parent-dir path refused" "../a.yaml $GAME" "bad values file"
+dfail "absolute path refused" "/etc/passwd $GAME" "bad values file"
+dfail "blank pins refused" $'\n  \n' "no pins"
+dfail "second image from another commit refused (not one rollout)" "a.yaml $GAME"$'\n'"b.yaml ffffffffffff@$D" "not of the built commit"
+dfail "./ segment refused (a.yaml and ./a.yaml are one file)" "a.yaml $GAME"$'\n'"./a.yaml $REALM" "bad values file"
+dfail "inner . segment refused" "x/./a.yaml $GAME" "bad values file"
+dfail "// refused" "x//a.yaml $GAME" "bad values file"
+dfail "trailing slash refused" "a.yaml/ $GAME" "bad values file"
+ln -sf a.yaml "$T/atomic/l.yaml"; out=$(cd "$T/atomic" && PINS="l.yaml $GAME" VALUES_KEY=.image.tag bash "$T/dbump.sh" 2>&1)
+if [[ "$out" == *symlink* ]]; then ok "deploy.yml symlink refused"; else bad "deploy.yml symlink: $out"; fi
+gm "deploy.yml: stale re-run (any pin descends from built) skips" false "other.yaml values.yaml" "$A" "$T/dfresh.sh"
+gm "deploy.yml: no pin descends, deploys" true "other.yaml third.yaml" "$A" "$T/dfresh.sh"
+if VALUES_KEY='.image.tag; x' bash "$T/dcheck.sh" >/dev/null 2>&1; then bad "deploy.yml bad values-key must fail"; else ok "deploy.yml bad values-key refused"; fi
+if VALUES_KEY=.image.tag bash "$T/dcheck.sh" >/dev/null 2>&1; then ok "deploy.yml values-key .image.tag passes"; else bad "deploy.yml .image.tag refused"; fi
+
+# 4c. image.yml deploy: false skips the deploy job and keeps the build outputs.
+if [ "$(yq '.on.workflow_call.inputs.deploy.default' "$WF")" = true ]; then ok "image.yml deploy defaults to true"; else bad "image.yml deploy default"; fi
+if yq '.jobs.deploy.if' "$WF" | grep -qF '&& inputs.deploy'; then ok "image.yml deploy job gated on inputs.deploy"; else bad "image.yml deploy job not gated on inputs.deploy"; fi
+for o in tag commit digest; do
+  if [ "$(yq ".on.workflow_call.outputs.$o.value" "$WF")" = "\${{ jobs.build.outputs.$o }}" ]; then ok "image.yml output $o comes from the build job"; else bad "image.yml output $o"; fi
+done
+ev="(github.event_name == 'push' || github.event_name == 'workflow_dispatch')"
+br="github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"
+if [ "$(yq '.jobs.deploy.if' "$DWF")" = "$ev && $br" ] && [[ "$(yq '.jobs.deploy.if' "$WF")" == *"$ev"*"$br"* ]]; then
+  ok "deploy.yml deploys on the same events and branch as image.yml"
+else bad "deploy.yml event/branch gate differs from image.yml"; fi
 
 # 4b. Version inputs sanity in the build job's Check inputs step.
 step build "Check inputs" > "$T/ci.sh"
