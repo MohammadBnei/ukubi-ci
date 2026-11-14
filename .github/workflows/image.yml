@@ -93,6 +93,17 @@ on:
       registry:
         type: string
         default: registry.bnei.lan:5000
+      registry-secret-path:
+        description: >-
+          Infisical folder holding REGISTRY_PASSWORD. Only REGISTRY_PASSWORD is
+          kept from it, but the action fetches the whole folder, so a dedicated
+          folder (e.g. /registry) keeps app secrets from being read at all.
+        type: string
+        default: /
+      build-timeout-minutes:
+        description: Cap for the build job; a hung buildah would hold the shared runner for GitHub's 6 hours.
+        type: number
+        default: 60
     secrets:
       build-secrets:
         description: Multiline id=value; each becomes `--secret id=<id>` (RUN --mount=type=secret,id=<id>).
@@ -132,6 +143,7 @@ jobs:
   # (build-runner-ops: per-repo runners, fork PR approval).
   guard:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions: {}
     steps:
       - name: Refuse a non-GitHub-hosted runner on pull_request
@@ -149,6 +161,7 @@ jobs:
 
   build:
     needs: guard
+    timeout-minutes: ${{ inputs.build-timeout-minutes }}
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     concurrency:
       group: ukubi-ci-image-${{ inputs.image }}-${{ github.ref }}
@@ -256,8 +269,12 @@ jobs:
           done <<< "$BUILD_SECRETS"
           sudo -n buildah bud "${args[@]}" "$CONTEXT"
 
-      # Only REGISTRY_PASSWORD, not the whole environment. The identity's bound
-      # claims allow push and workflow_dispatch only, so nothing else asks.
+      # The action has no single-secret option (a `secret-name` input does not
+      # exist), and export-type env would put EVERY secret at secret-path into
+      # the env of all later steps. So it writes a file (in the workspace, after
+      # the build) and the next step lifts REGISTRY_PASSWORD alone. The identity's
+      # bound claims allow push and workflow_dispatch only, so nothing else asks.
+      # A dedicated folder (input registry-secret-path) stops them being fetched.
       - name: Read the registry password from Infisical
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: Infisical/secrets-action@a663da43e1541832614bfd9dcf9ab67381ea2b98 # v1.0.12
@@ -268,15 +285,33 @@ jobs:
           domain: ${{ env.INFISICAL_DOMAIN }}
           project-slug: ${{ env.INFISICAL_PROJECT_SLUG }}
           env-slug: ${{ env.INFISICAL_ENV }}
-          secret-path: /
-          secret-name: REGISTRY_PASSWORD
-          export-type: env
+          secret-path: ${{ inputs.registry-secret-path }}
+          export-type: file
+          file-output-path: /.infisical-secrets
 
       # GitHub masks only secrets.*; an unmasked Infisical value leaked a token
-      # in this estate once.
-      - name: Mask the fetched password
+      # in this estate once. The file holds KEY='value' lines; only this one
+      # reaches GITHUB_ENV, and the file is deleted either way.
+      # test/check.sh runs this block verbatim; keep the name.
+      - name: Keep only the registry password
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        run: echo "::add-mask::$REGISTRY_PASSWORD"
+        run: |
+          set -euo pipefail
+          f="$GITHUB_WORKSPACE/.infisical-secrets"
+          line=$(grep -m1 "^REGISTRY_PASSWORD='" "$f" || true); rm -f "$f"
+          [ -n "$line" ] || { echo "::error::Infisical returned no REGISTRY_PASSWORD"; exit 1; }
+          # A multi-line password would leave this line without its closing quote.
+          [[ "$line" == REGISTRY_PASSWORD=\'*\' && ${#line} -gt 20 ]] \
+            || { echo "::error::REGISTRY_PASSWORD is empty or not a single line"; exit 1; }
+          pw=${line#REGISTRY_PASSWORD=\'}; pw=${pw%\'}
+          echo "::add-mask::$pw"
+          echo "REGISTRY_PASSWORD=$pw" >> "$GITHUB_ENV"
+
+      # A cancel or timeout between fetch and keep must not leave the file on
+      # the self-hosted workspace.
+      - name: Remove the Infisical secrets file
+        if: always()
+        run: rm -f "$GITHUB_WORKSPACE/.infisical-secrets"
 
       - name: Registry login
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
@@ -324,6 +359,7 @@ jobs:
       && (inputs.values-files != '' || inputs.values-file != '')
       && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     concurrency:
       group: ukubi-ci-image-${{ inputs.image }}-deploy
       cancel-in-progress: false

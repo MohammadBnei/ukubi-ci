@@ -254,5 +254,32 @@ if [[ "$a" == *"--build-arg VERSION=1.2.3+0123456789ab"* && "$a" == *"--build-ar
 a=$(build_args '')
 if [[ "$a" == *"--build-arg A=b"* && "$a" != *VERSION* ]]; then ok "Build without VERSION_ARG adds no VERSION arg"; else bad "Build without VERSION_ARG: '$a'"; fi
 
+# 9. Every job has a timeout; only REGISTRY_PASSWORD leaves the Infisical file.
+for f in "$WF" "$(dirname "$WF")/image-build.yml"; do
+  for j in $(yq '.jobs | keys | .[]' "$f"); do
+    if [ "$(yq ".jobs.$j.timeout-minutes // \"\"" "$f")" != "" ]; then ok "$(basename "$f") job $j has timeout-minutes"; else bad "$(basename "$f") job $j has no timeout-minutes"; fi
+  done
+done
+if [ "$(yq '.jobs.build.steps[] | select(.name == "Remove the Infisical secrets file") | .if' "$WF")" = "always()" ]; then ok "cleanup step runs always()"; else bad "cleanup step missing or not always()"; fi
+step build "Keep only the registry password" > "$T/keep.sh"
+[ -s "$T/keep.sh" ] || { echo "FAIL extract keep block"; exit 1; }
+keep() { # name want_rc content
+  local w="$T/ws"; rm -rf "$w"; mkdir "$w"; [ "$3" = - ] || printf '%s' "$3" > "$w/.infisical-secrets"
+  : > "$T/genv"; local rc=0
+  GITHUB_WORKSPACE=$w GITHUB_ENV=$T/genv bash "$T/keep.sh" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" != "$2" ]; then bad "keep $1: rc=$rc want $2"; return; fi
+  if [ -e "$w/.infisical-secrets" ]; then bad "keep $1: file left behind"; return; fi
+  ok "keep $1"
+}
+keep "extracts the password" 0 "REDIS_URL='redis://x'
+REGISTRY_PASSWORD='pw 1'
+OTHER='y'"
+if [ "$(cat "$T/genv")" = "REGISTRY_PASSWORD=pw 1" ]; then ok "keep: GITHUB_ENV holds only REGISTRY_PASSWORD"; else bad "keep: GITHUB_ENV '$(cat "$T/genv")'"; fi
+keep "no password fails" 1 "REDIS_URL='redis://x'"
+keep "missing file fails" 1 -
+keep "empty value fails" 1 "REGISTRY_PASSWORD=''"
+keep "multi-line value fails" 1 "REGISTRY_PASSWORD='line1
+line2'"
+
 echo "failures: $fails"
 [ "$fails" = 0 ]
