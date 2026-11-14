@@ -271,7 +271,7 @@ keep() { # name want_rc content
 keep "extracts the password" 0 "REDIS_URL='redis://x'
 REGISTRY_PASSWORD='pw 1'
 OTHER='y'"
-[ "$(cat "$T/genv")" = "REGISTRY_PASSWORD=pw 1" ] && ok "keep: GITHUB_ENV holds only REGISTRY_PASSWORD" || bad "keep: GITHUB_ENV '$(cat "$T/genv")'"
+if [ "$(cat "$T/genv")" = "REGISTRY_PASSWORD=pw 1" ]; then ok "keep: GITHUB_ENV holds only REGISTRY_PASSWORD"; else bad "keep: GITHUB_ENV '$(cat "$T/genv")'"; fi
 keep "no password fails" 1 "REDIS_URL='redis://x'"
 keep "missing file fails" 1 -
 
