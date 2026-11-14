@@ -151,6 +151,12 @@ vbump "parent-dir path refused" 1 "bad values file" "a.yaml ../x.yaml"
 vbump "absolute path refused" 1 "bad values file" "/etc/passwd"
 vbump "glob refused, not expanded" 1 "bad values file" "*.yaml"
 vbump "empty list refused" 1 "no values file" ""
+vbump "blank list refused" 1 "no values file" " "
+vbump "leading dash refused" 1 "bad values file" "-a.yaml"
+vbump_link() { local d="$T/vb"; mkdir -p "$d"; printf 'image:\n  tag: "x"\n' > "$d/real.yaml"; ln -sf real.yaml "$d/l.yaml"
+  local out rc; out=$(cd "$d" && TAG=0123456789ab DIGEST=$D VALUES_FILES=l.yaml VALUES_KEY=.image.tag bash "$T/bump.sh" 2>&1); rc=$?
+  if [ "$rc" = 1 ] && [[ "$out" == *symlink* ]]; then ok "multi symlink refused"; else bad "multi symlink: rc=$rc ($out)"; fi; }
+vbump_link
 
 # 4. The stale-run guard, against a throwaway remote. History: A, B (built
 #    commits), a docs commit, then the bot's bump commit pinning B.
@@ -180,13 +186,37 @@ done
 if (cd "$g/w" && BUILT=abc BRANCH=main VALUES_FILES=values.yaml VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >"$T/m" 2>&1); then bad "guard malformed BUILT must fail"
 elif grep -q "built commit missing or malformed" "$T/m"; then ok "guard malformed BUILT fails closed"; else bad "guard malformed BUILT: $(cat "$T/m")"; fi
 
-# The guard reads the pin from the FIRST file only.
-printf 'image:\n  tag: "ffffffffffff@%s"\n' "$D" > "$g/w/other.yaml"; pin "${B:0:12}@$D"; : > "$T/out"
-(cd "$g/w" && BUILT=$A GITHUB_RUN_ATTEMPT=2 BRANCH=main VALUES_FILES="values.yaml other.yaml" VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >/dev/null 2>&1)
-if grep -qx "ok=false" "$T/out"; then ok "guard reads the pin from the first of several files"; else bad "guard first-file pin: $(cat "$T/out")"; fi
-: > "$T/out"
-(cd "$g/w" && BUILT=$A GITHUB_RUN_ATTEMPT=2 BRANCH=main VALUES_FILES="other.yaml values.yaml" VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >/dev/null 2>&1)
-if grep -qx "ok=true" "$T/out"; then ok "guard ignores the later files (first pin unknown deploys)"; else bad "guard later files: $(cat "$T/out")"; fi
+# The guard skips when ANY file's pin descends from BUILT, in either order.
+printf 'image:\n  tag: "ffffffffffff@%s"\n' "$D" > "$g/w/other.yaml"; pin "${B:0:12}@$D"
+gm() { # name want files [built]
+  : > "$T/out"
+  (cd "$g/w" && BUILT=${4:-$A} GITHUB_RUN_ATTEMPT=2 BRANCH=main VALUES_FILES=$3 VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >"$T/gm" 2>&1)
+  if grep -qx "ok=$2" "$T/out"; then ok "guard $1"; else bad "guard $1: $(cat "$T/out" "$T/gm")"; fi
+}
+gm "several files: a stale one first skips" false "values.yaml other.yaml"
+gm "several files: a stale one second skips" false "other.yaml values.yaml"
+gm "several files: no pin descends, deploys" true "other.yaml other.yaml"
+gm_fail() { # name files substring
+  (cd "$g/w" && BUILT=$A BRANCH=main VALUES_FILES=$2 VALUES_KEY=.image.tag GITHUB_OUTPUT="$T/out" bash "$T/fresh.sh" >"$T/gm" 2>&1) \
+    && { bad "guard $1 must fail"; return; }
+  if grep -q "$3" "$T/gm"; then ok "guard $1"; else bad "guard $1: $(cat "$T/gm")"; fi
+}
+gm_fail "blank values-files fails early" " " "values-files is blank"
+gm_fail "path with .. refused before reading" "../x.yaml" "bad values file"
+gm_fail "leading dash refused" "-x.yaml" "bad values file"
+ln -sf values.yaml "$g/w/link.yaml"; gm_fail "symlink refused" "link.yaml" "symlink"; unlink "$g/w/link.yaml"
+
+# 4b. Version inputs sanity in the build job's Check inputs step.
+step build "Check inputs" > "$T/ci.sh"
+[ -s "$T/ci.sh" ] || { echo "FAIL extract Check inputs"; exit 1; }
+cin() { # name want_rc want_msg version-arg version build-args
+  local out rc; out=$(IMAGE=app VALUES_KEY=.image.tag VERSION_ARG_ON=$4 VERSION_IN=$5 BUILD_ARGS_IN=$6 bash "$T/ci.sh" 2>&1); rc=$?
+  if [ "$rc" = "$2" ] && { [ -z "$3" ] || [[ "$out" == *"$3"* ]]; }; then ok "check inputs: $1"; else bad "check inputs: $1: rc=$rc ($out)"; fi
+}
+cin "version without version-arg warns" 0 "::warning::version is set" false 1.2.3 ""
+cin "no version, no arg: silent" 0 "" false "" "A=b"
+cin "version-arg with a VERSION= build-arg fails" 1 "already sets VERSION" true 1.2.3 $'A=b\nVERSION=9'
+cin "version-arg with an unrelated build-arg passes" 0 "" true 1.2.3 "MYVERSION=9"
 
 # 5. The version build arg: the version step computes it, the Build step passes it
 #    (a fake sudo records buildah's args; no buildah needed).

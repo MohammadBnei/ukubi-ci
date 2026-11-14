@@ -64,8 +64,8 @@ on:
         default: helm/values.yaml
       values-files:
         description: >-
-          Several values files, newline or space separated, each pinning the same
-          values-key; bumped in one commit. When set it replaces values-file. The
+          Several values files of THIS image only (one call per image), newline or
+          space separated, each pinning the same values-key; bumped in one commit. When set it replaces values-file. The
           stale-run guard reads the pin from the first one.
         type: string
         default: ''
@@ -164,8 +164,17 @@ jobs:
       - name: Check inputs
         env:
           VALUES_KEY: ${{ inputs.values-key }}
+          VERSION_ARG_ON: ${{ inputs.version-arg }}
+          VERSION_IN: ${{ inputs.version }}
+          BUILD_ARGS_IN: ${{ inputs.build-args }}
         run: |
           set -euo pipefail
+          if [ "$VERSION_ARG_ON" != true ] && [ -n "$VERSION_IN" ]; then
+            echo "::warning::version is set but version-arg is false: no VERSION build arg is passed"
+          fi
+          if [ "$VERSION_ARG_ON" = true ] && grep -qE '^[[:space:]]*VERSION=' <<<"$BUILD_ARGS_IN"; then
+            echo "::error::build-args already sets VERSION; use version-arg or build-args, not both"; exit 1
+          fi
           [[ "$IMAGE" =~ ^[a-z0-9][a-z0-9._/-]*$ ]] || { echo "::error::bad image name: $IMAGE"; exit 1; }
           [[ "$VALUES_KEY" =~ ^(\.[A-Za-z0-9_-]+)+$ ]] || { echo "::error::bad values-key: $VALUES_KEY"; exit 1; }
 
@@ -344,11 +353,24 @@ jobs:
           [[ "$BUILT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::built commit missing or malformed ('$BUILT')"; exit 1; }
           [ "$(git rev-parse --is-shallow-repository)" = true ] && git fetch -q --unshallow origin "$BRANCH" || true
           read -ra files <<< "${VALUES_FILES//$'\n'/ }"
-          p=$(yq "$VALUES_KEY" "${files[0]}" 2>/dev/null || true); p=${p%%@*}
-          pc=$(git rev-parse -q --verify "$p^{commit}" 2>/dev/null || true)
-          if [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ] && [ -n "$pc" ] && [ "$pc" != "$BUILT" ] && git merge-base --is-ancestor "$BUILT" "$pc"; then
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::no values file (values-files is blank)"; exit 1; }
+          for f in "${files[@]}"; do
+            [[ "$f" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ && "/$f/" != *"/../"* ]] \
+              || { echo "::error::bad values file: '$f'"; exit 1; }
+            [ ! -L "$f" ] || { echo "::error::values file is a symlink: '$f'"; exit 1; }
+          done
+          # Stale if ANY file's pin strictly descends from the built commit.
+          stale=
+          for f in "${files[@]}"; do
+            p=$(yq "$VALUES_KEY" "$f" 2>/dev/null || true); p=${p%%@*}
+            pc=$(git rev-parse -q --verify "$p^{commit}" 2>/dev/null || true)
+            if [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ] && [ -n "$pc" ] && [ "$pc" != "$BUILT" ] && git merge-base --is-ancestor "$BUILT" "$pc"; then
+              stale=$pc
+            fi
+          done
+          if [ -n "$stale" ]; then
             echo "ok=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::skipping deploy: pinned $pc is newer than built $BUILT; a re-run of an old run must not roll back"
+            echo "::notice::skipping deploy: pinned $stale is newer than built $BUILT; a re-run of an old run must not roll back"
           else
             echo "ok=true" >> "$GITHUB_OUTPUT"
           fi
@@ -370,13 +392,16 @@ jobs:
           TAG="$TAG@$DIGEST"
           echo "PINNED=$TAG" >> "${GITHUB_ENV:-/dev/null}"
           read -ra files <<< "${VALUES_FILES//$'\n'/ }"
-          [ "${#files[@]}" -gt 0 ] || { echo "::error::no values file"; exit 1; }
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::no values file (values-files is blank)"; exit 1; }
+          for f in "${files[@]}"; do
+            [[ "$f" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ && "/$f/" != *"/../"* ]] \
+              || { echo "::error::bad values file: '$f'"; exit 1; }
+            [ ! -L "$f" ] || { echo "::error::values file is a symlink: '$f'"; exit 1; }
+          done
           leaf=${VALUES_KEY##*.}
           dots=${VALUES_KEY//[^.]/}
           indent=$(printf '%*s' $(( (${#dots} - 1) * 2 )) '')
           for f in "${files[@]}"; do
-            [[ "$f" =~ ^[A-Za-z0-9._/-]+$ && "$f" != /* && "/$f/" != *"/../"* ]] \
-              || { echo "::error::bad values file: '$f'"; exit 1; }
             [ -f "$f" ] || { echo "::error::$f not found"; exit 1; }
             # Same sha and digest: nothing to bump. buildah bud is not reproducible
             # (created timestamp), so any rebuild gets a new digest and redeploys;

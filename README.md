@@ -63,10 +63,10 @@ hq-style layout (Dockerfile and context in a subdirectory):
 | `layers` | `true` | `--layers` (large images may want `false`: layers stay on the shared disk until the weekly prune) |
 | `pull-newer` | `true` | `--pull=newer` |
 | `values-file` | `helm/values.yaml` | empty (with `values-files` empty) skips the deploy job |
-| `values-files` | | several values files, newline or space separated, each pinning `values-key`; one bump commit. Replaces `values-file` when set. The stale-run guard reads the first; a file already at the pin is skipped, and no file changed means no commit |
+| `values-files` | | several values files, newline or space separated, each pinning `values-key` for this same image only (one call per image: wird's adminweb file does not go in the api call); one bump commit. Replaces `values-file` when set. The stale-run guard skips when any file's pin descends from the built commit; a file already at the pin is skipped, and no file changed means no commit |
 | `version-arg` | `false` | pass `--build-arg VERSION`: `X.Y.Z` when `ref` is a release tag, else `X.Y.Z+<sha12>` on the default branch, else `X.Y.Z-dev+<sha12>` (`0.0.0` before the first release) |
 | `version` | | release.yml's `version` output; needs `version-arg`. Must be `X.Y.Z`, or empty with an empty `ref` |
-| `cancel-in-progress` | `true` | build concurrency; `false` queues builds (release callers: the tag is pushed before the image builds). The deploy group never cancels |
+| `cancel-in-progress` | `true` | build concurrency; `false` never cancels a running build (release callers: a cancel leaves a pushed tag with no image); GitHub still keeps one pending run per group, and a newer push replaces a pending one. The deploy group never cancels |
 | `values-key` | `.image.tag` | yq path; the value must be double-quoted, two-space indented |
 | `registry` | `registry.bnei.lan:5000` | |
 
@@ -88,7 +88,7 @@ Rules:
 - No `:latest` is pushed; the helm values pin the sha. Zot keeps the 3 most
   recently pushed tags per image (2 for ukubi-stt), so a rebuild of an old
   commit can evict the deployed tag.
-- A version label: pass it as a build-arg and set `ARG VERSION` +
+- A version label: pass `version-arg: true` (not a hand-written `VERSION=` build-arg; that combination fails) and set `ARG VERSION` +
   `LABEL org.opencontainers.image.version=$VERSION` in the Dockerfile.
 - The deploy job runs on `push` and `workflow_dispatch` on the default
   branch only. It pins `<sha>@sha256:<digest>` (the chart renders
