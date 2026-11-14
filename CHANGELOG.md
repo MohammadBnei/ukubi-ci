@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2 - 2026-11-14
+
+### Fixes
+
+- **image:** Pin pushed digest so a same-commit rebuild deploys (#6)
+
 ## 0.2.1 - 2026-10-28
 
 ### Fixes
