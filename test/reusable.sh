@@ -46,6 +46,8 @@ gate go-checks golangci-lint "inputs.golangci-lint-version != ''"
 gate go-checks 'go vet -vettool' "inputs.vettool != ''"
 gate bun-checks Install ''
 gate bun-checks Typecheck "inputs.typecheck-script != ''"
+gate go-checks govulncheck "inputs.govulncheck"
+gate bun-checks Lint "inputs.lint-script != ''"
 gate bun-checks Test "inputs.test-script != ''"
 gate bun-checks Build "inputs.build-script != ''"
 gate bun-checks 'Dist is fresh' "inputs.dist != ''"

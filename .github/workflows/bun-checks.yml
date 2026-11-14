@@ -15,6 +15,10 @@ on:
         description: package.json script run as the typecheck. Empty skips.
         type: string
         default: typecheck
+      lint-script:
+        description: package.json script run as the lint, after the typecheck. Empty skips.
+        type: string
+        default: ''
       test-script:
         description: package.json script run as the tests. Empty skips.
         type: string
@@ -78,6 +82,12 @@ jobs:
         if: inputs.typecheck-script != ''
         env:
           SCRIPT: ${{ inputs.typecheck-script }}
+        run: bun run "$SCRIPT"
+
+      - name: Lint
+        if: inputs.lint-script != ''
+        env:
+          SCRIPT: ${{ inputs.lint-script }}
         run: bun run "$SCRIPT"
 
       - name: Test

@@ -289,6 +289,7 @@ with Go from the module's `go.mod`.
 | `vettool` | | `pkg@vX.Y.Z` (never `@latest`), run as `go vet -vettool`; empty skips. The hook for ukubicheck |
 | `test-flags` | | extra `go test` flags, e.g. `-p 1` when tests share one database; `[A-Za-z0-9 ._=,/:-]` only |
 | `pre-test` | | a command run at the repo root before the tests, e.g. `docker compose up -d --wait postgres` |
+| `govulncheck` | `false` | run `govulncheck ./...` (v1.9.0, built with the module's toolchain). Fails only on vulnerabilities the code calls; unreachable module advisories pass. Default is off because every current caller fails today on stdlib fixes (go1.27.3/1.27.4) and `golang.org/x/net` v0.60.0; bump `go.mod`, then enable |
 
 ### bun-checks.yml
 
@@ -300,6 +301,7 @@ typecheck, test and the package's real build script.
 |---|---|---|
 | `working-directory` | `.` | holds `package.json` and `bun.lock` |
 | `typecheck-script` | `typecheck` | empty skips |
+| `lint-script` | | package.json script run after the typecheck; empty skips |
 | `test-script` | `test` | empty skips |
 | `build-script` | `build` | the real build; empty skips (a package with no build) |
 | `dist` | | committed build output, relative to `working-directory`. After the build `git status --porcelain -- <dist>` must be empty (untracked files count). Must track files, and needs a `build-script` |
