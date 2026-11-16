@@ -42,7 +42,7 @@ on:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ukubi-build]
     permissions:
       contents: write
     # Keyed on the ref: a pull_request dry run must not take the one pending

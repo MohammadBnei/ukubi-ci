@@ -27,9 +27,9 @@ on:
         type: string
         default: .image.tag
       runs-on:
-        description: JSON list of runner labels; needs git and yq.
+        description: JSON list of runner labels; needs git and curl (yq is installed by a step).
         type: string
-        default: '["ubuntu-latest"]'
+        default: '["self-hosted","ukubi-build"]'
       commit-author:
         description: Bump commit author name. Empty is "<repo>-ci".
         type: string
@@ -63,6 +63,17 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.repository.default_branch }}
+
+      # The runner has no yq and sudo is buildah-only: a pinned release, checked by sha256.
+      - name: Install yq
+        run: |
+          set -euo pipefail
+          v=4.44.3
+          sha=a2c097180dd884a8d50c956ee16a9cec070f30a7947cf4ebf87d5f36213e9ed7
+          curl -sSfLo "$RUNNER_TEMP/yq" "https://github.com/mikefarah/yq/releases/download/v$v/yq_linux_amd64"
+          echo "$sha  $RUNNER_TEMP/yq" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/yq"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
       - name: Check inputs
         run: |
