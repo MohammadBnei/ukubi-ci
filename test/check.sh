@@ -152,7 +152,7 @@ multi() { # name want_commits files-of-commit(0|1|2) a-tag b-tag
   local d="$T/multi" pins; repo "$d" "$4" "$5"; pins="a.yaml $PIN"$'\n'"b.yaml $PIN"
   local out rc; out=$(cd "$d" && PINS=$pins VALUES_KEY=.image.tag bash "$T/bump.sh" 2>&1); rc=$?
   [ "$rc" = 0 ] || { bad "multi $1: bump rc=$rc ($out)"; return; }
-  [ "$(yq .image.tag "$d/a.yaml")" = "$PIN" ] && [ "$(yq .image.tag "$d/b.yaml")" = "$PIN" ] || { bad "multi $1: a file not pinned"; return; }
+  if ! { [ "$(yq .image.tag "$d/a.yaml")" = "$PIN" ] && [ "$(yq .image.tag "$d/b.yaml")" = "$PIN" ]; }; then bad "multi $1: a file not pinned"; return; fi
   (cd "$d" && AUTHOR=app-ci MESSAGE="chore(deploy): bump app image to $PIN" PINS=$pins BRANCH=main bash "$T/commit.sh" >/dev/null 2>&1) || { bad "multi $1: commit step failed"; return; }
   local n f; n=$(git -C "$d" rev-list --count HEAD); f=$(git -C "$d" show --format= --name-only HEAD | grep -c yaml)
   if [ "$n" != "$2" ] || { [ "$2" = 2 ] && [ "$f" != "$3" ]; }; then bad "multi $1: $n commits, last touches $f files; want $2, $3"; return; fi
@@ -253,7 +253,7 @@ atomic() { # name want_commits a-tag b-tag [files in the bump commit]
   out=$(cd "$d" && PINS=$pins VALUES_KEY=.image.tag bash "$T/dbump.sh" 2>&1 \
     && AUTHOR=game-ci MESSAGE="chore(deploy): bump game images" PINS=$pins BRANCH=main bash "$T/dcommit.sh" 2>&1); rc=$?
   [ "$rc" = 0 ] || { bad "deploy.yml $1: rc=$rc ($out)"; return; }
-  [ "$(yq .image.tag "$d/a.yaml")" = "$GAME" ] && [ "$(yq .image.tag "$d/b.yaml")" = "$REALM" ] || { bad "deploy.yml $1: a file not at its own pin"; return; }
+  if ! { [ "$(yq .image.tag "$d/a.yaml")" = "$GAME" ] && [ "$(yq .image.tag "$d/b.yaml")" = "$REALM" ]; }; then bad "deploy.yml $1: a file not at its own pin"; return; fi
   local n; n=$(git -C "$d-remote.git" rev-list --count main)
   [ "$n" = "$2" ] || { bad "deploy.yml $1: $n commits on the remote, want $2"; return; }
   if [ "$2" = 2 ]; then

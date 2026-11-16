@@ -489,7 +489,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$BUILT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::built commit missing or malformed ('$BUILT')"; exit 1; }
-          [ "$(git rev-parse --is-shallow-repository)" = true ] && git fetch -q --unshallow origin "$BRANCH" || true
+          if [ "$(git rev-parse --is-shallow-repository)" = true ]; then git fetch -q --unshallow origin "$BRANCH" || true; fi
           # PINS: one "<values file> <sha12>@sha256:<64 hex>" per line.
           files=(); vals=()
           while read -r f v extra; do
