@@ -35,7 +35,7 @@ on:
 
 jobs:
   go:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ukubi-build]
     permissions:
       contents: read
     defaults:
@@ -68,7 +68,7 @@ jobs:
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: ${{ inputs.working-directory }}/go.mod
-          cache-dependency-path: ${{ inputs.working-directory }}/go.sum
+          cache: false # the runner user's ~/go persists between jobs: no tar restore/save each run
 
       # gofmt -l exits 0 on unformatted files, so the output is the check.
       # -r: no .go files must not hang gofmt on stdin. vendor/ and testdata/

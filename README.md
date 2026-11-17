@@ -35,9 +35,9 @@ jobs:
       id-token: write   # the Infisical OIDC login
     uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@<40-char sha>
     with:
-      # PRs build on GitHub-hosted runners; on pull_request image.yml refuses
-      # any runs-on label that is not ubuntu-*.
-      runs-on: ${{ github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["self-hosted","ukubi-build"]' }}
+      # Every job runs on the self-hosted build runner, PRs included; on a
+      # pull_request nothing logs in, reads Infisical, pushes or bumps.
+      runs-on: '["self-hosted","ukubi-build"]'
       image: drop
 ```
 
@@ -83,11 +83,15 @@ Outputs: `tag`, the pushed tag; `digest`, the pushed manifest digest;
 
 Rules:
 
-- On `pull_request` and `pull_request_target`, a GitHub-hosted `guard` job refuses any `runs-on` label
-  that is not `ubuntu-*` before the build job is scheduled. It is a tripwire
-  against a wrong `runs-on`, not the security boundary: a PR can edit the
-  caller's own workflow and skip image.yml. The boundary is the runner and
-  repo configuration (per-repo build runners, fork PR approval).
+- The `guard` job runs on the passed `runs-on` runner and decides `publish` from an
+  allowlist: only `push` and `workflow_dispatch` publish. On `pull_request`,
+  `pull_request_target` or any other event the build runs but the Infisical,
+  login, push and logout steps and the deploy job are skipped. It is not the
+  security boundary: a PR can edit the caller's own workflow and skip image.yml.
+  The boundary is the runner and repo configuration (per-repo build runners, no
+  fork PR runs on private repos, the Infisical identity bound to `push` and
+  `workflow_dispatch`). Unlike before, PR code now runs on the same box as
+  releases: a PR's build can reach whatever the runner user can.
 
 - Secrets go in `build-secrets`, never in `build-args` (those land in the
   log and the image history).
@@ -137,7 +141,7 @@ jobs:
       id-token: write
     uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@<40-char sha>
     with:
-      runs-on: ${{ github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["self-hosted","ukubi-build"]' }}
+      runs-on: '["self-hosted","ukubi-build"]'
       image: ukubi-game
       build-args: BIN=game
       deploy: false
@@ -149,7 +153,7 @@ jobs:
       id-token: write
     uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@<40-char sha>
     with:
-      runs-on: ${{ github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["self-hosted","ukubi-build"]' }}
+      runs-on: '["self-hosted","ukubi-build"]'
       image: ukubi-realm
       build-args: BIN=realm
       deploy: false
@@ -174,7 +178,7 @@ jobs:
 | `pins` | required | one `<values file> <sha12>@sha256:<64 hex>` per line; each file once, every file must exist (no skip-if-missing), paths relative to the repo root, no `..`, no symlink |
 | `built-commit` | required | full sha the images were built from (image.yml's `commit`); all images come from one commit |
 | `values-key` | `.image.tag` | yq path in every file, as in image.yml |
-| `runs-on` | `["ubuntu-latest"]` | JSON list; the runner needs git and yq |
+| `runs-on` | `["self-hosted","ukubi-build"]` | JSON list; the runner needs git and curl (yq is installed by a step) |
 | `commit-author` | `<repo>-ci` | bump commit author name |
 
 The commit subject is `chore(deploy): bump <repo> images`; its body lists the
@@ -208,7 +212,7 @@ jobs:
       id-token: write
     uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@<40-char sha>
     with:
-      runs-on: ${{ github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["self-hosted","ukubi-build"]' }}
+      runs-on: '["self-hosted","ukubi-build"]'
       image: drop
       ref: ${{ needs.release.outputs.tag }}            # empty on a dry run: the triggering commit
       version-arg: true
@@ -298,8 +302,9 @@ generated`. That hq change is not part of this repo.
 ## Checks: go-checks, bun-checks, rust-checks, image-build, trailers
 
 Five least-privilege checks for a caller's `checks.yml`. Each runs on
-`ubuntu-latest`, every job is `contents: read`, and none touches Infisical,
-OIDC, the registry or a self-hosted runner. Inputs reach scripts through env
+the self-hosted `["self-hosted","ukubi-build"]` runner (no `runs-on` input), every job is `contents: read`, and none touches Infisical,
+OIDC or the registry. The runner has jq, curl, git and tar only: the checks install what else they
+need (bun from npm, Go through setup-go, rustup, yq) and `sudo apt-get` does not work there. Inputs reach scripts through env
 only. `test/reusable.sh` runs their run blocks against throwaway repos, and
 `ci.yml` calls each one on a fixture under `test/`.
 
@@ -389,7 +394,7 @@ dependencies, so no advisory is ever hit in CI: the blocking exit and the
 | input | default | |
 |---|---|---|
 | `working-directory` | `.` | holds `Cargo.toml`, `Cargo.lock` and `rust-toolchain.toml` |
-| `apt-packages` | | space-separated, e.g. `protobuf-compiler` |
+| `apt-packages` | | space-separated, e.g. `protobuf-compiler`; checked with `dpkg -s`, not installed (no `sudo apt-get` on the runner): they must be baked into the build-runner playbook |
 | `audit-ignore` | | multiline `RUSTSEC-YYYY-NNNN`, each passed as `--ignore`. `.cargo/audit.toml` is read too; keep the reasons there |
 
 ### image-build.yml

@@ -26,25 +26,29 @@ if grep -qwE 'yq|node|npx|apt-get' <<<"$step_runs"; then
   bad "build job: no yq/node/apt-get on the LXC"
 else ok "build job: no yq/node/apt-get on the LXC"; fi
 
-# 2. The pull_request refusal: an allowlist of GitHub-hosted ubuntu-* labels.
-step guard "Refuse a non-GitHub-hosted runner on pull_request" > "$T/pr.sh"
+# 2. The publish decision: only push and workflow_dispatch may log in, push or
+#    bump; every other event (pull_request, pull_request_target, new ones) builds only.
+step guard "Decide whether this run may publish" > "$T/pr.sh"
 [ -s "$T/pr.sh" ] || { echo "FAIL extract guard block"; exit 1; }
-pr() { # want_rc event runs-on name
-  local rc=0; EVENT=$2 RUNS_ON=$3 bash "$T/pr.sh" >/dev/null 2>&1 || rc=$?
-  if [ "$rc" = "$1" ]; then ok "pr guard: $4"; else bad "pr guard: $4 (rc=$rc)"; fi
+pr() { # want_value event name
+  local rc=0 got; : > "$T/gout"
+  EVENT=$2 GITHUB_OUTPUT="$T/gout" bash "$T/pr.sh" >/dev/null 2>&1 || rc=$?
+  got=$(sed -n 's/^value=//p' "$T/gout")
+  if [ "$rc" = 0 ] && [ "$got" = "$1" ]; then ok "publish guard: $3"; else bad "publish guard: $3 (rc=$rc, value=$got)"; fi
 }
-pr 0 pull_request '["ubuntu-latest"]'             "PR on ubuntu-latest passes"
-pr 0 push '["self-hosted","ukubi-build"]'         "push on self-hosted passes"
-pr 0 pull_request '["ubuntu-24.04"]'              "PR on ubuntu-24.04 passes"
-pr 1 pull_request '["self-hosted","ukubi-build"]' "PR on self-hosted refused"
-pr 1 pull_request '["ukubi-build"]'               "PR on a bare self-hosted label refused"
-pr 1 pull_request '["Self-Hosted","ukubi-build"]' "PR on mixed-case Self-Hosted refused"
-pr 1 pull_request '["ubuntu-latest","ukubi-build"]' "PR mixing ubuntu and a self-hosted label refused"
-pr 1 pull_request '[]'                            "PR on an empty list refused"
-pr 1 pull_request '"ubuntu-latest"'               "PR on a non-list refused"
-pr 1 pull_request_target '["self-hosted","ukubi-build"]' "pull_request_target on self-hosted refused"
-pr 0 pull_request_target '["ubuntu-latest"]'      "pull_request_target on ubuntu-latest passes"
-pr 0 workflow_dispatch '["ukubi-build"]'          "dispatch on a bare self-hosted label passes"
+pr true  push              "push may publish"
+pr true  workflow_dispatch "dispatch may publish"
+pr false pull_request        "pull_request builds only"
+pr false pull_request_target "pull_request_target builds only"
+pr false schedule            "an unlisted event builds only"
+pr false ""                  "an empty event builds only"
+# Every step that logs in, reads Infisical or pushes, and the deploy job, also ask the guard.
+for sn in "Read the registry password from Infisical" "Keep only the registry password" "Registry login" "Push" "Registry logout"; do
+  if [[ "$(yq ".jobs.build.steps[] | select(.name == \"$sn\") | .if" "$WF")" == *"needs.guard.outputs.publish == 'true'"* ]]; then ok "publish gate on '$sn'"; else bad "no guard gate on '$sn'"; fi
+done
+if [[ "$(yq '.jobs.deploy.if' "$WF")" == *"needs.guard.outputs.publish == 'true'"* ]]; then ok "publish gate on the deploy job"; else bad "no guard gate on the deploy job"; fi
+# Every job of every workflow runs on a self-hosted label (no hosted runner is paid for).
+if grep -rniE 'ubuntu-|macos-|windows-' "$(dirname "$WF")" | grep -v '^\S*:[0-9]*:\s*#'; then bad "a workflow names a GitHub-hosted runner"; else ok "no GitHub-hosted runner in the workflows"; fi
 
 # 3. The deploy bump. Each case: name, values-key, expected rc, expected
 #    error substring (or ""), file content; the pin is 0123456789ab@$D unless
@@ -148,7 +152,7 @@ multi() { # name want_commits files-of-commit(0|1|2) a-tag b-tag
   local d="$T/multi" pins; repo "$d" "$4" "$5"; pins="a.yaml $PIN"$'\n'"b.yaml $PIN"
   local out rc; out=$(cd "$d" && PINS=$pins VALUES_KEY=.image.tag bash "$T/bump.sh" 2>&1); rc=$?
   [ "$rc" = 0 ] || { bad "multi $1: bump rc=$rc ($out)"; return; }
-  [ "$(yq .image.tag "$d/a.yaml")" = "$PIN" ] && [ "$(yq .image.tag "$d/b.yaml")" = "$PIN" ] || { bad "multi $1: a file not pinned"; return; }
+  if ! { [ "$(yq .image.tag "$d/a.yaml")" = "$PIN" ] && [ "$(yq .image.tag "$d/b.yaml")" = "$PIN" ]; }; then bad "multi $1: a file not pinned"; return; fi
   (cd "$d" && AUTHOR=app-ci MESSAGE="chore(deploy): bump app image to $PIN" PINS=$pins BRANCH=main bash "$T/commit.sh" >/dev/null 2>&1) || { bad "multi $1: commit step failed"; return; }
   local n f; n=$(git -C "$d" rev-list --count HEAD); f=$(git -C "$d" show --format= --name-only HEAD | grep -c yaml)
   if [ "$n" != "$2" ] || { [ "$2" = 2 ] && [ "$f" != "$3" ]; }; then bad "multi $1: $n commits, last touches $f files; want $2, $3"; return; fi
@@ -249,7 +253,7 @@ atomic() { # name want_commits a-tag b-tag [files in the bump commit]
   out=$(cd "$d" && PINS=$pins VALUES_KEY=.image.tag bash "$T/dbump.sh" 2>&1 \
     && AUTHOR=game-ci MESSAGE="chore(deploy): bump game images" PINS=$pins BRANCH=main bash "$T/dcommit.sh" 2>&1); rc=$?
   [ "$rc" = 0 ] || { bad "deploy.yml $1: rc=$rc ($out)"; return; }
-  [ "$(yq .image.tag "$d/a.yaml")" = "$GAME" ] && [ "$(yq .image.tag "$d/b.yaml")" = "$REALM" ] || { bad "deploy.yml $1: a file not at its own pin"; return; }
+  if ! { [ "$(yq .image.tag "$d/a.yaml")" = "$GAME" ] && [ "$(yq .image.tag "$d/b.yaml")" = "$REALM" ]; }; then bad "deploy.yml $1: a file not at its own pin"; return; fi
   local n; n=$(git -C "$d-remote.git" rev-list --count main)
   [ "$n" = "$2" ] || { bad "deploy.yml $1: $n commits on the remote, want $2"; return; }
   if [ "$2" = 2 ]; then

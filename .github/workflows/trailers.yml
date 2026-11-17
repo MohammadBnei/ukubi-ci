@@ -36,7 +36,7 @@ on:
 
 jobs:
   trailers:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ukubi-build]
     permissions:
       contents: read
     defaults:

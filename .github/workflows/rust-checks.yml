@@ -11,7 +11,7 @@ on:
         type: string
         default: .
       apt-packages:
-        description: Space-separated apt packages the build needs, e.g. protobuf-compiler. Empty skips.
+        description: Space-separated apt packages the build needs, e.g. protobuf-compiler. The runner cannot apt-get (sudo is buildah-only), so each must already be installed there (the build-runner playbook); the job fails naming the missing ones. Empty skips.
         type: string
         default: ''
       audit-ignore:
@@ -26,7 +26,7 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ukubi-build]
     permissions:
       contents: read
     defaults:
@@ -51,6 +51,20 @@ jobs:
             [[ "$p" =~ ^[a-z0-9][a-z0-9.+-]+$ ]] || { echo "::error::bad apt package name '$p'"; exit 1; }
           done
 
+      # The runner has no rustup. A pinned rustup-init, checked by sha256, once
+      # per runner user (~/.cargo persists); the toolchain comes from rust-toolchain.toml below.
+      - name: Install rustup
+        run: |
+          set -euo pipefail
+          if ! PATH="$HOME/.cargo/bin:$PATH" command -v rustup >/dev/null; then
+            sha=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+            curl -sSfLo "$RUNNER_TEMP/rustup-init" "https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init"
+            echo "$sha  $RUNNER_TEMP/rustup-init" | sha256sum -c -
+            chmod +x "$RUNNER_TEMP/rustup-init"
+            "$RUNNER_TEMP/rustup-init" -y --profile minimal --default-toolchain none --no-modify-path
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       # No arguments: installs exactly what rust-toolchain.toml names, components
       # included. The second line fails if that file is not what is active.
       - name: Install the pinned toolchain
@@ -59,15 +73,16 @@ jobs:
           rustup toolchain install
           rustup show active-toolchain | tee /dev/stderr | grep -q 'rust-toolchain.toml'
 
-      - name: Install apt packages
+      - name: Check apt packages
         if: inputs.apt-packages != ''
         env:
           APT_PACKAGES: ${{ inputs.apt-packages }}
         run: |
           set -euo pipefail
           read -ra pkgs <<<"$APT_PACKAGES"
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends "${pkgs[@]}"
+          missing=()
+          for p in "${pkgs[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done
+          [ ${#missing[@]} -eq 0 ] || { echo "::error::not installed on this runner (sudo apt-get does not work here; add them to the build-runner playbook): ${missing[*]}"; exit 1; }
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -87,7 +102,7 @@ jobs:
   # advisory database" means the cargo-audit pin is too old for the DB format:
   # bump the pin, do not ignore an id.
   audit:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ukubi-build]
     permissions:
       contents: read
     defaults:

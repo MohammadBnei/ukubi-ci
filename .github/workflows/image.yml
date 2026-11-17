@@ -154,30 +154,35 @@ env:
   INFISICAL_IDENTITY_ID: 19807471-d73a-48d4-9e58-1dc34255ef77
 
 jobs:
-  # Its own GitHub-hosted job, so a refused PR never lands on the shared box.
-  # An allowlist: a self-hosted runner matches on any of its labels (e.g.
-  # just "ukubi-build", or "Self-Hosted": labels are case-insensitive), so on
-  # pull_request every label must be a GitHub-hosted ubuntu-* one. This is a
-  # tripwire, not the boundary: a PR can edit the caller's app.yml to skip
-  # image.yml entirely. The boundary is the runner and repo settings
-  # (build-runner-ops: per-repo runners, fork PR approval).
+  # Runs on the passed runner (self-hosted: every job of every repo does).
+  # A pull request builds there, but nothing on a pull_request or
+  # pull_request_target run logs in, reads Infisical, pushes or bumps: this job
+  # decides `publish` from an allowlist of events, and the build job's
+  # Infisical, login, push and logout steps and the deploy job carry
+  # `needs.guard.outputs.publish == 'true'` on top of their own event checks.
+  # Not the boundary: a PR can edit the caller's own workflow and skip
+  # image.yml. The boundary is the runner and repo configuration (per-repo
+  # runners, no fork PR runs on private repos, the Infisical identity bound to
+  # push and workflow_dispatch).
   guard:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 5
     permissions: {}
+    outputs:
+      publish: ${{ steps.publish.outputs.value }}
     steps:
-      - name: Refuse a non-GitHub-hosted runner on pull_request
+      # test/check.sh runs this block verbatim; keep the name.
+      - name: Decide whether this run may publish
+        id: publish
         env:
           EVENT: ${{ github.event_name }}
-          RUNS_ON: ${{ inputs.runs-on }}
         run: |
           set -euo pipefail
-          # pull_request_target too: it runs with secrets, so building PR code there is worse.
-          case "$EVENT" in pull_request|pull_request_target) ;; *) exit 0 ;; esac
-          # jq missing or RUNS_ON not a JSON list also refuses (fail closed).
-          if ! jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and test("^ubuntu-"; "i"))' <<<"$RUNS_ON" >/dev/null 2>&1; then
-            echo "::error::pull_request must build on GitHub-hosted ubuntu-* runners only, not $RUNS_ON"; exit 1
-          fi
+          # An allowlist: any other event (pull_request, pull_request_target, anything new) is build-only.
+          case "$EVENT" in
+            push|workflow_dispatch) echo "value=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "value=false" >> "$GITHUB_OUTPUT"; echo "::notice::$EVENT builds only: no login, push or bump" ;;
+          esac
 
   build:
     needs: guard
@@ -303,6 +308,7 @@ jobs:
         if: >-
           (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
           && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+          && needs.guard.outputs.publish == 'true'
         uses: Infisical/secrets-action@a663da43e1541832614bfd9dcf9ab67381ea2b98 # v1.0.12
         with:
           method: oidc
@@ -323,6 +329,7 @@ jobs:
         if: >-
           (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
           && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+          && needs.guard.outputs.publish == 'true'
         run: |
           set -euo pipefail
           f="$GITHUB_WORKSPACE/.infisical-secrets"
@@ -345,6 +352,7 @@ jobs:
         if: >-
           (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
           && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+          && needs.guard.outputs.publish == 'true'
         run: |
           set -euo pipefail
           [ -n "${REGISTRY_PASSWORD:-}" ] || { echo "::error::Infisical returned no REGISTRY_PASSWORD"; exit 1; }
@@ -361,6 +369,7 @@ jobs:
         if: >-
           (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
           && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+          && needs.guard.outputs.publish == 'true'
         env:
           TAG: ${{ steps.tag.outputs.value }}
           EXTRA_TAGS: ${{ inputs.extra-tags }}
@@ -405,10 +414,11 @@ jobs:
         if: >-
           always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
           && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+          && needs.guard.outputs.publish == 'true'
         run: sudo -n buildah logout --authfile "$RUNNER_TEMP/registry-auth.json" "$REGISTRY" || true
 
   deploy:
-    needs: build
+    needs: [guard, build]
     # Only push/dispatch on the default branch deploys; a branch dispatch builds.
     # deploy: false leaves the bump to deploy.yml (several images, one commit).
     if: >-
@@ -416,7 +426,8 @@ jobs:
       && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
       && (inputs.values-files != '' || inputs.values-file != '')
       && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    runs-on: ubuntu-latest
+      && needs.guard.outputs.publish == 'true'
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 10
     concurrency:
       group: ukubi-ci-image-${{ inputs.image }}-deploy
@@ -436,6 +447,17 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.repository.default_branch }}
+
+      # The runner has no yq and sudo is buildah-only: a pinned release, checked by sha256.
+      - name: Install yq
+        run: |
+          set -euo pipefail
+          v=4.44.3
+          sha=a2c097180dd884a8d50c956ee16a9cec070f30a7947cf4ebf87d5f36213e9ed7
+          curl -sSfLo "$RUNNER_TEMP/yq" "https://github.com/mikefarah/yq/releases/download/v$v/yq_linux_amd64"
+          echo "$sha  $RUNNER_TEMP/yq" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/yq"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
       # Turns this image's tag and digest into PINS (one "<file> <pin>" line per
       # values file) for the shared steps below. No bare-sha fallback: an empty
@@ -467,7 +489,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$BUILT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::built commit missing or malformed ('$BUILT')"; exit 1; }
-          [ "$(git rev-parse --is-shallow-repository)" = true ] && git fetch -q --unshallow origin "$BRANCH" || true
+          if [ "$(git rev-parse --is-shallow-repository)" = true ]; then git fetch -q --unshallow origin "$BRANCH" || true; fi
           # PINS: one "<values file> <sha12>@sha256:<64 hex>" per line.
           files=(); vals=()
           while read -r f v extra; do

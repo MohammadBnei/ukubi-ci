@@ -51,7 +51,7 @@ gate bun-checks Lint "inputs.lint-script != ''"
 gate bun-checks Test "inputs.test-script != ''"
 gate bun-checks Build "inputs.build-script != ''"
 gate bun-checks 'Dist is fresh' "inputs.dist != ''"
-gate rust-checks 'Install apt packages' "inputs.apt-packages != ''"
+gate rust-checks 'Check apt packages' "inputs.apt-packages != ''"
 gate rust-checks Format ''
 gate rust-checks Clippy ''
 gate rust-checks Audit ''
