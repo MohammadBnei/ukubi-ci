@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.0 - 2026-11-17
+
+### Features
+
+- **ci:** Run every workflow on the self-hosted build runner (#12)
+
 ## 0.6.0 - 2026-11-14
 
 ### Features
