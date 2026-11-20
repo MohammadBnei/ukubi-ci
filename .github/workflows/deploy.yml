@@ -27,9 +27,12 @@ on:
         type: string
         default: .image.tag
       runs-on:
-        description: JSON list of runner labels; needs git and curl (yq is installed by a step).
+        description: >-
+          JSON list of runner labels; needs bash, git and curl (yq is installed
+          by a step). The default is the container runner label on Forgejo;
+          GitHub callers pass their own.
         type: string
-        default: '["self-hosted","ukubi-build"]'
+        default: '["ubuntu-latest"]'
       commit-author:
         description: Bump commit author name. Empty is "<repo>-ci".
         type: string

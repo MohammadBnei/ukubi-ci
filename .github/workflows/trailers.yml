@@ -17,6 +17,12 @@ name: trailers
 on:
   workflow_call:
     inputs:
+      runs-on:
+        description: >-
+          JSON list of runner labels; needs bash and git. The default is the
+          container runner label on Forgejo; GitHub callers pass their own.
+        type: string
+        default: '["ubuntu-latest"]'
       conventional:
         description: Require Conventional Commit subjects (non-merge commits) and PR title.
         type: boolean
@@ -36,7 +42,7 @@ on:
 
 jobs:
   trailers:
-    runs-on: [self-hosted, ukubi-build]
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     permissions:
       contents: read
     defaults:

@@ -16,6 +16,7 @@
 #
 # The caller's job must grant `contents: write` and `id-token: write`, also on
 # pull_request (GitHub checks nested permissions before any job starts).
+# Forgejo ignores permissions; there it passes the universal-auth secrets.
 # Inputs reach scripts through env only, never inline ${{ }}.
 name: image
 
@@ -23,7 +24,7 @@ on:
   workflow_call:
     inputs:
       runs-on:
-        description: JSON list of runner labels for the build job, e.g. '["self-hosted","ukubi-build"]'.
+        description: JSON list of runner labels for every job, e.g. '["ukubi-build"]' (buildah with a sudo -n grant).
         type: string
         required: true
       image:
@@ -124,9 +125,23 @@ on:
         description: Cap for the build job; a hung buildah would hold the shared runner for GitHub's 6 hours.
         type: number
         default: 60
+      infisical-auth:
+        description: >-
+          How the build job logs in to Infisical for REGISTRY_PASSWORD: oidc
+          (the GitHub OIDC identity), universal (universal-auth with the
+          infisical-client-id and infisical-client-secret secrets), or auto:
+          oidc on github.com, universal anywhere else (Forgejo).
+        type: string
+        default: auto
     secrets:
       build-secrets:
         description: Multiline id=value; each becomes `--secret id=<id>` (RUN --mount=type=secret,id=<id>).
+        required: false
+      infisical-client-id:
+        description: Universal-auth client id of an Infisical identity that can read registry-secret-path. Used only by the universal login.
+        required: false
+      infisical-client-secret:
+        description: Universal-auth client secret for infisical-client-id.
         required: false
     outputs:
       tag:
@@ -145,8 +160,9 @@ env:
   REGISTRY_USER: ci
   IMAGE: ${{ inputs.image }}
   # The registry password comes from the shared platform-commons project over
-  # GitHub OIDC (infra-bootstrap ADR-0049). Under workflow_call the claims are
-  # the CALLER's: the caller repo must be on the identity's repository list
+  # GitHub OIDC (infra-bootstrap ADR-0049), or on Forgejo over universal-auth
+  # (input infisical-auth). Under workflow_call the OIDC claims are the
+  # CALLER's: the caller repo must be on the identity's repository list
   # (build-runner-ops step 3), else "OIDC claim not allowed" / 401.
   INFISICAL_DOMAIN: https://infisical.bnei.dev
   INFISICAL_PROJECT_SLUG: platform-commons-76pb
@@ -304,6 +320,35 @@ jobs:
       # the build) and the next step lifts REGISTRY_PASSWORD alone. The identity's
       # bound claims allow push and workflow_dispatch only, so nothing else asks.
       # A dedicated folder (input registry-secret-path) stops them being fetched.
+      # Forgejo Actions has no proven OIDC token for Infisical yet, so off
+      # github.com the login is universal-auth. test/check.sh runs this block
+      # verbatim; keep the name.
+      - name: Pick the Infisical login
+        if: >-
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+          && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+          && needs.guard.outputs.publish == 'true'
+        id: infisical
+        env:
+          AUTH: ${{ inputs.infisical-auth }}
+          HAVE_CLIENT: ${{ secrets.infisical-client-id != '' && secrets.infisical-client-secret != '' }}
+        run: |
+          set -euo pipefail
+          case "$AUTH" in
+            oidc|universal) m=$AUTH ;;
+            # Forgejo's runner sets FORGEJO_ACTIONS (Gitea's GITEA_ACTIONS) and its own server URL.
+            auto) if [ -n "${FORGEJO_ACTIONS:-}${GITEA_ACTIONS:-}" ] || [ "${GITHUB_SERVER_URL:-https://github.com}" != https://github.com ]; then
+                    m=universal
+                  else
+                    m=oidc
+                  fi ;;
+            *) echo "::error::infisical-auth is auto, oidc or universal, got '$AUTH'"; exit 1 ;;
+          esac
+          if [ "$m" = universal ] && [ "$HAVE_CLIENT" != true ]; then
+            echo "::error::the universal Infisical login needs the infisical-client-id and infisical-client-secret secrets"; exit 1
+          fi
+          echo "method=$m" >> "$GITHUB_OUTPUT"
+
       - name: Read the registry password from Infisical
         if: >-
           (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
@@ -311,8 +356,11 @@ jobs:
           && needs.guard.outputs.publish == 'true'
         uses: Infisical/secrets-action@a663da43e1541832614bfd9dcf9ab67381ea2b98 # v1.0.12
         with:
-          method: oidc
+          method: ${{ steps.infisical.outputs.method }}
+          # oidc reads identity-id and oidc-audience; universal the client pair.
           identity-id: ${{ env.INFISICAL_IDENTITY_ID }}
+          client-id: ${{ secrets.infisical-client-id }}
+          client-secret: ${{ secrets.infisical-client-secret }}
           oidc-audience: infisical.bnei.dev
           domain: ${{ env.INFISICAL_DOMAIN }}
           project-slug: ${{ env.INFISICAL_PROJECT_SLUG }}

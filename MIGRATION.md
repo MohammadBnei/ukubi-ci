@@ -1,0 +1,125 @@
+# Moving a caller to Forgejo Actions
+
+From v0.8.0 the workflows run on Forgejo Actions and on GitHub Actions. This
+page lists what each caller repo has to change once its git and CI live on
+Forgejo. The workflow files stay in `.github/workflows/`: Forgejo reads that
+folder when the repo has no `.forgejo/workflows/`, so do not add one.
+
+## Before any repo moves (once, on the platform)
+
+- **Actions are pulled from github.com.** Set `[actions] DEFAULT_ACTIONS_URL =
+  https://github.com` in Forgejo's `app.ini`. Then the pinned
+  `actions/checkout@<sha>`, `actions/setup-go`, `actions/setup-node`,
+  `Swatinem/rust-cache` and `Infisical/secrets-action` resolve unchanged.
+  data.forgejo.org does not mirror Infisical or Swatinem.
+- **ukubi-ci is on Forgejo with the same commits, and public.** It must be a
+  migrated mirror, not a fresh push, so the `@<sha>` pins still resolve.
+  Forgejo calls a reusable workflow from another repo only when that repo is
+  public. ukubi-ci holds no secrets.
+- **Two runner labels:**
+  - `ukubi-build` runs on the build LXC in host mode. It needs `sudo -n buildah`
+    as today, and `node` on PATH, because JavaScript actions (checkout, the
+    Infisical action) run on the host's node.
+  - `ubuntu-latest` runs in a podman container. The image needs bash, git,
+    curl, jq, tar, xz and sha256sum, gcc (`go test -race` uses cgo) and `cc` for
+    Rust.
+- **Infisical login without OIDC.** Forgejo's OIDC token for Infisical is not
+  proven yet, so off github.com image.yml logs in with universal-auth
+  (`infisical-auth: auto`). Make a universal-auth machine identity that can
+  read only platform-commons `dev:/registry` (the folder that holds
+  `REGISTRY_PASSWORD`). Store its pair as the org secrets
+  `INFISICAL_CLIENT_ID` and `INFISICAL_CLIENT_SECRET`.
+  The trade-off: OIDC bound the login to push and workflow_dispatch claims,
+  and universal-auth has no such binding. Any workflow that is given the
+  secret can read the registry password, including a PR's edited workflow in
+  the same repo. Forgejo keeps secrets away from fork PRs only. That is why the
+  identity sees `/registry` and nothing else.
+
+## In each caller repo
+
+1. **Re-pin** every `uses: MohammadBnei/ukubi-ci/.github/workflows/<x>.yml@<sha>`
+   to the v0.8.0 sha. The path stays the same, because Forgejo resolves
+   `owner/repo` on its own instance.
+2. **image.yml callers** (drop, hq, mountain, ukubi-bridge, ukubi-game, ukubi-meet,
+   ukubi-stt, wird):
+   ```yaml
+   uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@<v0.8.0 sha>
+   with:
+     runs-on: '["ukubi-build"]'          # was ["self-hosted","ukubi-build"]
+     image: drop
+     registry-secret-path: /registry      # only the password folder is fetched
+   secrets:
+     infisical-client-id: ${{ secrets.INFISICAL_CLIENT_ID }}
+     infisical-client-secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+   ```
+   Keep the `permissions:` blocks. GitHub needs them and Forgejo ignores them.
+3. **Checks and release callers** (go-checks, bun-checks, rust-checks,
+   trailers, release, deploy) need no change. Their new `runs-on` input defaults
+   to `["ubuntu-latest"]`, the container runner. image-build defaults to
+   `["ukubi-build"]`. A caller still on GitHub passes
+   `runs-on: '["self-hosted","ukubi-build"]'` to keep today's runner.
+4. **Do not set `runs-on` on a `uses:` job.** GitHub refuses it. On Forgejo,
+   leaving it out lets the server expand the called workflow into its own
+   jobs, each with its own `runs-on`. With `runs-on` set, the whole called
+   workflow runs inside the one caller job.
+5. **Concurrency:** Forgejo honours only the workflow-level `concurrency:`
+   and ignores the job-level groups inside image.yml, deploy.yml and
+   release.yml. With no workflow-level setting, a new push or PR update
+   cancels the older run of the same workflow. The release and deploy pushes
+   are atomic and retried, so a cancelled run loses nothing and the newer run
+   publishes. If a release must never be cut short, the caller adds
+   `concurrency: {group: release-${{ github.ref }}, cancel-in-progress: false}`
+   at the top of its own workflow.
+6. **Your own jobs:** change `runs-on: [self-hosted, ukubi-build]` to
+   `runs-on: ukubi-build` for jobs that need buildah or the box's caches, or to
+   `ubuntu-latest` for jobs that do not. `ukubi-race` (ukubi-game) has no
+   Forgejo runner yet. `ubuntu-latest` jobs stay as they are.
+7. **Databases in tests:** replace `pre-test: docker compose up -d --wait
+   postgres` (wird) with the `dev-db` action from ukubi-ci (branch
+   `feat/dev-db-action`, which merges separately). It is a composite action, so
+   it goes in your own job and not inside go-checks:
+   ```yaml
+   go-db:
+     runs-on: ubuntu-latest
+     steps:
+       - uses: actions/checkout@<sha>
+       - uses: MohammadBnei/ukubi-ci/actions/dev-db@<sha>
+         with:
+           integresql-url: https://integresql.dev.example
+           token: ${{ secrets.DEV_DB_TOKEN }}
+           seed-command: ./scripts/migrate-and-seed.sh
+       - run: go test -race -count=1 ./...       # DATABASE_URL is exported
+       - if: always()
+         uses: MohammadBnei/ukubi-ci/actions/dev-db-release@<sha>
+         with:
+           token: ${{ secrets.DEV_DB_TOKEN }}
+   ```
+8. **Inline Infisical OIDC outside ukubi-ci** fails on Forgejo. Move each of
+   these to `method: universal` with the org secrets (or to image.yml):
+   editable-website, editable-website-article, editable-website-article2
+   (`release.yml`), has-journal (`build.yml`), pi-lab (`app.yml`), and wird
+   (`.github/actions/infisical-keep`, `apk.yml`, `ipa.yml`).
+9. **gh CLI:** wird `release-app.yml` calls `gh run list`. On Forgejo, call
+   `$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/actions/...` with curl
+   and `Authorization: token ${{ github.token }}`, or drop that guard. No
+   ukubi-ci workflow uses gh.
+10. **Pushes with the job token** (release.yml's release commit and tag,
+   image.yml and deploy.yml's tag bump) need the Forgejo Actions token to be
+   allowed to push to the default branch. Branch protection on Forgejo must
+   leave that open, as it does on GitHub today. On both, those pushes start no
+   new run, so they cannot loop.
+
+## Check on the pilot before the first real repo
+
+The workflows pass actionlint and their self-tests. These Forgejo behaviours
+could only be checked on a live instance, so run ukubi-ci's own `ci.yml` on the
+pilot first:
+
+- A reusable workflow's `outputs` reach the caller's later jobs
+  (ukubi-game: image.yml's `tag`, `digest` and `commit` feed deploy.yml).
+- `secrets:` passed to a reusable workflow reach its steps.
+- A `uses: ...@<40-char sha>` ref resolves (the docs only show branch refs).
+- The `ubuntu-latest` image has every tool listed above (ukubi-ci's own
+  `actionlint` and `check` jobs run there).
+- `github.event.repository.default_branch` is set on push and dispatch, since
+  every publish and deploy gate compares against it.
