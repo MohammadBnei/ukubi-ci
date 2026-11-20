@@ -1,19 +1,24 @@
 # Local IntegreSQL + Postgres for the dev-db self-test (test/dev-db/run.sh).
 # network_mode: bridge reuses Docker's default network (no new network, so no
 # address-pool use); the two containers reach each other through the host.
+# IntegreSQL runs as the non-superuser roles of roles.sql, like the real one.
+# Plain postgres, not the TimescaleDB image the cluster runs (6.8 GB); the
+# extensions are infra-bootstrap's to test, the action never touches them.
 services:
   postgres:
-    image: postgres:18
+    image: postgres:18@sha256:979bccfde35445db618c65107d27d08c6c21339d8dc3ad4c830c6633947be0e4
     network_mode: bridge
     environment:
       POSTGRES_PASSWORD: pgpass
     ports: ["15432:5432"]
+    volumes: ["./roles.sql:/docker-entrypoint-initdb.d/roles.sql:ro"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      # TCP: the entrypoint's init server listens on the socket only.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres"]
       interval: 1s
       retries: 30
   integresql:
-    image: ghcr.io/allaboutapps/integresql:v1.1.0
+    image: ghcr.io/allaboutapps/integresql:v1.1.0@sha256:66b7433399f1907bad9e4b7cc7bd528ed4ebfccddecb8fd65da4af4d06a68c5a
     network_mode: bridge
     extra_hosts: ["host.docker.internal:host-gateway"]
     depends_on:
@@ -21,6 +26,12 @@ services:
     environment:
       INTEGRESQL_PGHOST: host.docker.internal
       INTEGRESQL_PGPORT: "15432"
-      INTEGRESQL_PGUSER: postgres
-      INTEGRESQL_PGPASSWORD: pgpass
+      INTEGRESQL_PGUSER: integresql
+      INTEGRESQL_PGPASSWORD: mgrpass
+      INTEGRESQL_TEST_PGUSER: integresql_test
+      INTEGRESQL_TEST_PGPASSWORD: testpass
+      INTEGRESQL_ROOT_TEMPLATE: template1
+      # A GET on an unfinished template answers 500 after this, not 60 s,
+      # so the killed-builder check in run.sh takes seconds.
+      INTEGRESQL_TEMPLATE_FINALIZE_TIMEOUT_MS: "3000"
     ports: ["15000:5000"]

@@ -12,6 +12,9 @@ case "$1" in
     [ "$n" = 1 ] || { echo "FAIL expected 1 row after recreate, got $n"; exit 1; } ;;
   *) echo "usage: check.sh seeded|fresh"; exit 2 ;;
 esac
-exp=$(q "SELECT (shobj_description(oid,'pg_database')::json->>'expires')::bigint FROM pg_database WHERE datname=current_database()")
-[ "$exp" -gt "$(date +%s)" ] || { echo "FAIL expiry comment missing or in the past: '$exp'"; exit 1; }
-echo "ok   $1 (rows=$n, expires=$exp)"
+# The TTL sweeper's own test: a ttl that parses as timestamptz and lies ahead.
+exp=$(q "SELECT (shobj_description(oid,'pg_database')::jsonb->>'ttl')::timestamptz > now() FROM pg_database WHERE datname=current_database()")
+[ "$exp" = t ] || { echo "FAIL ttl comment missing or in the past: '$exp'"; exit 1; }
+su=$(q "SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+[ "$su" = f ] || { echo "FAIL the test database's role is a superuser"; exit 1; }
+echo "ok   $1 (rows=$n, ttl ahead, not superuser)"

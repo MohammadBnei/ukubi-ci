@@ -23,6 +23,6 @@ runs:
         if [ "$IN_KEEP" = true ]; then echo "keep=true: leaving database $DEV_DB_ID of template $DEV_DB_TEMPLATE_HASH to the sweeper"; exit 0; fi
         args=(-sS -o /dev/null -w '%{http_code}' --max-time 90 -X POST)
         [ -z "$IN_TOKEN" ] || args+=(-H "Authorization: Bearer $IN_TOKEN")
-        code=$(curl "${args[@]}" "$DEV_DB_INTEGRESQL_URL/api/v1/templates/$DEV_DB_TEMPLATE_HASH/tests/$DEV_DB_ID/recreate" || echo 000)
+        code=$(curl "${args[@]}" "$DEV_DB_INTEGRESQL_URL/api/v1/templates/$DEV_DB_TEMPLATE_HASH/tests/$DEV_DB_ID/recreate") || code=000
         # A failed release is a warning: the sweeper drops the database at its TTL.
         if [ "$code" = 204 ]; then echo "database $DEV_DB_ID recreated"; else echo "::warning::recreate returned $code; the sweeper will clean up"; fi

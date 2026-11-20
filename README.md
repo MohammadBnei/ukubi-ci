@@ -466,25 +466,38 @@ steps:
       token: ${{ secrets.DEV_DB_TOKEN }}
 ```
 
-What `dev-db` does: `POST /templates {hash}`. A 200 means this job builds the
-template: it runs `seed-command` against the template database, then
-`PUT /templates/<hash>`. A failed seed discards the template so the next run
-rebuilds. A 423 means another job built it or is building it: the action loops
-on `GET /templates/<hash>/tests`, which IntegreSQL holds open until the template
-is final. It then writes `DATABASE_URL` (password masked) and `DEV_DB_*` to
-`GITHUB_ENV`, and sets the expiry with `COMMENT ON DATABASE`
-(`{"expires":<epoch>,"repo":..,"run":..,"keep":..}`) for the TTL sweeper.
+What `dev-db` does: `POST /templates {key}`, where the key is the first 32 hex
+of sha256(`GITHUB_REPOSITORY`, hash), so two repos never share a template by
+accident. A 200 means this job builds the template: it runs `seed-command`
+against the template database, then `PUT /templates/<key>`. A template this job
+created but did not finalize (failed seed, cancel, step timeout, failed PUT) is
+deleted by an exit trap, so the next run rebuilds. A 423 means another job built
+it or is building it: the action loops on `GET /templates/<key>/tests`, which
+IntegreSQL holds open until the template is final. If it is still not final
+after `timeout-seconds` (its builder was killed outright), the action deletes it
+and builds it once itself. It then writes `DATABASE_URL` (password masked) and
+`DEV_DB_*` to `GITHUB_ENV`, and sets the expiry with `COMMENT ON DATABASE`
+(`{"ttl":"<RFC 3339 UTC>","repo":..,"run":..,"keep":..}`), the format
+infra-bootstrap's TTL sweeper reads.
+
+The credentials come from IntegreSQL. IntegreSQL v1.1.0 hands every caller,
+seeder and test alike, its own manager role, so that role must not be a
+superuser (on the dev Postgres it is `integresql`: NOSUPERUSER, CREATEDB). Until
+an auth proxy sits in front of IntegreSQL, any job can still reach another job's
+database with it, and can compute another repo's key; the proxy has to bind each
+token to its repo's keys and hand out a per-database role.
 
 | input | default | |
 |---|---|---|
 | `integresql-url` | required | base URL; its host is also the Postgres host |
 | `token` | | bearer token for the auth proxy; empty sends no header |
-| `template-hash` | | `[A-Za-z0-9_-]{1,64}`; empty hashes `hash-paths` plus `seed-command` |
+| `template-hash` | | `[A-Za-z0-9_-]{1,64}`; empty hashes `hash-paths` plus `seed-command`; hashed again with the repo name |
 | `hash-paths` | `migrations seeds` | space-separated files or directories hashed when `template-hash` is empty; missing ones are skipped, none found is an error |
 | `seed-command` | | runs only when the template is built, with `DATABASE_URL` set to it |
 | `postgres-port` | `5432` | IntegreSQL reports its in-cluster address, so only the port comes from the caller |
-| `ttl` | `2` | hours until the sweeper may drop the database; `0` skips the comment (and psql) |
-| `keep` | `false` | informational copy of the release input, stored in the comment |
+| `sslmode` | `disable` | `sslmode` in `DATABASE_URL`; the dev Postgres is LAN-only without TLS |
+| `ttl` | `2` | hours until the sweeper may drop the database; `0` skips the comment; no psql on the runner warns and skips |
+| `keep` | `false` | copy of the release input, stored in the comment; `true` needs `ttl` above 0 and psql |
 | `timeout-seconds` | `600` | wait for another job's template build |
 
 `dev-db-release` (inputs `token`, `keep`) is a separate action because composite
@@ -493,6 +506,8 @@ failed recreate only warns, the sweeper cleans up at the ttl. With no `dev-db`
 step in the job it does nothing.
 
 Self-test: `test/dev-db/run.sh` runs both actions' blocks against
-`test/dev-db/compose.yml` (IntegreSQL + Postgres 18, no new Docker network);
+`test/dev-db/compose.yml` (IntegreSQL + Postgres 18 by digest, both roles
+non-superusers as on the dev Postgres, no new Docker network), including a
+cancelled seed, a killed builder and two repos with one hash;
 `.github/workflows/dev-db-selftest.yml` does the same through `uses: ./actions/...`
 on a runner with docker compose and psql.
