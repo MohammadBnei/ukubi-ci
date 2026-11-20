@@ -1,0 +1,132 @@
+name: dev-db
+description: >-
+  Get a disposable, seeded Postgres database from IntegreSQL (ADR-0088) and
+  export DATABASE_URL. Pair it with dev-db-release in a final if-always step.
+inputs:
+  integresql-url:
+    description: Base URL of IntegreSQL (or its auth proxy), e.g. https://integresql.dev.example.
+    required: true
+  token:
+    description: Bearer token for the auth proxy in front of IntegreSQL. Empty sends no header.
+    default: ''
+  template-hash:
+    description: Template key (letters, digits, - and _, up to 64). Empty hashes hash-paths and seed-command.
+    default: ''
+  hash-paths:
+    description: Space-separated files or directories (relative to the workspace, no spaces in names) hashed when template-hash is empty. Missing ones are skipped.
+    default: 'migrations seeds'
+  seed-command:
+    description: >-
+      Shell command that migrates and seeds the template database. Runs only
+      when the template must be built, with DATABASE_URL pointing at it.
+    default: ''
+  postgres-port:
+    description: Port of the dev Postgres on the integresql-url host. IntegreSQL reports its own in-cluster address, so only the port is trusted from the caller.
+    default: '5432'
+  ttl:
+    description: Hours until the TTL sweeper may drop the database. Written to COMMENT ON DATABASE (needs psql on the runner); 0 skips it.
+    default: '2'
+  keep:
+    description: Pass the same value to dev-db-release. true leaves the database for the sweeper instead of recreating it.
+    default: 'false'
+  timeout-seconds:
+    description: How long to wait for another job's template build.
+    default: '600'
+runs:
+  using: composite
+  steps:
+    - name: Get a dev database
+      shell: bash
+      env:
+        IN_URL: ${{ inputs.integresql-url }}
+        IN_TOKEN: ${{ inputs.token }}
+        IN_HASH: ${{ inputs.template-hash }}
+        IN_PATHS: ${{ inputs.hash-paths }}
+        IN_SEED: ${{ inputs.seed-command }}
+        IN_PORT: ${{ inputs.postgres-port }}
+        IN_TTL: ${{ inputs.ttl }}
+        IN_KEEP: ${{ inputs.keep }}
+        IN_TIMEOUT: ${{ inputs.timeout-seconds }}
+      run: |
+        set -euo pipefail
+        url=${IN_URL%/}
+        [[ "$url" =~ ^https?://([^/:@]+)(:[0-9]+)?(/.*)?$ ]] || { echo "::error::integresql-url must be http(s)://host[:port]"; exit 1; }
+        pghost=${BASH_REMATCH[1]}
+        [[ "$IN_PORT" =~ ^[0-9]+$ && "$IN_TTL" =~ ^[0-9]+$ && "$IN_TIMEOUT" =~ ^[0-9]+$ ]] || { echo "::error::postgres-port, ttl and timeout-seconds must be whole numbers"; exit 1; }
+        [ -z "$IN_TOKEN" ] || echo "::add-mask::$IN_TOKEN"
+        for c in curl jq; do command -v "$c" >/dev/null || { echo "::error::$c is required"; exit 1; }; done
+
+        sha() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }
+        hash=$IN_HASH
+        if [ -z "$hash" ]; then
+          # shellcheck disable=SC2086 # splitting the path list is the point
+          files=$(for p in $IN_PATHS; do [ -e "$p" ] && find "$p" -type f; done | LC_ALL=C sort -u)
+          [ -n "$files" ] || { echo "::error::no files under hash-paths '$IN_PATHS' and template-hash is empty"; exit 1; }
+          # Names and contents in a fixed order, plus the seed command: change any and the template is rebuilt.
+          hash=$({ printf '%s\n' "$IN_SEED"; while IFS= read -r f; do printf '%s\n' "$f"; sha < "$f"; done <<<"$files"; } | sha | cut -c1-32)
+        fi
+        [[ "$hash" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { echo "::error::template-hash must match [A-Za-z0-9_-]{1,64}"; exit 1; }
+
+        body=$(mktemp)
+        # api METHOD PATH [JSON]: prints the HTTP status, leaves the body in $body.
+        api() {
+          local args=(-sS -o "$body" -w '%{http_code}' --max-time 90 -X "$1")
+          [ -z "$IN_TOKEN" ] || args+=(-H "Authorization: Bearer $IN_TOKEN")
+          [ -z "${3:-}" ] || args+=(-H 'Content-Type: application/json' -d "$3")
+          curl "${args[@]}" "$url/api/v1$2" || echo 000
+        }
+        # dburl: DATABASE_URL from the last response body; host and port come from the caller, not IntegreSQL.
+        dburl() {
+          jq -r --arg h "$pghost" --arg p "$IN_PORT" \
+            '.database.config | "postgres://\(.username|@uri):\(.password|@uri)@\($h):\($p)/\(.database|@uri)?sslmode=disable"' "$body"
+        }
+        mask() { echo "::add-mask::$(jq -r '.database.config.password' "$body")"; }
+
+        code=$(api POST /templates "$(jq -nc --arg h "$hash" '{hash:$h}')")
+        case "$code" in
+          200|201)
+            mask
+            tpl=$(dburl)
+            echo "template $hash is new; building it"
+            if ! DATABASE_URL=$tpl bash -c "${IN_SEED:-true}"; then
+              # Free the lock so the next run can rebuild instead of waiting on a dead template.
+              api DELETE "/templates/$hash" >/dev/null || true
+              echo "::error::seed-command failed; template $hash discarded"; exit 1
+            fi
+            code=$(api PUT "/templates/$hash")
+            [ "$code" = 204 ] || { echo "::error::finalizing template $hash returned $code"; exit 1; }
+            ;;
+          423) echo "template $hash exists or is being built; waiting for it" ;;
+          *) echo "::error::POST /templates returned $code"; exit 1 ;;
+        esac
+
+        # GET blocks on the server until the template is final (503 after about a minute), so loop.
+        deadline=$((SECONDS + IN_TIMEOUT))
+        while :; do
+          code=$(api GET "/templates/$hash/tests")
+          [ "$code" = 200 ] && break
+          case "$code" in 423|503|000) ;; *) echo "::error::GET /templates/$hash/tests returned $code"; exit 1 ;; esac
+          [ "$SECONDS" -lt "$deadline" ] || { echo "::error::template $hash not ready after ${IN_TIMEOUT}s"; exit 1; }
+          sleep 2
+        done
+        mask
+        db=$(jq -r '.database.config.database' "$body")
+        id=$(jq -r '.id' "$body")
+        [[ "$db" =~ ^[A-Za-z0-9_]+$ && "$id" =~ ^[0-9]+$ ]] || { echo "::error::unexpected database name or id in the response"; exit 1; }
+        dsn=$(dburl)
+        echo "::add-mask::$dsn"
+
+        if [ "$IN_TTL" -gt 0 ]; then
+          command -v psql >/dev/null || { echo "::error::ttl needs psql on the runner (set ttl: 0 to skip the expiry comment)"; exit 1; }
+          meta=$(jq -nc --argjson t "$(( $(date +%s) + IN_TTL * 3600 ))" --arg r "${GITHUB_REPOSITORY:-}" --arg run "${GITHUB_RUN_ID:-}" --arg k "$IN_KEEP" \
+            '{expires:$t, repo:$r, run:$run, keep:($k=="true")}' | sed "s/'/''/g")
+          psql "$dsn" -v ON_ERROR_STOP=1 -qc "COMMENT ON DATABASE \"$db\" IS '$meta'"
+        fi
+
+        {
+          echo "DATABASE_URL=$dsn"
+          echo "DEV_DB_INTEGRESQL_URL=$url"
+          echo "DEV_DB_TEMPLATE_HASH=$hash"
+          echo "DEV_DB_ID=$id"
+        } >> "$GITHUB_ENV"
+        echo "dev database $db ready (template $hash, id $id)"

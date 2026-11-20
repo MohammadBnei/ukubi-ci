@@ -1,0 +1,48 @@
+# Runs the dev-db and dev-db-release actions against a throwaway IntegreSQL +
+# Postgres from test/dev-db/compose.yml. Needs docker compose and psql on the
+# runner. test/dev-db/run.sh does the same locally without a runner.
+name: dev-db-selftest
+
+on:
+  pull_request:
+    paths: [actions/dev-db/**, actions/dev-db-release/**, test/dev-db/**, .github/workflows/dev-db-selftest.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: [self-hosted, ukubi-build]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Start IntegreSQL and Postgres
+        run: |
+          docker compose -f test/dev-db/compose.yml up -d --wait
+          sleep 3
+      - name: Build the template and get a database
+        uses: ./actions/dev-db
+        with:
+          integresql-url: http://localhost:15000
+          postgres-port: '15432'
+          template-hash: selftest
+          seed-command: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'CREATE TABLE t(id int); INSERT INTO t VALUES (1)'
+      - run: bash test/dev-db/check.sh seeded
+      - name: Release (recreate)
+        uses: ./actions/dev-db-release
+      - name: Reuse the template; the seed command must not run
+        uses: ./actions/dev-db
+        with:
+          integresql-url: http://localhost:15000
+          postgres-port: '15432'
+          template-hash: selftest
+          seed-command: exit 1
+      - run: bash test/dev-db/check.sh fresh
+      - name: Release with keep
+        uses: ./actions/dev-db-release
+        with:
+          keep: 'true'
+      - name: Stop
+        if: always()
+        run: docker compose -f test/dev-db/compose.yml down -v

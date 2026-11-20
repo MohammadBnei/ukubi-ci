@@ -1,0 +1,26 @@
+# Local IntegreSQL + Postgres for the dev-db self-test (test/dev-db/run.sh).
+# network_mode: bridge reuses Docker's default network (no new network, so no
+# address-pool use); the two containers reach each other through the host.
+services:
+  postgres:
+    image: postgres:18
+    network_mode: bridge
+    environment:
+      POSTGRES_PASSWORD: pgpass
+    ports: ["15432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 1s
+      retries: 30
+  integresql:
+    image: ghcr.io/allaboutapps/integresql:v1.1.0
+    network_mode: bridge
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      INTEGRESQL_PGHOST: host.docker.internal
+      INTEGRESQL_PGPORT: "15432"
+      INTEGRESQL_PGUSER: postgres
+      INTEGRESQL_PGPASSWORD: pgpass
+    ports: ["15000:5000"]

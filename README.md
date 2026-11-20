@@ -442,3 +442,57 @@ The forms are anchored, so prose about the rule passes.
 | `allow-prefixes` | | multiline literal subject prefixes exempt from the Conventional rule only, never from the ban |
 | `agent-trailers` | `any` | `forbid`: no agent `Co-Authored-By` or `Agent-Session` at all. `pair`: an agent commit carries both `Co-Authored-By: ukubi-claude-<host> <noreply@bnei.dev>` and `Agent-Session: <id>`, a human one neither |
 | `extra-banned` | | an extra case-insensitive ERE, e.g. `generated with` for a repo that bans the words anywhere |
+
+## dev-db and dev-db-release
+
+Composite actions (shell, curl, jq; psql for the expiry comment) that give a job
+a disposable, seeded Postgres database from the dev IntegreSQL (ADR-0088), on
+GitHub Actions and Forgejo Actions alike. Pin them by commit sha like the
+workflows: `MohammadBnei/ukubi-ci/actions/dev-db@<sha>`.
+
+```yaml
+steps:
+  - uses: actions/checkout@<sha>
+  - uses: MohammadBnei/ukubi-ci/actions/dev-db@<sha>
+    with:
+      integresql-url: https://integresql.dev.example
+      token: ${{ secrets.DEV_DB_TOKEN }}
+      # the template is keyed by a hash of migrations/ and seeds/ (and this command)
+      seed-command: ./scripts/migrate-and-seed.sh   # sees DATABASE_URL
+  - run: go test ./...                              # DATABASE_URL is exported
+  - if: always()
+    uses: MohammadBnei/ukubi-ci/actions/dev-db-release@<sha>
+    with:
+      token: ${{ secrets.DEV_DB_TOKEN }}
+```
+
+What `dev-db` does: `POST /templates {hash}`. A 200 means this job builds the
+template: it runs `seed-command` against the template database, then
+`PUT /templates/<hash>`. A failed seed discards the template so the next run
+rebuilds. A 423 means another job built it or is building it: the action loops
+on `GET /templates/<hash>/tests`, which IntegreSQL holds open until the template
+is final. It then writes `DATABASE_URL` (password masked) and `DEV_DB_*` to
+`GITHUB_ENV`, and sets the expiry with `COMMENT ON DATABASE`
+(`{"expires":<epoch>,"repo":..,"run":..,"keep":..}`) for the TTL sweeper.
+
+| input | default | |
+|---|---|---|
+| `integresql-url` | required | base URL; its host is also the Postgres host |
+| `token` | | bearer token for the auth proxy; empty sends no header |
+| `template-hash` | | `[A-Za-z0-9_-]{1,64}`; empty hashes `hash-paths` plus `seed-command` |
+| `hash-paths` | `migrations seeds` | space-separated files or directories hashed when `template-hash` is empty; missing ones are skipped, none found is an error |
+| `seed-command` | | runs only when the template is built, with `DATABASE_URL` set to it |
+| `postgres-port` | `5432` | IntegreSQL reports its in-cluster address, so only the port comes from the caller |
+| `ttl` | `2` | hours until the sweeper may drop the database; `0` skips the comment (and psql) |
+| `keep` | `false` | informational copy of the release input, stored in the comment |
+| `timeout-seconds` | `600` | wait for another job's template build |
+
+`dev-db-release` (inputs `token`, `keep`) is a separate action because composite
+actions have no post step. It recreates the database unless `keep` is `true`; a
+failed recreate only warns, the sweeper cleans up at the ttl. With no `dev-db`
+step in the job it does nothing.
+
+Self-test: `test/dev-db/run.sh` runs both actions' blocks against
+`test/dev-db/compose.yml` (IntegreSQL + Postgres 18, no new Docker network);
+`.github/workflows/dev-db-selftest.yml` does the same through `uses: ./actions/...`
+on a runner with docker compose and psql.

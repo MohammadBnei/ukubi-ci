@@ -1,0 +1,28 @@
+name: dev-db-release
+description: >-
+  Give the dev-db database back (IntegreSQL recreate) unless keep is true.
+  Run it as the last step with if: always().
+inputs:
+  token:
+    description: Same bearer token as dev-db.
+    default: ''
+  keep:
+    description: true leaves the database in place for the TTL sweeper.
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Release the dev database
+      shell: bash
+      env:
+        IN_TOKEN: ${{ inputs.token }}
+        IN_KEEP: ${{ inputs.keep }}
+      run: |
+        set -euo pipefail
+        if [ -z "${DEV_DB_ID:-}" ]; then echo "::notice::no dev-db database in this job; nothing to release"; exit 0; fi
+        if [ "$IN_KEEP" = true ]; then echo "keep=true: leaving database $DEV_DB_ID of template $DEV_DB_TEMPLATE_HASH to the sweeper"; exit 0; fi
+        args=(-sS -o /dev/null -w '%{http_code}' --max-time 90 -X POST)
+        [ -z "$IN_TOKEN" ] || args+=(-H "Authorization: Bearer $IN_TOKEN")
+        code=$(curl "${args[@]}" "$DEV_DB_INTEGRESQL_URL/api/v1/templates/$DEV_DB_TEMPLATE_HASH/tests/$DEV_DB_ID/recreate" || echo 000)
+        # A failed release is a warning: the sweeper drops the database at its TTL.
+        if [ "$code" = 204 ]; then echo "database $DEV_DB_ID recreated"; else echo "::warning::recreate returned $code; the sweeper will clean up"; fi
