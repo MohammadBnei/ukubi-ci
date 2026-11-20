@@ -7,6 +7,12 @@ name: bun-checks
 on:
   workflow_call:
     inputs:
+      runs-on:
+        description: >-
+          JSON list of runner labels; needs bash, git and jq. The default is the
+          container runner label on Forgejo; GitHub callers pass their own.
+        type: string
+        default: '["ubuntu-latest"]'
       working-directory:
         description: The package directory (holds package.json and bun.lock), relative to the repo root.
         type: string
@@ -34,7 +40,7 @@ on:
 
 jobs:
   bun:
-    runs-on: [self-hosted, ukubi-build]
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     permissions:
       contents: read
     defaults:

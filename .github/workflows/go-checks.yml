@@ -8,6 +8,12 @@ name: go-checks
 on:
   workflow_call:
     inputs:
+      runs-on:
+        description: >-
+          JSON list of runner labels; needs bash, git, curl and gcc (go test -race uses cgo). The default is the
+          container runner label on Forgejo; GitHub callers pass their own.
+        type: string
+        default: '["ubuntu-latest"]'
       working-directory:
         description: The module directory, relative to the repo root.
         type: string
@@ -35,7 +41,7 @@ on:
 
 jobs:
   go:
-    runs-on: [self-hosted, ukubi-build]
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     permissions:
       contents: read
     defaults:

@@ -10,6 +10,12 @@ name: image-build
 on:
   workflow_call:
     inputs:
+      runs-on:
+        description: >-
+          JSON list of runner labels; needs buildah with a sudo -n grant (the build runner). The default is the
+          build runner label on Forgejo; GitHub callers pass their own.
+        type: string
+        default: '["ukubi-build"]'
       image:
         description: Image name, used for the local tag only, e.g. drop.
         type: string
@@ -53,7 +59,7 @@ env:
 
 jobs:
   build:
-    runs-on: [self-hosted, ukubi-build]
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: ${{ inputs.build-timeout-minutes }}
     permissions:
       contents: read

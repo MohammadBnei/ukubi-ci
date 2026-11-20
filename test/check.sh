@@ -43,12 +43,44 @@ pr false pull_request_target "pull_request_target builds only"
 pr false schedule            "an unlisted event builds only"
 pr false ""                  "an empty event builds only"
 # Every step that logs in, reads Infisical or pushes, and the deploy job, also ask the guard.
-for sn in "Read the registry password from Infisical" "Keep only the registry password" "Registry login" "Push" "Registry logout"; do
+for sn in "Pick the Infisical login" "Read the registry password from Infisical" "Keep only the registry password" "Registry login" "Push" "Registry logout"; do
   if [[ "$(yq ".jobs.build.steps[] | select(.name == \"$sn\") | .if" "$WF")" == *"needs.guard.outputs.publish == 'true'"* ]]; then ok "publish gate on '$sn'"; else bad "no guard gate on '$sn'"; fi
 done
 if [[ "$(yq '.jobs.deploy.if' "$WF")" == *"needs.guard.outputs.publish == 'true'"* ]]; then ok "publish gate on the deploy job"; else bad "no guard gate on the deploy job"; fi
-# Every job of every workflow runs on a self-hosted label (no hosted runner is paid for).
-if grep -rniE 'ubuntu-|macos-|windows-' "$(dirname "$WF")" | grep -v '^\S*:[0-9]*:\s*#'; then bad "a workflow names a GitHub-hosted runner"; else ok "no GitHub-hosted runner in the workflows"; fi
+# No job names a GitHub-hosted image (no hosted runner is paid for). The one
+# exception is the bare label ubuntu-latest: on Forgejo it is the self-hosted
+# container runner, and it is a JSON default or ci.yml's own label only.
+if grep -rniE 'ubuntu-|macos-|windows-' "$(dirname "$WF")" | grep -v '^\S*:[0-9]*:\s*#' \
+  | grep -vE "^[^:]*:[0-9]+:\s*(default: '\[\"ubuntu-latest\"\]'|runs-on: ubuntu-latest)$"; then
+  bad "a workflow names a GitHub-hosted runner"
+else ok "no GitHub-hosted runner in the workflows"; fi
+# The build job's runner comes from the caller: buildah runs only where it is granted.
+# shellcheck disable=SC2016 # a literal ${{, not a shell expansion
+if [ "$(yq '.jobs.build."runs-on"' "$WF")" = '${{ fromJSON(inputs.runs-on) }}' ]; then ok "build job runs on inputs.runs-on"; else bad "build job runs-on is not inputs.runs-on"; fi
+
+# 2a. The Infisical login: oidc on github.com, universal-auth (client pair) elsewhere.
+step build "Pick the Infisical login" > "$T/auth.sh"
+[ -s "$T/auth.sh" ] || { echo "FAIL extract Infisical login block"; exit 1; }
+auth() { # want_rc want_method name [VAR=value ...]
+  local rc=0 got want_rc=$1 want=$2 name=$3; shift 3; : > "$T/aout"
+  env -u FORGEJO_ACTIONS -u GITEA_ACTIONS -u GITHUB_SERVER_URL AUTH=auto HAVE_CLIENT=true GITHUB_OUTPUT="$T/aout" "$@" \
+    bash "$T/auth.sh" >/dev/null 2>&1 || rc=$?
+  got=$(sed -n 's/^method=//p' "$T/aout")
+  if [ "$rc" = "$want_rc" ] && [ "$got" = "$want" ]; then ok "infisical login: $name"; else bad "infisical login: $name (rc=$rc, method=$got)"; fi
+}
+auth 0 oidc      "auto on github.com is oidc" GITHUB_SERVER_URL=https://github.com
+auth 0 oidc      "auto with no server url is oidc"
+auth 0 universal "auto on Forgejo (FORGEJO_ACTIONS) is universal" FORGEJO_ACTIONS=true GITHUB_SERVER_URL=https://git.bnei.dev
+auth 0 universal "auto on Gitea (GITEA_ACTIONS) is universal" GITEA_ACTIONS=true
+auth 0 universal "auto on another server url is universal" GITHUB_SERVER_URL=https://git.bnei.dev
+auth 0 oidc      "oidc forced on Forgejo" AUTH=oidc FORGEJO_ACTIONS=true
+auth 0 universal "universal forced on github.com" AUTH=universal GITHUB_SERVER_URL=https://github.com
+auth 1 ""        "universal without the client pair fails" AUTH=universal HAVE_CLIENT=false
+auth 0 oidc      "oidc needs no client pair" AUTH=oidc HAVE_CLIENT=false
+auth 1 ""        "a bad infisical-auth value fails" AUTH=token
+# shellcheck disable=SC2016 # a literal ${{, not a shell expansion
+if [ "$(yq '.jobs.build.steps[] | select(.name == "Read the registry password from Infisical") | .with.method' "$WF")" = '${{ steps.infisical.outputs.method }}' ]; then
+  ok "the Infisical action takes the picked method"; else bad "the Infisical action ignores the picked method"; fi
 
 # 3. The deploy bump. Each case: name, values-key, expected rc, expected
 #    error substring (or ""), file content; the pin is 0123456789ab@$D unless
@@ -358,7 +390,7 @@ for in in push-default-branch-only extra-tags; do
   if [ "$(yq ".on.workflow_call.inputs.\"$in\".default" "$WF")" = "${want//\"/}" ]; then ok "image.yml $in is off by default"; else bad "image.yml $in default"; fi
 done
 gate="!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"
-for sn in "Read the registry password from Infisical" "Keep only the registry password" "Registry login" "Push" "Registry logout"; do
+for sn in "Pick the Infisical login" "Read the registry password from Infisical" "Keep only the registry password" "Registry login" "Push" "Registry logout"; do
   if [[ "$(yq ".jobs.build.steps[] | select(.name == \"$sn\") | .if" "$WF")" == *"$gate"* ]]; then ok "gate on '$sn'"; else bad "no push-default-branch-only gate on '$sn'"; fi
 done
 

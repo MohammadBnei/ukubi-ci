@@ -1,8 +1,9 @@
 # ukubi-ci
 
-Reusable GitHub Actions workflows (`on: workflow_call`) and composite actions
-shared by the ukubi app repos: image build, push and tag bump; Go, Bun and Rust
-checks; the commit-trailer check; releases.
+Reusable workflows (`on: workflow_call`) and composite actions shared by the
+ukubi app repos: image build, push and tag bump; Go, Bun and Rust checks; the
+commit-trailer check; releases. They run on Forgejo Actions and GitHub Actions
+alike; moving a caller to Forgejo is [MIGRATION.md](MIGRATION.md).
 
 App repos call them pinned by commit sha:
 
@@ -35,10 +36,14 @@ jobs:
       id-token: write   # the Infisical OIDC login
     uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@<40-char sha>
     with:
-      # Every job runs on the self-hosted build runner, PRs included; on a
+      # Every job runs on the build runner, PRs included; on a
       # pull_request nothing logs in, reads Infisical, pushes or bumps.
-      runs-on: '["self-hosted","ukubi-build"]'
+      runs-on: '["ukubi-build"]'
       image: drop
+    # Forgejo only (no OIDC there yet): the universal-auth identity's pair.
+    secrets:
+      infisical-client-id: ${{ secrets.INFISICAL_CLIENT_ID }}
+      infisical-client-secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
 ```
 
 hq-style layout (Dockerfile and context in a subdirectory):
@@ -74,10 +79,13 @@ hq-style layout (Dockerfile and context in a subdirectory):
 | `values-key` | `.image.tag` | yq path; the value must be double-quoted, two-space indented |
 | `deploy` | `true` | `false` skips the deploy job (build and push only); bump with [deploy.yml](#deployyml) instead, to roll several images out in one commit |
 | `registry` | `registry.bnei.lan:5000` | |
+| `infisical-auth` | `auto` | the Infisical login: `oidc` (GitHub OIDC, `id-token: write`), `universal` (secrets `infisical-client-id` and `infisical-client-secret`), `auto` = `oidc` on github.com, `universal` elsewhere (Forgejo sets `FORGEJO_ACTIONS` and its own `GITHUB_SERVER_URL`). Checked only on a publishing run, so PRs need neither |
 
 Secret `build-secrets` (optional): multiline `id=value`. Each becomes
 `--secret id=<id>`, read in the Dockerfile with
 `RUN --mount=type=secret,id=<id>`. Example: `build-secrets: github_token=${{ github.token }}`.
+Secrets `infisical-client-id` and `infisical-client-secret` (optional): the
+universal-auth login; a publishing run with `universal` and either missing fails.
 Outputs: `tag`, the pushed tag; `digest`, the pushed manifest digest;
 `commit`, the full built sha (set with `deploy: false` too).
 
@@ -141,7 +149,7 @@ jobs:
       id-token: write
     uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@<40-char sha>
     with:
-      runs-on: '["self-hosted","ukubi-build"]'
+      runs-on: '["ukubi-build"]'
       image: ukubi-game
       build-args: BIN=game
       deploy: false
@@ -153,7 +161,7 @@ jobs:
       id-token: write
     uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@<40-char sha>
     with:
-      runs-on: '["self-hosted","ukubi-build"]'
+      runs-on: '["ukubi-build"]'
       image: ukubi-realm
       build-args: BIN=realm
       deploy: false
@@ -178,7 +186,7 @@ jobs:
 | `pins` | required | one `<values file> <sha12>@sha256:<64 hex>` per line; each file once, every file must exist (no skip-if-missing), paths relative to the repo root, no `..`, no symlink |
 | `built-commit` | required | full sha the images were built from (image.yml's `commit`); all images come from one commit |
 | `values-key` | `.image.tag` | yq path in every file, as in image.yml |
-| `runs-on` | `["self-hosted","ukubi-build"]` | JSON list; the runner needs git and curl (yq is installed by a step) |
+| `runs-on` | `["ubuntu-latest"]` | JSON list; the runner needs bash, git and curl (yq is installed by a step) |
 | `commit-author` | `<repo>-ci` | bump commit author name |
 
 The commit subject is `chore(deploy): bump <repo> images`; its body lists the
@@ -212,7 +220,7 @@ jobs:
       id-token: write
     uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@<40-char sha>
     with:
-      runs-on: '["self-hosted","ukubi-build"]'
+      runs-on: '["ukubi-build"]'
       image: drop
       ref: ${{ needs.release.outputs.tag }}            # empty on a dry run: the triggering commit
       version-arg: true
@@ -226,6 +234,7 @@ LABEL org.opencontainers.image.version=$VERSION
 
 | input | default | |
 |---|---|---|
+| `runs-on` | `["ubuntu-latest"]` | JSON list of runner labels; the default is the Forgejo container runner |
 | `config` | | git-cliff config. Empty: `cliff.toml` at the repo root if present, else this repo's [`cliff.toml`](cliff.toml) (embedded in release.yml). A non-empty path must exist |
 | `changelog` | `CHANGELOG.md` | created on the first release |
 
@@ -301,10 +310,13 @@ generated`. That hq change is not part of this repo.
 
 ## Checks: go-checks, bun-checks, rust-checks, image-build, trailers
 
-Five least-privilege checks for a caller's `checks.yml`. Each runs on
-the self-hosted `["self-hosted","ukubi-build"]` runner (no `runs-on` input), every job is `contents: read`, and none touches Infisical,
-OIDC or the registry. The runner has jq, curl, git and tar only: the checks install what else they
-need (bun from npm, Go through setup-go, rustup, yq) and `sudo apt-get` does not work there. Inputs reach scripts through env
+Five least-privilege checks for a caller's `checks.yml`. Each takes a
+`runs-on` input (a JSON list): `["ubuntu-latest"]` by default, the Forgejo
+container runner, and `["ukubi-build"]` for image-build (buildah). Every job is
+`contents: read`, and none touches Infisical, OIDC or the registry. The checks
+install what else they need (bun from npm, Go through setup-go, rustup, yq); the
+image needs bash, git, curl, jq, tar and xz, plus gcc for `go test -race` and a
+C linker for Rust. Inputs reach scripts through env
 only. `test/reusable.sh` runs their run blocks against throwaway repos, and
 `ci.yml` calls each one on a fixture under `test/`.
 
@@ -360,6 +372,7 @@ with Go from the module's `go.mod`.
 
 | input | default | |
 |---|---|---|
+| `runs-on` | `["ubuntu-latest"]` | JSON list of runner labels; the default is the Forgejo container runner |
 | `working-directory` | `.` | a module directory (holds `go.mod`); a `go.work` root that is not a module rejects `./...` |
 | `golangci-lint-version` | | `vX.Y.Z`; empty skips. Built with `go install` |
 | `vettool` | | `pkg@vX.Y.Z` (never `@latest`), run as `go vet -vettool`; empty skips. The hook for ukubicheck |
@@ -375,6 +388,7 @@ typecheck, test and the package's real build script.
 
 | input | default | |
 |---|---|---|
+| `runs-on` | `["ubuntu-latest"]` | JSON list of runner labels; the default is the Forgejo container runner |
 | `working-directory` | `.` | holds `package.json` and `bun.lock` |
 | `typecheck-script` | `typecheck` | empty skips |
 | `lint-script` | | package.json script run after the typecheck; empty skips |
@@ -393,8 +407,9 @@ dependencies, so no advisory is ever hit in CI: the blocking exit and the
 
 | input | default | |
 |---|---|---|
+| `runs-on` | `["ubuntu-latest"]` | JSON list of runner labels; the default is the Forgejo container runner |
 | `working-directory` | `.` | holds `Cargo.toml`, `Cargo.lock` and `rust-toolchain.toml` |
-| `apt-packages` | | space-separated, e.g. `protobuf-compiler`; checked with `dpkg -s`, not installed (no `sudo apt-get` on the runner): they must be baked into the build-runner playbook |
+| `apt-packages` | | space-separated, e.g. `protobuf-compiler`; checked with `dpkg -s`, not installed: they must be baked into the runner image (or the build-runner playbook for a host runner) |
 | `audit-ignore` | | multiline `RUSTSEC-YYYY-NNNN`, each passed as `--ignore`. `.cargo/audit.toml` is read too; keep the reasons there |
 
 ### image-build.yml
@@ -402,8 +417,9 @@ dependencies, so no advisory is ever hit in CI: the blocking exit and the
 The image build as a PR check: image.yml's tag and Build steps byte for byte
 (`sudo -n buildah bud --isolation chroot`, build-args, build-secrets), tagged
 `localhost/<image>:<sha>`, with no login and no push. Inputs `image`
-(required), `context`, `dockerfile`, `target`, `build-args`, `layers`,
-`pull-newer`, `build-timeout-minutes` and secret `build-secrets`, as in image.yml.
+(required), `runs-on` (default `["ukubi-build"]`), `context`, `dockerfile`,
+`target`, `build-args`, `layers`, `pull-newer`, `build-timeout-minutes` and
+secret `build-secrets`, as in image.yml.
 
 ### trailers.yml
 
@@ -421,6 +437,7 @@ The forms are anchored, so prose about the rule passes.
 
 | input | default | |
 |---|---|---|
+| `runs-on` | `["ubuntu-latest"]` | JSON list of runner labels; the default is the Forgejo container runner |
 | `conventional` | `false` | Conventional Commit subjects on non-merge commits (git's `Revert "..."` passes, `fixup!` does not), and the PR title (a trailing ` (#N)` is ignored), since a squash lands the title |
 | `allow-prefixes` | | multiline literal subject prefixes exempt from the Conventional rule only, never from the ban |
 | `agent-trailers` | `any` | `forbid`: no agent `Co-Authored-By` or `Agent-Session` at all. `pair`: an agent commit carries both `Co-Authored-By: ukubi-claude-<host> <noreply@bnei.dev>` and `Agent-Session: <id>`, a human one neither |

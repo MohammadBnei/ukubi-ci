@@ -6,6 +6,12 @@ name: rust-checks
 on:
   workflow_call:
     inputs:
+      runs-on:
+        description: >-
+          JSON list of runner labels; needs bash, git, curl and a C linker (cc). The default is the
+          container runner label on Forgejo; GitHub callers pass their own.
+        type: string
+        default: '["ubuntu-latest"]'
       working-directory:
         description: The crate or workspace root (holds Cargo.toml, Cargo.lock and rust-toolchain.toml), relative to the repo root.
         type: string
@@ -26,7 +32,7 @@ env:
 
 jobs:
   check:
-    runs-on: [self-hosted, ukubi-build]
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     permissions:
       contents: read
     defaults:
@@ -102,7 +108,7 @@ jobs:
   # advisory database" means the cargo-audit pin is too old for the DB format:
   # bump the pin, do not ignore an id.
   audit:
-    runs-on: [self-hosted, ukubi-build]
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     permissions:
       contents: read
     defaults:

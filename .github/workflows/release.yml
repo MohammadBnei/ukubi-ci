@@ -21,6 +21,12 @@ name: release
 on:
   workflow_call:
     inputs:
+      runs-on:
+        description: >-
+          JSON list of runner labels; needs bash, git, curl and jq. The default is the
+          container runner label on Forgejo; GitHub callers pass their own.
+        type: string
+        default: '["ubuntu-latest"]'
       config:
         description: git-cliff config path. Empty uses cliff.toml at the repo root if present, else ukubi-ci's default (embedded below). A non-empty path must exist.
         type: string
@@ -42,7 +48,7 @@ on:
 
 jobs:
   release:
-    runs-on: [self-hosted, ukubi-build]
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     permissions:
       contents: write
     # Keyed on the ref: a pull_request dry run must not take the one pending
@@ -168,7 +174,7 @@ jobs:
             n=$(releasable)
             if [ "$n" = 0 ]; then unchanged; exit 0; fi
             t=$(next)
-            { echo "## Dry run: would release $t"; echo; cliff --unreleased --tag "$t" --strip header; } >> "$GITHUB_STEP_SUMMARY"
+            { echo "## Dry run: would release $t"; echo; cliff --unreleased --tag "$t" --strip header; } >> "${GITHUB_STEP_SUMMARY:-/dev/stderr}" # a runner without summaries logs it
             out "${t#v}" '' false
             exit 0
           fi

@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   actionlint:
-    runs-on: [self-hosted, ukubi-build]
+    runs-on: ubuntu-latest
     env:
       VERSION: 1.7.12
       SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
@@ -41,7 +41,7 @@ jobs:
           "$RUNNER_TEMP/actionlint" -color
 
   check:
-    runs-on: [self-hosted, ukubi-build]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # The runner has no yq and sudo is buildah-only: a pinned release, checked by sha256.
@@ -103,7 +103,7 @@ jobs:
       id-token: write
     uses: ./.github/workflows/image.yml
     with:
-      runs-on: '["self-hosted","ukubi-build"]'
+      runs-on: '["ukubi-build"]'
       image: ukubi-ci-selftest
       context: test/fixture
       dockerfile: test/fixture/Dockerfile
