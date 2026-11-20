@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.0 - 2026-11-20
+
+### Features
+
+- Run the workflows on Forgejo Actions as well as GitHub (#14)
+
 ## 0.7.0 - 2026-11-17
 
 ### Features
