@@ -54,8 +54,9 @@ inputs:
       How long to wait for IntegreSQL and for another job's template build; at
       least 120, and longer than seed-command takes, or a waiter gives up on a
       build that would have finished. A waiter never deletes a template: one
-      left unfinished by a SIGKILLed builder fails waiters with the DELETE to
-      run by hand.
+      left unfinished fails waiters with the DELETE to run by hand. On Forgejo
+      Actions a cancelled or timed-out build always leaves it unfinished (the
+      runner sends no signal); see the README's stuck templates.
     default: '600'
 runs:
   using: composite
@@ -109,21 +110,27 @@ runs:
         body=$(mktemp)
         building='' seedpid=''
         # Only the job that created the template (POST 200: building=1) ever
-        # deletes it, from this trap, before its PUT succeeded: a failed seed,
-        # a cancel (SIGINT/SIGTERM), a step timeout, a failed PUT. Waiters
-        # never delete: two waiters reclaiming one dead template race, and the
-        # later one drops the other's new build and handed-out database.
-        # SIGKILL skips this trap and leaves the template unfinished; waiters
-        # then fail with the DELETE to run by hand.
+        # deletes it, from this trap, and only while it knows the template is
+        # not final: the seed failed or was cancelled (SIGINT/SIGTERM).
+        # building is cleared before the PUT is sent, since a PUT can land
+        # server-side and still look failed here (timeout, lost response).
+        # Waiters never delete: two waiters reclaiming one dead template race,
+        # and the later one drops the other's new build and handed-out
+        # database. A SIGKILL, or a cancel during the PUT, leaves the template
+        # unfinished; waiters then fail with the DELETE to run by hand. On
+        # Forgejo (runner v13.2.2) a cancel or step timeout sends no signal at
+        # all, so this trap never runs there (tested; README, stuck templates).
         cleanup() {
           # The seed runs in its own process group (setsid, where there is one): kill all of it.
           [ -z "$seedpid" ] || kill -TERM -- "-$seedpid" 2>/dev/null || kill -TERM "$seedpid" 2>/dev/null || true
           if [ -n "$building" ]; then
-            if [ "$(api_max=5 api DELETE "/templates/$key")" = 204 ]; then
-              echo "::warning::template $key was not finished; discarded it so the next run rebuilds"
-            else
-              echo "::warning::template $key was not finished and discarding it failed; delete it by hand: $(recover)"
-            fi
+            case "$(api_max=5 api DELETE "/templates/$key")" in
+              204) echo "::warning::template $key was not finished; discarded it so the next run rebuilds" ;;
+              # DiscardTemplateDatabase pops the key before its DROP, so a
+              # failed DROP (a lingering connection) leaves no stuck template.
+              500) echo "::warning::template $key was not finished; IntegreSQL forgot it but its DROP failed (a lingering connection); the next build drops it" ;;
+              *) echo "::warning::template $key was not finished and IntegreSQL did not answer the DELETE. Only if no job is building it now: $(recover)" ;;
+            esac
           fi
           rm -f "$body"
         }
@@ -177,17 +184,20 @@ runs:
               fi
               wait "$seedpid" || { echo "::error::seed-command failed"; exit 1; }
               seedpid=''
-              # Hold INT/TERM across the PUT (curl ignores them, this shell
-              # defers them), so a cancel never lands between a PUT that
-              # succeeded and building='' and deletes a final template.
-              sig=''
-              trap 'sig=130' INT; trap 'sig=143' TERM
-              code=$(trap '' INT TERM; api PUT "/templates/$key")
-              # 404: the key is no longer ours (someone deleted it); never delete it.
-              [ "$code" != 204 ] && [ "$code" != 404 ] || building=''
-              trap 'exit 130' INT; trap 'exit 143' TERM
-              [ -z "$sig" ] || exit "$sig"
-              [ "$code" = 204 ] || { echo "::error::finalizing template $key returned $code"; exit 1; }
+              # From here on the template may be final: never delete it.
+              building=''
+              # Finalize is in memory, so a short max-time; a PUT on a final
+              # template answers 204 too (ErrTemplateAlreadyInitialized), so
+              # retrying a lost answer is safe.
+              for try in 1 2 3; do
+                code=$(api_max=10 api PUT "/templates/$key")
+                case "$code" in 000|5??) [ "$try" = 3 ] || sleep 2 ;; *) break ;; esac
+              done
+              case "$code" in
+                204) deadline=$((SECONDS + timeout)) ;;
+                404) echo "::error::template $key vanished before it was finalized (someone deleted it)"; exit 1 ;;
+                *) echo "::error::finalizing template $key returned $code; it may be final or stuck unfinished. If waiters report it not final, and only if no job is building it: $(recover)"; exit 1 ;;
+              esac
               ;;
             423) echo "template $key exists or is being built; waiting for it" ;;
             # Not up yet: connection refused (000) or manager not ready (503).
@@ -214,7 +224,7 @@ runs:
             esac
             if [ "$SECONDS" -ge "$deadline" ]; then
               if [ "$code" = 500 ] && [ "$msg" = "$not_final" ]; then
-                echo "::error::template $key still not final after ${timeout}s. A builder killed with SIGKILL (not TERM) leaves it unfinished; if no job is building it, delete it and rerun: $(recover)"
+                echo "::error::template $key still not final after ${timeout}s. A builder killed with SIGKILL, cancelled during its PUT, or cancelled or timed out on Forgejo, leaves it unfinished. Only if no job is building it, delete it and rerun: $(recover)"
               else
                 echo "::error::template $key: no database after ${timeout}s; last GET returned $code${msg:+ ($msg)}"
               fi

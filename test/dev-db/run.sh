@@ -74,7 +74,7 @@ recov=$(sed -n 's/.*delete it and rerun: //p' "$T/wa.out")
 kkey=$(sed -n 's/.*template \([0-9a-f]\{32\}\) still not final.*/\1/p' "$T/wa.out")
 tpl=$(pgsu "SELECT count(*) FROM pg_database WHERE datname LIKE 'integresql_template_%${kkey:-none}%'")
 for w in wa wb; do
-  [ "$(cat "$T/$w.rc")" != 0 ] && grep -q 'killed with SIGKILL (not TERM) leaves it unfinished' "$T/$w.out" \
+  [ "$(cat "$T/$w.rc")" != 0 ] && grep -q 'leaves it unfinished. Only if no job is building it' "$T/$w.out" \
     && grep -q "curl -X DELETE http://localhost:15000/api/v1/templates/$kkey" "$T/$w.out" && ! grep -q 'is new; building it' "$T/$w.out" \
     && ok "killed builder: waiter $w fails with the manual DELETE" || bad "killed builder, waiter $w: $(cat "$T/$w.out")"
 done
@@ -82,6 +82,27 @@ done
 [ -n "$recov" ] && eval "$recov -sS -o /dev/null -w '%{http_code}'" | grep -q 204 && : > "$T/env" \
   && out=$(get k1 "$seed" 2>&1) && grep -q 'is new; building it' <<<"$out" && (load; bash "$D/check.sh" seeded) >/dev/null \
   && ok "after the manual DELETE the next run builds" || bad "manual recovery ($recov): $out"
+
+# 4f. A PUT that lands server-side but looks failed here (the reviewer's
+# shim: real PUT, then curl exit 28 and 000 after 4 s). The builder must not
+# delete the now-final template: the waiter's database survives, the builder
+# fails with the recovery hint, and no "discarded" line appears.
+mkdir -p "$T/bin"; real_curl=$(command -v curl)
+cat > "$T/bin/curl" <<SH
+#!/bin/bash
+for a in "\$@"; do [ "\$a" = PUT ] && put=1; done
+if [ -n "\${put:-}" ]; then "$real_curl" "\$@" >/dev/null; sleep 4; echo -n 000; exit 28; fi
+exec "$real_curl" "\$@"
+SH
+chmod +x "$T/bin/curl"
+: > "$T/env"
+( PATH="$T/bin:$PATH" get l1 "sleep 3; $seed" > "$T/l1.out" 2>&1; echo $? > "$T/l1.rc" ) &
+sleep 1
+w=$(get l1 "exit 1" 2>&1); wrc=$?
+wait
+[ "$wrc" = 0 ] && [ "$(cat "$T/l1.rc")" != 0 ] && grep -q 'finalizing template .* returned 000; it may be final' "$T/l1.out" \
+  && ! grep -q discarded "$T/l1.out" && (load; bash "$D/check.sh" seeded) >/dev/null \
+  && ok "lost PUT answer: no delete, the waiter's database survives" || bad "lost PUT answer (waiter rc=$wrc): $(cat "$T/l1.out") / $w"
 
 # 4d. Two repos with the same template-hash get different templates.
 key_of() { GITHUB_REPOSITORY=$1 get r1 true 2>/dev/null | sed -n 's/.*ready (template \([0-9a-f]*\),.*/\1/p'; }
