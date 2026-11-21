@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.0 - 2026-11-21
+
+### Features
+
+- **dev-db:** Composite actions for disposable IntegreSQL databases (ADR-0088) (#13)
+
+### Fixes
+
+- Event gates read the caller's event on Forgejo (#15)
+
 ## 0.8.0 - 2026-11-20
 
 ### Features
