@@ -23,8 +23,14 @@ inputs:
       Shell command that migrates and seeds the template database. Runs only
       when the template must be built, with DATABASE_URL pointing at it.
     default: ''
+  postgres-host:
+    description: >-
+      Host of the dev Postgres. Empty uses the integresql-url host. IntegreSQL
+      reports its own in-cluster address, so the host comes from the caller
+      (ukubi: dev-postgres.bnei.lan, its own LAN address next to IntegreSQL's).
+    default: ''
   postgres-port:
-    description: Port of the dev Postgres on the integresql-url host. IntegreSQL reports its own in-cluster address, so only the port is trusted from the caller.
+    description: Port of the dev Postgres. IntegreSQL reports its own in-cluster address, so only the caller's port is trusted.
     default: '5432'
   sslmode:
     description: sslmode in DATABASE_URL. The dev Postgres is LAN-only without TLS, hence disable.
@@ -52,6 +58,7 @@ runs:
         IN_HASH: ${{ inputs.template-hash }}
         IN_PATHS: ${{ inputs.hash-paths }}
         IN_SEED: ${{ inputs.seed-command }}
+        IN_HOST: ${{ inputs.postgres-host }}
         IN_PORT: ${{ inputs.postgres-port }}
         IN_SSLMODE: ${{ inputs.sslmode }}
         IN_TTL: ${{ inputs.ttl }}
@@ -61,7 +68,8 @@ runs:
         set -euo pipefail
         url=${IN_URL%/}
         [[ "$url" =~ ^https?://([^/:@]+)(:[0-9]+)?(/.*)?$ ]] || { echo "::error::integresql-url must be http(s)://host[:port]"; exit 1; }
-        pghost=${BASH_REMATCH[1]}
+        pghost=${IN_HOST:-${BASH_REMATCH[1]}}
+        [[ "$pghost" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "::error::postgres-host must be a hostname or IPv4 address"; exit 1; }
         [[ "$IN_PORT" =~ ^[0-9]+$ && "$IN_TTL" =~ ^[0-9]+$ && "$IN_TIMEOUT" =~ ^[0-9]+$ ]] || { echo "::error::postgres-port, ttl and timeout-seconds must be whole numbers"; exit 1; }
         [[ "$IN_SSLMODE" =~ ^(disable|allow|prefer|require|verify-ca|verify-full)$ ]] || { echo "::error::sslmode must be a libpq sslmode"; exit 1; }
         if [ "$IN_KEEP" = true ] && [ "$IN_TTL" = 0 ]; then echo "::error::keep=true needs ttl above 0, or the sweeper never drops the database"; exit 1; fi

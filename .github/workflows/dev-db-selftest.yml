@@ -1,6 +1,9 @@
 # Runs the dev-db and dev-db-release actions against a throwaway IntegreSQL +
-# Postgres from test/dev-db/compose.yml. Needs docker compose and psql on the
-# runner. test/dev-db/run.sh does the same locally without a runner.
+# Postgres started as job services. It runs on the podman runner
+# (ubuntu-latest): the host runner has no container engine for jobs.
+# roles.sql runs before the first IntegreSQL call, which is when IntegreSQL
+# first dials Postgres. test/dev-db/run.sh does the same locally with
+# test/dev-db/compose.yml.
 name: dev-db-selftest
 
 on:
@@ -13,19 +16,39 @@ permissions:
 
 jobs:
   selftest:
-    runs-on: [ukubi-build]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:18@sha256:979bccfde35445db618c65107d27d08c6c21339d8dc3ad4c830c6633947be0e4
+        env:
+          POSTGRES_PASSWORD: pgpass
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 1s --health-retries 30
+      integresql:
+        image: ghcr.io/allaboutapps/integresql:v1.1.0@sha256:66b7433399f1907bad9e4b7cc7bd528ed4ebfccddecb8fd65da4af4d06a68c5a
+        env:
+          INTEGRESQL_PGHOST: postgres
+          INTEGRESQL_PGPORT: "5432"
+          INTEGRESQL_PGUSER: integresql
+          INTEGRESQL_PGPASSWORD: mgrpass
+          INTEGRESQL_TEST_PGUSER: integresql_test
+          INTEGRESQL_TEST_PGPASSWORD: testpass
+          INTEGRESQL_ROOT_TEMPLATE: template1
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-      - name: Start IntegreSQL and Postgres
-        run: |
-          docker compose -f test/dev-db/compose.yml up -d --wait
-          sleep 3
+      - name: Install psql
+        run: command -v psql || { sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client; }
+      - name: Create IntegreSQL's roles
+        env:
+          PGPASSWORD: pgpass
+        run: psql -h postgres -U postgres -v ON_ERROR_STOP=1 -f test/dev-db/roles.sql
       - name: Build the template and get a database
         uses: ./actions/dev-db
         with:
-          integresql-url: http://localhost:15000
-          postgres-port: '15432'
+          integresql-url: http://integresql:5000
+          postgres-host: postgres
           template-hash: selftest
           seed-command: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'CREATE TABLE t(id int); INSERT INTO t VALUES (1)'
       - run: bash test/dev-db/check.sh seeded
@@ -34,8 +57,8 @@ jobs:
       - name: Reuse the template; the seed command must not run
         uses: ./actions/dev-db
         with:
-          integresql-url: http://localhost:15000
-          postgres-port: '15432'
+          integresql-url: http://integresql:5000
+          postgres-host: postgres
           template-hash: selftest
           seed-command: exit 1
       - run: bash test/dev-db/check.sh fresh
@@ -43,6 +66,3 @@ jobs:
         uses: ./actions/dev-db-release
         with:
           keep: 'true'
-      - name: Stop
-        if: always()
-        run: docker compose -f test/dev-db/compose.yml down -v

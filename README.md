@@ -489,11 +489,12 @@ token to its repo's keys and hand out a per-database role.
 
 | input | default | |
 |---|---|---|
-| `integresql-url` | required | base URL; its host is also the Postgres host |
+| `integresql-url` | required | base URL; its host is also the Postgres host unless `postgres-host` is set |
 | `token` | | bearer token for the auth proxy; empty sends no header |
 | `template-hash` | | `[A-Za-z0-9_-]{1,64}`; empty hashes `hash-paths` plus `seed-command`; hashed again with the repo name |
 | `hash-paths` | `migrations seeds` | space-separated files or directories hashed when `template-hash` is empty; missing ones are skipped, none found is an error |
 | `seed-command` | | runs only when the template is built, with `DATABASE_URL` set to it |
+| `postgres-host` | `''` | Postgres host when it is not on the IntegreSQL host (ukubi: `dev-postgres.bnei.lan`) |
 | `postgres-port` | `5432` | IntegreSQL reports its in-cluster address, so only the port comes from the caller |
 | `sslmode` | `disable` | `sslmode` in `DATABASE_URL`; the dev Postgres is LAN-only without TLS |
 | `ttl` | `2` | hours until the sweeper may drop the database; `0` skips the comment; no psql on the runner warns and skips |
