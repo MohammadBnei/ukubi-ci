@@ -17,7 +17,7 @@ on:
         type: string
         default: .
       apt-packages:
-        description: Space-separated apt packages the build needs, e.g. protobuf-compiler. The runner cannot apt-get (sudo is buildah-only), so each must already be installed there (the build-runner playbook); the job fails naming the missing ones. Empty skips.
+        description: Space-separated apt packages the build needs, e.g. protobuf-compiler. When the job runs as root with apt-get (a container job, fresh per job) missing ones are installed from the live apt index, unpinned; the host executor cannot apt-get (sudo is buildah-only), so there each must already be installed (the build-runner playbook) and the job fails naming the missing ones. Empty skips.
         type: string
         default: ''
       audit-ignore:
@@ -88,7 +88,15 @@ jobs:
           read -ra pkgs <<<"$APT_PACKAGES"
           missing=()
           for p in "${pkgs[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done
-          [ ${#missing[@]} -eq 0 ] || { echo "::error::not installed on this runner (sudo apt-get does not work here; add them to the build-runner playbook): ${missing[*]}"; exit 1; }
+          [ ${#missing[@]} -gt 0 ] || exit 0
+          # A container job (Forgejo's ubuntu-latest) runs as root and can install;
+          # the host executor cannot (sudo is buildah-only).
+          if [ "$(id -u)" = 0 ] && command -v apt-get >/dev/null; then
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing[@]}" >/dev/null
+            exit 0
+          fi
+          echo "::error::not installed on this runner (sudo apt-get does not work here; add them to the build-runner playbook): ${missing[*]}"; exit 1
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
