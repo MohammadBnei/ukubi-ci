@@ -213,8 +213,15 @@ check "k: no expression inside a run block" "! yq '.jobs[].steps[].run | select(
 check "k: checkout full history, persist-credentials false" \
   "[ \"\$(yq -o=json -I0 '.jobs.release.steps[0].with' '$WF')\" = '{\"fetch-depth\":0,\"persist-credentials\":false}' ]"
 check "k: install checks sha256" "step 'Install git-cliff' | grep -q 'sha256sum -c'"
-check "k: TOKEN only on a real release" \
-  "[ \"\$(yq '.jobs.release.steps[] | select(.name == \"Release\") | .env.TOKEN' '$WF')\" = \"\\\${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow)) && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.token || '' }}\" ]"
+check "k: TOKEN only when the decide step says real" \
+  "[ \"\$(yq '.jobs.release.steps[] | select(.name == \"Release\") | .env.TOKEN' '$WF')\" = \"\\\${{ steps.decide.outputs.real == 'true' && github.token || '' }}\" ]"
+yq '.jobs.release.steps[] | select(.name == "Decide whether this run releases") | .run' "$WF" > "$T/decide.sh"
+dec() { : > "$T/dout"; EVENT=$2 REF=$3 BRANCH=main GITHUB_OUTPUT="$T/dout" bash "$T/decide.sh" >/dev/null 2>&1; [ "$(sed -n 's/^real=//p' "$T/dout")" = "$1" ]; }
+check "k2: push on main is real" "dec true push refs/heads/main"
+check "k3: dispatch on main is real" "dec true workflow_dispatch refs/heads/main"
+check "k4: push on a branch is not" "dec false push refs/heads/feat"
+check "k5: pull_request is not" "dec false pull_request refs/heads/main"
+check "k6: workflow_call fallback is not" "dec false workflow_call refs/heads/main"
 check "k: TOKEN only in the Release step" "[ \"\$(yq '[.jobs.release.steps[] | select(.env.TOKEN) | .name] | join(\",\")' '$WF')\" = Release ]"
 check "k: every fetch and push carries the auth header" \
   "[ \"\$(grep -cE 'git .*(fetch|push) ' '$T/rel.sh')\" = 2 ] && ! grep -E 'git .*(fetch|push) ' '$T/rel.sh' | grep -vq 'http.extraheader=\"\$hdr\"'"

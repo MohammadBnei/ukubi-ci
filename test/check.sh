@@ -30,23 +30,32 @@ else ok "build job: no yq/node/apt-get on the LXC"; fi
 #    bump; every other event (pull_request, pull_request_target, new ones) builds only.
 step guard "Decide whether this run may publish" > "$T/pr.sh"
 [ -s "$T/pr.sh" ] || { echo "FAIL extract guard block"; exit 1; }
-pr() { # want_value event name
-  local rc=0 got; : > "$T/gout"
-  EVENT=$2 GITHUB_OUTPUT="$T/gout" bash "$T/pr.sh" >/dev/null 2>&1 || rc=$?
-  got=$(sed -n 's/^value=//p' "$T/gout")
-  if [ "$rc" = 0 ] && [ "$got" = "$1" ]; then ok "publish guard: $3"; else bad "publish guard: $3 (rc=$rc, value=$got)"; fi
+pr() { # want_publish want_deploy name EVENT REF [PDBO] [DEPLOY] [VALUES]
+  local rc=0 got gotd; : > "$T/gout"
+  EVENT=$4 REF=$5 DEFAULT_BRANCH=main PDBO=${6:-false} DEPLOY=${7:-true} VALUES=${8-helm/values.yaml} \
+    GITHUB_OUTPUT="$T/gout" bash "$T/pr.sh" >/dev/null 2>&1 || rc=$?
+  got=$(sed -n 's/^value=//p' "$T/gout"); gotd=$(sed -n 's/^deploy=//p' "$T/gout")
+  if [ "$rc" = 0 ] && [ "$got" = "$1" ] && [ "$gotd" = "$2" ]; then ok "publish guard: $3"; else bad "publish guard: $3 (rc=$rc, publish=$got, deploy=$gotd)"; fi
 }
-pr true  push              "push may publish"
-pr true  workflow_dispatch "dispatch may publish"
-pr false pull_request        "pull_request builds only"
-pr false pull_request_target "pull_request_target builds only"
-pr false schedule            "an unlisted event builds only"
-pr false ""                  "an empty event builds only"
+M=refs/heads/main B=refs/heads/feat
+pr true  true  "push on main publishes and deploys"      push              $M
+pr true  true  "dispatch on main publishes and deploys"  workflow_dispatch $M
+pr true  false "push on a branch publishes, no deploy"   push              $B
+pr false false "push-default-branch-only off main: nothing" push           $B true
+pr true  true  "push-default-branch-only on main"        push              $M true
+pr true  false "deploy: false publishes, no deploy"      push              $M false false
+pr true  false "no values file: no deploy"               push              $M false true ""
+pr false false "tag push with push-default-branch-only"  push              refs/tags/v1.0.0 true
+pr false false "pull_request builds only"                pull_request      refs/pull/1/merge
+pr false false "pull_request_target builds only"         pull_request_target $M
+pr false false "workflow_run builds only"                workflow_run      $M
+pr false false "an unlisted event builds only"           schedule          $M
+pr false false "an empty event builds only"              ""                $M
 # Every step that logs in, reads Infisical or pushes, and the deploy job, also ask the guard.
-for sn in "Pick the Infisical login" "Read the registry password from Infisical" "Keep only the registry password" "Registry login" "Push" "Registry logout"; do
+for sn in "Pick the Infisical login" "Read the registry password from Infisical" "Read the registry password over Forgejo OIDC" "Keep only the registry password" "Registry login" "Push" "Registry logout"; do
   if [[ "$(yq ".jobs.build.steps[] | select(.name == \"$sn\") | .if" "$WF")" == *"needs.guard.outputs.publish == 'true'"* ]]; then ok "publish gate on '$sn'"; else bad "no guard gate on '$sn'"; fi
 done
-if [[ "$(yq '.jobs.deploy.if' "$WF")" == *"needs.guard.outputs.publish == 'true'"* ]]; then ok "publish gate on the deploy job"; else bad "no guard gate on the deploy job"; fi
+if [ "$(yq '.jobs.deploy.if' "$WF")" = "always() && needs.build.result == 'success' && needs.guard.outputs.deploy == 'true'" ]; then ok "deploy job reads the guard's deploy only"; else bad "deploy job if is not the guard's deploy"; fi
 # No job names a GitHub-hosted image (no hosted runner is paid for). The one
 # exception is the bare label ubuntu-latest: on Forgejo it is the self-hosted
 # container runner, and it is a JSON default or ci.yml's own label only.
@@ -58,7 +67,7 @@ else ok "no GitHub-hosted runner in the workflows"; fi
 # shellcheck disable=SC2016 # a literal ${{, not a shell expansion
 if [ "$(yq '.jobs.build."runs-on"' "$WF")" = '${{ fromJSON(inputs.runs-on) }}' ]; then ok "build job runs on inputs.runs-on"; else bad "build job runs-on is not inputs.runs-on"; fi
 
-# 2a. The Infisical login: oidc on github.com, universal-auth (client pair) elsewhere.
+# 2a. The Infisical login: oidc on github.com, Forgejo OIDC elsewhere, universal on request.
 step build "Pick the Infisical login" > "$T/auth.sh"
 [ -s "$T/auth.sh" ] || { echo "FAIL extract Infisical login block"; exit 1; }
 auth() { # want_rc want_method name [VAR=value ...]
@@ -70,9 +79,10 @@ auth() { # want_rc want_method name [VAR=value ...]
 }
 auth 0 oidc      "auto on github.com is oidc" GITHUB_SERVER_URL=https://github.com
 auth 0 oidc      "auto with no server url is oidc"
-auth 0 universal "auto on Forgejo (FORGEJO_ACTIONS) is universal" FORGEJO_ACTIONS=true GITHUB_SERVER_URL=https://git.bnei.dev
-auth 0 universal "auto on Gitea (GITEA_ACTIONS) is universal" GITEA_ACTIONS=true
-auth 0 universal "auto on another server url is universal" GITHUB_SERVER_URL=https://git.bnei.dev
+auth 0 forgejo   "auto on Forgejo (FORGEJO_ACTIONS) is forgejo" FORGEJO_ACTIONS=true GITHUB_SERVER_URL=https://git.bnei.dev
+auth 0 forgejo   "auto on Gitea (GITEA_ACTIONS) is forgejo" GITEA_ACTIONS=true
+auth 0 forgejo   "auto on another server url is forgejo" GITHUB_SERVER_URL=https://git.bnei.dev
+auth 0 universal "universal forced on Forgejo" AUTH=universal FORGEJO_ACTIONS=true
 auth 0 oidc      "oidc forced on Forgejo" AUTH=oidc FORGEJO_ACTIONS=true
 auth 0 universal "universal forced on github.com" AUTH=universal GITHUB_SERVER_URL=https://github.com
 auth 1 ""        "universal without the client pair fails" AUTH=universal HAVE_CLIENT=false
@@ -81,6 +91,52 @@ auth 1 ""        "a bad infisical-auth value fails" AUTH=token
 # shellcheck disable=SC2016 # a literal ${{, not a shell expansion
 if [ "$(yq '.jobs.build.steps[] | select(.name == "Read the registry password from Infisical") | .with.method' "$WF")" = '${{ steps.infisical.outputs.method }}' ]; then
   ok "the Infisical action takes the picked method"; else bad "the Infisical action ignores the picked method"; fi
+# Exactly one of the two readers runs: the action off forgejo, the curl step on it.
+if [[ "$(yq '.jobs.build.steps[] | select(.name == "Read the registry password from Infisical") | .if' "$WF")" == *"steps.infisical.outputs.method != 'forgejo'"* ]] \
+  && [[ "$(yq '.jobs.build.steps[] | select(.name == "Read the registry password over Forgejo OIDC") | .if' "$WF")" == *"steps.infisical.outputs.method == 'forgejo'"* ]]; then
+  ok "one Infisical reader per method"; else bad "the two Infisical readers overlap or neither runs"; fi
+if [ "$(yq '."enable-openid-connect"' "$WF")" = true ]; then ok "image.yml asks Forgejo for an OIDC token (workflow level)"; else bad "image.yml lacks workflow-level enable-openid-connect"; fi
+
+# 2b. The Forgejo OIDC reader against a fake curl: argv never carries a token,
+#     a failed read still revokes, and only REGISTRY_PASSWORD lands in the file.
+step build "Read the registry password over Forgejo OIDC" > "$T/fj.sh"
+[ -s "$T/fj.sh" ] || { echo "FAIL extract Forgejo OIDC block"; exit 1; }
+mkdir -p "$T/fjbin"
+cat > "$T/fjbin/curl" <<'CURL'
+#!/usr/bin/env bash
+# Fake curl: logs argv and stdin config, answers by URL.
+printf '%s\n' "$*" >> "$FJ_LOG.argv"; cfg=$(cat); printf '%s\n' "$cfg" >> "$FJ_LOG.stdin"
+url=${!#}
+case $url in
+  *audience=infisical*) echo '{"value":"FORGEJO-JWT-xyz"}' ;;
+  */jwt-auth/login) [ "${FJ_LOGIN:-ok}" = ok ] && echo '{"accessToken":"INF-TOKEN-abc"}' || echo '{"message":"denied"}' ;;
+  */secrets/raw/REGISTRY_PASSWORD*) [ "${FJ_GET:-ok}" = ok ] || exit 22; echo '{"secret":{"secretValue":"pw-0123456789abcdef"}}' ;;
+  */token/revoke) echo revoked >> "$FJ_LOG.revoke" ;;
+esac
+CURL
+chmod +x "$T/fjbin/curl"
+# jq too: a token on its argv is as visible in ps as on curl's.
+cat > "$T/fjbin/jq" <<JQ
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "\$FJ_LOG.argv"
+exec $(command -v jq) "\$@"
+JQ
+chmod +x "$T/fjbin/jq"
+fj() { # name want_rc [VAR=value ...]
+  local rc=0 name=$1 want=$2; shift 2; rm -f "$T"/fjlog.* "$T/ws/.infisical-secrets"; mkdir -p "$T/ws"
+  env PATH="$T/fjbin:$PATH" FJ_LOG="$T/fjlog" GITHUB_WORKSPACE="$T/ws" IDENTITY=id INFISICAL_DOMAIN=https://inf.example \
+    INFISICAL_PROJECT_SLUG=p INFISICAL_ENV=dev SECRET_PATH=/ ACTIONS_ID_TOKEN_REQUEST_URL='https://fj.example/token?x=1' \
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN=REQ-TOKEN-def "$@" bash "$T/fj.sh" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = "$want" ] || { bad "forgejo reader: $name (rc=$rc)"; return; }
+  if grep -qE 'REQ-TOKEN|FORGEJO-JWT|INF-TOKEN' "$T/fjlog.argv" 2>/dev/null; then bad "forgejo reader: $name: a token on curl's argv"; return; fi
+  ok "forgejo reader: $name"
+}
+fj "happy path writes the password" 0
+if [ "$(cat "$T/ws/.infisical-secrets" 2>/dev/null)" = "REGISTRY_PASSWORD='pw-0123456789abcdef'" ] && [ -s "$T/fjlog.revoke" ]; then ok "forgejo reader: file holds the password only, token revoked"; else bad "forgejo reader: file or revoke"; fi
+fj "a failed read fails" 1 FJ_GET=fail
+if [ -s "$T/fjlog.revoke" ] && [ ! -e "$T/ws/.infisical-secrets" ]; then ok "forgejo reader: a failed read still revokes, writes nothing"; else bad "forgejo reader: failed read left the token live or wrote a file"; fi
+fj "a refused login fails" 1 FJ_LOGIN=refused
+fj "no OIDC request url fails" 1 ACTIONS_ID_TOKEN_REQUEST_URL=
 
 # 3. The deploy bump. Each case: name, values-key, expected rc, expected
 #    error substring (or ""), file content; the pin is 0123456789ab@$D unless
@@ -323,15 +379,23 @@ if VALUES_KEY=.image.tag bash "$T/dcheck.sh" >/dev/null 2>&1; then ok "deploy.ym
 
 # 4c. image.yml deploy: false skips the deploy job and keeps the build outputs.
 if [ "$(yq '.on.workflow_call.inputs.deploy.default' "$WF")" = true ]; then ok "image.yml deploy defaults to true"; else bad "image.yml deploy default"; fi
-if yq '.jobs.deploy.if' "$WF" | grep -qF '&& inputs.deploy'; then ok "image.yml deploy job gated on inputs.deploy"; else bad "image.yml deploy job not gated on inputs.deploy"; fi
+# shellcheck disable=SC2016 # a literal ${{, not a shell expansion
+if [ "$(yq '.jobs.guard.steps[0].env.DEPLOY' "$WF")" = '${{ inputs.deploy }}' ]; then ok "image.yml guard reads inputs.deploy"; else bad "image.yml guard ignores inputs.deploy"; fi
 for o in tag commit digest; do
   if [ "$(yq ".on.workflow_call.outputs.$o.value" "$WF")" = "\${{ jobs.build.outputs.$o }}" ]; then ok "image.yml output $o comes from the build job"; else bad "image.yml output $o"; fi
 done
-ev="(github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))"
-br="github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"
-if [ "$(yq '.jobs.deploy.if' "$DWF")" = "$ev && $br" ] && [[ "$(yq '.jobs.deploy.if' "$WF")" == *"$ev"*"$br"* ]]; then
-  ok "deploy.yml deploys on the same events and branch as image.yml"
-else bad "deploy.yml event/branch gate differs from image.yml"; fi
+# deploy.yml decides like image.yml's deploy output.
+yq '.jobs.guard.steps[] | select(.name == "Decide whether this run may deploy") | .run' "$DWF" > "$T/dg.sh"
+dg() { # want name EVENT REF
+  : > "$T/dgout"; EVENT=$3 REF=$4 DEFAULT_BRANCH=main GITHUB_OUTPUT="$T/dgout" bash "$T/dg.sh" >/dev/null 2>&1
+  if [ "$(sed -n 's/^deploy=//p' "$T/dgout")" = "$1" ]; then ok "deploy.yml guard: $2"; else bad "deploy.yml guard: $2"; fi
+}
+dg true  "push on main deploys"        push              refs/heads/main
+dg true  "dispatch on main deploys"    workflow_dispatch refs/heads/main
+dg false "push on a branch does not"   push              refs/heads/feat
+dg false "pull_request does not"       pull_request      refs/heads/main
+dg false "workflow_run does not"       workflow_run      refs/heads/main
+if [ "$(yq '.jobs.deploy.if' "$DWF")" = "needs.guard.outputs.deploy == 'true'" ]; then ok "deploy.yml deploy job reads the guard only"; else bad "deploy.yml deploy job if"; fi
 
 # 4b. Version inputs sanity in the build job's Check inputs step.
 step build "Check inputs" > "$T/ci.sh"
@@ -389,9 +453,15 @@ for in in push-default-branch-only extra-tags; do
   case $in in push-default-branch-only) want=false ;; *) want='""' ;; esac
   if [ "$(yq ".on.workflow_call.inputs.\"$in\".default" "$WF")" = "${want//\"/}" ]; then ok "image.yml $in is off by default"; else bad "image.yml $in default"; fi
 done
-gate="!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"
-for sn in "Pick the Infisical login" "Read the registry password from Infisical" "Keep only the registry password" "Registry login" "Push" "Registry logout"; do
-  if [[ "$(yq ".jobs.build.steps[] | select(.name == \"$sn\") | .if" "$WF")" == *"$gate"* ]]; then ok "gate on '$sn'"; else bad "no push-default-branch-only gate on '$sn'"; fi
+# Each gated step reads the guard alone (Forgejo mis-evaluates long ifs that mix ! and &&).
+for sn in "Pick the Infisical login" "Read the registry password from Infisical" "Read the registry password over Forgejo OIDC" "Keep only the registry password" "Registry login" "Push" "Registry logout"; do
+  case $sn in
+    "Read the registry password from Infisical") want="needs.guard.outputs.publish == 'true' && steps.infisical.outputs.method != 'forgejo'" ;;
+    "Read the registry password over Forgejo OIDC") want="needs.guard.outputs.publish == 'true' && steps.infisical.outputs.method == 'forgejo'" ;;
+    "Registry logout") want="always() && needs.guard.outputs.publish == 'true'" ;;
+    *) want="needs.guard.outputs.publish == 'true'" ;;
+  esac
+  if [ "$(yq ".jobs.build.steps[] | select(.name == \"$sn\") | .if" "$WF")" = "$want" ]; then ok "gate on '$sn' is the guard"; else bad "gate on '$sn' is not exactly the guard"; fi
 done
 
 # 5. The version build arg: the version step computes it, the Build step passes it
@@ -458,18 +528,17 @@ keep "multi-line value fails" 1 "REGISTRY_PASSWORD='line1
 line2'"
 
 # Forgejo runs a called workflow's jobs with event_name workflow_call; the
-# caller's event survives only in the payload. Every event gate and every
-# EVENT value in the reusable workflows must be exactly one of these two
-# expressions (an image that never publishes, a release that is always a dry
-# run, or a PR that publishes, otherwise).
-gate="(github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))"
+# caller's event survives only in the payload, and long if: expressions that
+# mix ! and && come out wrong there. So the four reusable workflows read
+# github.event_name only through the EVENT map below (scripts decide), and no
+# if: in them reads github.event except trailers' pull_request check.
 emap="\${{ github.event_name != 'workflow_call' && github.event_name || github.event.pull_request && 'pull_request' || github.event.workflow_run && 'workflow_run' || github.event.pusher && 'push' || github.event.workflow && 'workflow_dispatch' || 'workflow_call' }}"
 for f in release image deploy trailers; do
   w=.github/workflows/$f.yml
-  # Blank out the two allowed forms; any github.event_name left is a gate that skips them.
-  left=$(G=$gate E=$emap python3 -c 'import os,sys; s=open(sys.argv[1]).read().replace(os.environ["G"],"").replace(os.environ["E"],""); print(s.count("github.event_name"))' "$w")
-  if [ "$left" = 0 ]; then ok "$f.yml: every event read is the workflow_call-aware gate or map"
-  else bad "$f.yml: $left event read(s) outside the canonical gate/map"; fi
+  left=$(E=$emap python3 -c 'import os,sys; s=open(sys.argv[1]).read().replace(os.environ["E"],""); print(s.count("github.event_name"))' "$w")
+  if [ "$left" = 0 ]; then ok "$f.yml: github.event_name only through the EVENT map"; else bad "$f.yml: $left github.event_name read(s) outside the EVENT map"; fi
+  ifs=$(yq '.. | select(has("if")) | .if' "$w" 2>/dev/null | grep -F 'github.event' | grep -vxF 'github.event.pull_request' || true)
+  if [ -z "$ifs" ]; then ok "$f.yml: no if: reads github.event"; else bad "$f.yml: if: reads github.event: $ifs"; fi
 done
 
 echo "failures: $fails"

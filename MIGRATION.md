@@ -23,17 +23,27 @@ folder when the repo has no `.forgejo/workflows/`, so do not add one.
   - `ubuntu-latest` runs in a podman container. The image needs bash, git,
     curl, jq, tar, xz and sha256sum, gcc (`go test -race` uses cgo) and `cc` for
     Rust.
-- **Infisical login without OIDC.** Forgejo's OIDC token for Infisical is not
-  proven yet, so off github.com image.yml logs in with universal-auth
-  (`infisical-auth: auto`). Make a universal-auth machine identity that can
-  read only platform-commons `dev:/registry` (the folder that holds
-  `REGISTRY_PASSWORD`). Store its pair as the org secrets
-  `INFISICAL_CLIENT_ID` and `INFISICAL_CLIENT_SECRET`.
-  The trade-off: OIDC bound the login to push and workflow_dispatch claims,
-  and universal-auth has no such binding. Any workflow that is given the
-  secret can read the registry password, including a PR's edited workflow in
-  the same repo. Forgejo keeps secrets away from fork PRs only. That is why the
-  identity sees `/registry` and nothing else.
+- **Infisical login over Forgejo's OIDC token.** Off github.com image.yml
+  logs in with `infisical-auth: auto` = `forgejo`: image.yml sets
+  `enable-openid-connect: true` at workflow level (Forgejo ignores it on a
+  called job and on the caller's `uses:` job), asks Forgejo for a token with audience
+  `infisical`, and trades it at Infisical's JWT auth for identity
+  `ci-forgejo-tier1` (`e49781b3-9cf2-4964-be5b-da50ce8007a2`). That identity
+  holds Forgejo's Actions signing key (Infisical refuses to discover a LAN
+  issuer, so the key is pasted in) and is bound to issuer
+  `https://git.bnei.dev/api/actions`, `repository_owner` MohammadBnei and
+  `event_name` push, workflow_dispatch or workflow_call plus `ref_type`
+  branch or tag. Inside a call Forgejo's token says `workflow_call`; a PR run
+  has `ref_type` empty (`ref` refs/pull/N/head), so Infisical refuses it, not
+  just the workflow. A `pull_request_target` caller runs base-branch code and
+  would be let in; no caller uses that event. It is a viewer on platform-commons (custom,
+  narrower roles need Infisical Enterprise). No secret is stored in Forgejo.
+  If Forgejo's signing key ever changes (an upgrade, a restore onto a fresh
+  CT, a regenerated key), every publishing run fails at once with
+  `Infisical login refused`: paste the new public key from
+  `https://git.bnei.dev/api/actions/.well-known/keys` into the identity. Do
+  this as part of every Forgejo upgrade or restore. `universal` stays available
+  with the `infisical-client-id`/`infisical-client-secret` secrets.
 
 ## In each caller repo
 
@@ -47,10 +57,6 @@ folder when the repo has no `.forgejo/workflows/`, so do not add one.
    with:
      runs-on: '["ukubi-build"]'          # was ["self-hosted","ukubi-build"]
      image: drop
-     registry-secret-path: /registry      # only the password folder is fetched
-   secrets:
-     infisical-client-id: ${{ secrets.INFISICAL_CLIENT_ID }}
-     infisical-client-secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
    ```
    Keep the `permissions:` blocks. GitHub needs them and Forgejo ignores them.
 3. **Checks and release callers** (go-checks, bun-checks, rust-checks,

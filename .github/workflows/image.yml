@@ -20,6 +20,11 @@
 # Inputs reach scripts through env only, never inline ${{ }}.
 name: image
 
+# Forgejo's switch for the Actions OIDC token (it ignores permissions:). It
+# must sit here: in a called workflow Forgejo ignores it on the job and on the
+# caller's uses: job. Inside a call the token says event_name workflow_call,
+# so the identity also binds ref_type (branch or tag; a PR ref has none).
+enable-openid-connect: true
 on:
   workflow_call:
     inputs:
@@ -117,8 +122,11 @@ on:
       registry-secret-path:
         description: >-
           Infisical folder holding REGISTRY_PASSWORD. Only REGISTRY_PASSWORD is
-          kept from it, but the action fetches the whole folder, so a dedicated
-          folder (e.g. /registry) keeps app secrets from being read at all.
+          kept. The oidc/universal action fetches the whole folder; the forgejo
+          login reads REGISTRY_PASSWORD by name. Neither narrows what the
+          identity could read: ci-forgejo-tier1 is a viewer on all of
+          platform-commons (REDIS_URL and the registry pair today), since
+          narrower roles need Infisical Enterprise.
         type: string
         default: /
       build-timeout-minutes:
@@ -128,9 +136,10 @@ on:
       infisical-auth:
         description: >-
           How the build job logs in to Infisical for REGISTRY_PASSWORD: oidc
-          (the GitHub OIDC identity), universal (universal-auth with the
+          (the GitHub OIDC identity), forgejo (Forgejo's Actions OIDC token
+          against the JWT-auth identity), universal (universal-auth with the
           infisical-client-id and infisical-client-secret secrets), or auto:
-          oidc on github.com, universal anywhere else (Forgejo).
+          oidc on github.com, forgejo anywhere else.
         type: string
         default: auto
     secrets:
@@ -168,14 +177,19 @@ env:
   INFISICAL_PROJECT_SLUG: platform-commons-76pb
   INFISICAL_ENV: dev
   INFISICAL_IDENTITY_ID: 19807471-d73a-48d4-9e58-1dc34255ef77
+  # ci-forgejo-tier1: JWT auth holding Forgejo's Actions signing key, bound to
+  # issuer https://git.bnei.dev/api/actions, aud infisical, repository_owner
+  # MohammadBnei and event_name push/workflow_dispatch; viewer on
+  # platform-commons. A PR run is refused by Infisical itself.
+  INFISICAL_FORGEJO_IDENTITY_ID: e49781b3-9cf2-4964-be5b-da50ce8007a2
 
 jobs:
   # Runs on the passed runner (self-hosted: every job of every repo does).
   # A pull request builds there, but nothing on a pull_request or
   # pull_request_target run logs in, reads Infisical, pushes or bumps: this job
-  # decides `publish` from an allowlist of events, and the build job's
-  # Infisical, login, push and logout steps and the deploy job carry
-  # `needs.guard.outputs.publish == 'true'` on top of their own event checks.
+  # decides `publish` (and `deploy`) in shell from an allowlist of events, the
+  # ref and the inputs, and the build job's Infisical, login, push and logout
+  # steps and the deploy job read only those outputs.
   # Not the boundary: a PR can edit the caller's own workflow and skip
   # image.yml. The boundary is the runner and repo configuration (per-repo
   # runners, no fork PR runs on private repos, the Infisical identity bound to
@@ -186,19 +200,34 @@ jobs:
     permissions: {}
     outputs:
       publish: ${{ steps.publish.outputs.value }}
+      deploy: ${{ steps.publish.outputs.deploy }}
     steps:
       # test/check.sh runs this block verbatim; keep the name.
       - name: Decide whether this run may publish
         id: publish
         env:
           EVENT: ${{ github.event_name != 'workflow_call' && github.event_name || github.event.pull_request && 'pull_request' || github.event.workflow_run && 'workflow_run' || github.event.pusher && 'push' || github.event.workflow && 'workflow_dispatch' || 'workflow_call' }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PDBO: ${{ inputs.push-default-branch-only }}
+          DEPLOY: ${{ inputs.deploy }}
+          VALUES: ${{ inputs.values-files }}${{ inputs.values-file }}
         run: |
           set -euo pipefail
-          # An allowlist: any other event (pull_request, pull_request_target, anything new) is build-only.
-          case "$EVENT" in
-            push|workflow_dispatch) echo "value=true" >> "$GITHUB_OUTPUT" ;;
-            *) echo "value=false" >> "$GITHUB_OUTPUT"; echo "::notice::$EVENT builds only: no login, push or bump" ;;
-          esac
+          # Forgejo mis-evaluates long if: expressions that mix ! and && (a
+          # gate that should be false came out true), so every decision is
+          # made here in shell and the gated steps and jobs only read these
+          # outputs. An allowlist: any other event (pull_request,
+          # pull_request_target, workflow_run, schedule, anything new) builds only.
+          case "$EVENT" in push|workflow_dispatch) publish=true ;; *) publish=false ;; esac
+          on_default=false
+          if [ -n "$DEFAULT_BRANCH" ] && [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ]; then on_default=true; fi
+          if [ "$PDBO" = true ] && [ "$on_default" != true ]; then publish=false; fi
+          deploy=false
+          if [ "$publish" = true ] && [ "$on_default" = true ] && [ "$DEPLOY" = true ] && [ -n "$VALUES" ]; then deploy=true; fi
+          echo "value=$publish" >> "$GITHUB_OUTPUT"
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+          [ "$publish" = true ] || echo "::notice::$EVENT on $REF builds only: no login, push or bump"
 
   build:
     needs: guard
@@ -319,15 +348,15 @@ jobs:
       # the env of all later steps. So it writes a file (in the workspace, after
       # the build) and the next step lifts REGISTRY_PASSWORD alone. The identity's
       # bound claims allow push and workflow_dispatch only, so nothing else asks.
-      # A dedicated folder (input registry-secret-path) stops them being fetched.
-      # Forgejo Actions has no proven OIDC token for Infisical yet, so off
-      # github.com the login is universal-auth. test/check.sh runs this block
+      # A dedicated folder (input registry-secret-path) keeps the action from
+      # fetching more; the identity itself can still read the whole project.
+      # On Forgejo the login is Forgejo's own OIDC token (method forgejo):
+      # Infisical cannot discover a LAN issuer, so the identity is JWT auth
+      # with the key pasted in, which the action does not speak; the step
+      # after it does the two calls with curl. test/check.sh runs this block
       # verbatim; keep the name.
       - name: Pick the Infisical login
-        if: >-
-          (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))
-          && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
-          && needs.guard.outputs.publish == 'true'
+        if: needs.guard.outputs.publish == 'true'
         id: infisical
         env:
           AUTH: ${{ inputs.infisical-auth }}
@@ -335,14 +364,14 @@ jobs:
         run: |
           set -euo pipefail
           case "$AUTH" in
-            oidc|universal) m=$AUTH ;;
+            oidc|forgejo|universal) m=$AUTH ;;
             # Forgejo's runner sets FORGEJO_ACTIONS (Gitea's GITEA_ACTIONS) and its own server URL.
             auto) if [ -n "${FORGEJO_ACTIONS:-}${GITEA_ACTIONS:-}" ] || [ "${GITHUB_SERVER_URL:-https://github.com}" != https://github.com ]; then
-                    m=universal
+                    m=forgejo
                   else
                     m=oidc
                   fi ;;
-            *) echo "::error::infisical-auth is auto, oidc or universal, got '$AUTH'"; exit 1 ;;
+            *) echo "::error::infisical-auth is auto, oidc, forgejo or universal, got '$AUTH'"; exit 1 ;;
           esac
           if [ "$m" = universal ] && [ "$HAVE_CLIENT" != true ]; then
             echo "::error::the universal Infisical login needs the infisical-client-id and infisical-client-secret secrets"; exit 1
@@ -350,10 +379,7 @@ jobs:
           echo "method=$m" >> "$GITHUB_OUTPUT"
 
       - name: Read the registry password from Infisical
-        if: >-
-          (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))
-          && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
-          && needs.guard.outputs.publish == 'true'
+        if: needs.guard.outputs.publish == 'true' && steps.infisical.outputs.method != 'forgejo'
         uses: Infisical/secrets-action@a663da43e1541832614bfd9dcf9ab67381ea2b98 # v1.0.12
         with:
           method: ${{ steps.infisical.outputs.method }}
@@ -369,15 +395,46 @@ jobs:
           export-type: file
           file-output-path: /.infisical-secrets
 
+      # Same file and format as the action writes, REGISTRY_PASSWORD only.
+      # Nothing here echoes a token or the value. test/check.sh runs this
+      # block verbatim; keep the name.
+      - name: Read the registry password over Forgejo OIDC
+        if: needs.guard.outputs.publish == 'true' && steps.infisical.outputs.method == 'forgejo'
+        env:
+          IDENTITY: ${{ env.INFISICAL_FORGEJO_IDENTITY_ID }}
+          SECRET_PATH: ${{ inputs.registry-secret-path }}
+        run: |
+          set -euo pipefail
+          # Every token reaches curl on stdin (-K), never argv: the runner is shared.
+          [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] \
+            || { echo "::error::no Forgejo OIDC token: image.yml needs enable-openid-connect at workflow level"; exit 1; }
+          case $ACTIONS_ID_TOKEN_REQUEST_URL in *\?*) sep='&' ;; *) sep='?' ;; esac
+          jwt=$(printf 'header = "Authorization: bearer %s"\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            | curl -sS -K - "${ACTIONS_ID_TOKEN_REQUEST_URL}${sep}audience=infisical" | jq -r '.value // empty') || jwt=
+          [ -n "$jwt" ] || { echo "::error::Forgejo returned no OIDC token"; exit 1; }
+          echo "::add-mask::$jwt"
+          r=$(jq -Rn --arg i "$IDENTITY" '{identityId: $i, jwt: input}' <<<"$jwt" \
+            | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$INFISICAL_DOMAIN/api/v1/auth/jwt-auth/login") || r='{}'
+          tok=$(jq -r '.accessToken // empty' <<<"$r" 2>/dev/null) || tok=
+          [ -n "$tok" ] || { echo "::error::Infisical login refused: $(jq -r '.message // "no message"' <<<"$r" 2>/dev/null)"; exit 1; }
+          echo "::add-mask::$tok"
+          v=$(printf 'header = "Authorization: Bearer %s"\n' "$tok" | curl -sSf -K - -G \
+            --data-urlencode "workspaceSlug=$INFISICAL_PROJECT_SLUG" --data-urlencode "environment=$INFISICAL_ENV" \
+            --data-urlencode "secretPath=$SECRET_PATH" "$INFISICAL_DOMAIN/api/v3/secrets/raw/REGISTRY_PASSWORD" \
+            | jq -r '.secret.secretValue // empty') || v=
+          # Revoke whatever happened above; a failed read must not leave the token live.
+          printf 'header = "Authorization: Bearer %s"\ndata = "{\\"accessToken\\":\\"%s\\"}"\n' "$tok" "$tok" \
+            | curl -sS -o /dev/null -K - -X POST -H 'Content-Type: application/json' "$INFISICAL_DOMAIN/api/v1/auth/token/revoke" || true
+          [ -n "$v" ] || { echo "::error::Infisical returned no REGISTRY_PASSWORD"; exit 1; }
+          echo "::add-mask::$v"
+          printf "REGISTRY_PASSWORD='%s'\n" "$v" > "$GITHUB_WORKSPACE/.infisical-secrets"
+
       # GitHub masks only secrets.*; an unmasked Infisical value leaked a token
       # in this estate once. The file holds KEY='value' lines; only this one
       # reaches GITHUB_ENV, and the file is deleted either way.
       # test/check.sh runs this block verbatim; keep the name.
       - name: Keep only the registry password
-        if: >-
-          (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))
-          && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
-          && needs.guard.outputs.publish == 'true'
+        if: needs.guard.outputs.publish == 'true'
         run: |
           set -euo pipefail
           f="$GITHUB_WORKSPACE/.infisical-secrets"
@@ -397,10 +454,7 @@ jobs:
         run: rm -f "$GITHUB_WORKSPACE/.infisical-secrets"
 
       - name: Registry login
-        if: >-
-          (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))
-          && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
-          && needs.guard.outputs.publish == 'true'
+        if: needs.guard.outputs.publish == 'true'
         run: |
           set -euo pipefail
           [ -n "${REGISTRY_PASSWORD:-}" ] || { echo "::error::Infisical returned no REGISTRY_PASSWORD"; exit 1; }
@@ -414,10 +468,7 @@ jobs:
       # image CVE fix) keeps the sha tag but gets a new digest.
       - name: Push
         id: push
-        if: >-
-          (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))
-          && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
-          && needs.guard.outputs.publish == 'true'
+        if: needs.guard.outputs.publish == 'true'
         env:
           TAG: ${{ steps.tag.outputs.value }}
           EXTRA_TAGS: ${{ inputs.extra-tags }}
@@ -459,22 +510,14 @@ jobs:
 
       # The runner user cannot sudo rm, but buildah can clear its own entry.
       - name: Registry logout
-        if: >-
-          always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))
-          && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
-          && needs.guard.outputs.publish == 'true'
+        if: always() && needs.guard.outputs.publish == 'true'
         run: sudo -n buildah logout --authfile "$RUNNER_TEMP/registry-auth.json" "$REGISTRY" || true
 
   deploy:
     needs: [guard, build]
     # Only push/dispatch on the default branch deploys; a branch dispatch builds.
     # deploy: false leaves the bump to deploy.yml (several images, one commit).
-    if: >-
-      always() && needs.build.result == 'success' && inputs.deploy
-      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))
-      && (inputs.values-files != '' || inputs.values-file != '')
-      && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-      && needs.guard.outputs.publish == 'true'
+    if: always() && needs.build.result == 'success' && needs.guard.outputs.deploy == 'true'
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 10
     concurrency:

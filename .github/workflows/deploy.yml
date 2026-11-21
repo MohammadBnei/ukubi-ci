@@ -39,11 +39,34 @@ on:
         default: ''
 
 jobs:
+  # Only push/dispatch on the default branch deploys, as in image.yml. Decided
+  # in shell: Forgejo mis-evaluates long if: expressions that mix ! and &&.
+  guard:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      deploy: ${{ steps.guard.outputs.deploy }}
+    steps:
+      # test/check.sh runs this block verbatim; keep the name.
+      - name: Decide whether this run may deploy
+        id: guard
+        env:
+          EVENT: ${{ github.event_name != 'workflow_call' && github.event_name || github.event.pull_request && 'pull_request' || github.event.workflow_run && 'workflow_run' || github.event.pusher && 'push' || github.event.workflow && 'workflow_dispatch' || 'workflow_call' }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          deploy=false
+          case "$EVENT" in push|workflow_dispatch)
+            if [ -n "$DEFAULT_BRANCH" ] && [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ]; then deploy=true; fi ;;
+          esac
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+          [ "$deploy" = true ] || echo "::notice::$EVENT on $REF does not deploy"
+
   deploy:
-    # Only push/dispatch on the default branch deploys, as in image.yml.
-    if: >-
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))
-      && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: guard
+    if: needs.guard.outputs.deploy == 'true'
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 10
     # Not image.yml's per-image group on purpose: GitHub keeps one pending job
