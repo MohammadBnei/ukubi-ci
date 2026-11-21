@@ -52,16 +52,17 @@ outs() {
 }
 at_origin() { git -C "$O" show "main:${1:-CHANGELOG.md}" 2>/dev/null; }
 
-# (a) First release: no tags, a feat -> v0.1.0, commit + annotated tag on origin.
-repo a; c 'chore: init'; c 'feat: first thing'; pushall
+# (a) First release: no tags, a feat -> v0.1.0, an annotated tag on origin, no commit.
+repo a; c 'chore: init'; c 'feat: first thing'; pushall; main_before=$(git -C "$O" rev-parse main)
 rel
 check "a: no tags + feat -> 0.1.0 released" "outs '0.1.0|v0.1.0|true'"
-check "a: origin main is chore(release): v0.1.0 by release-ci" \
-  "[ \"\$(git -C '$O' log -1 --format='%s|%an|%ae' main)\" = 'chore(release): v0.1.0|release-ci|noreply@bnei.dev' ]"
-check "a: v0.1.0 is an annotated tag on that commit" \
-  "[ \"\$(git -C '$O' cat-file -t v0.1.0)\" = tag ] && [ \"\$(git -C '$O' rev-parse 'v0.1.0^{commit}')\" = \"\$(git -C '$O' rev-parse main)\" ]"
-check "a: CHANGELOG created with header and section" \
-  "at_origin | head -1 | grep -qx '# Changelog' && at_origin | grep -q '^## 0.1.0 - ' && at_origin | grep -qx -- '- First thing'"
+check "a: origin main untouched (no release commit)" "[ \"\$(git -C '$O' rev-parse main)\" = '$main_before' ]"
+check "a: v0.1.0 is an annotated tag by release-ci on the triggering commit" \
+  "[ \"\$(git -C '$O' cat-file -t v0.1.0)\" = tag ] && [ \"\$(git -C '$O' rev-parse 'v0.1.0^{commit}')\" = '$main_before' ] && [ \"\$(git -C '$O' for-each-ref --format='%(taggername)' refs/tags/v0.1.0)\" = release-ci ]"
+notes() { git -C "$O" tag -l --format='%(contents)' "$1"; }
+check "a: the tag message is the release notes" \
+  "notes v0.1.0 | head -1 | grep -qx v0.1.0 && notes v0.1.0 | grep -q '^## 0.1.0 - ' && notes v0.1.0 | grep -qx -- '- First thing'"
+check "a: no CHANGELOG written" "! at_origin >/dev/null"
 before=$(remote); rel
 check "a: re-run is a no-op that reports the tip's tag" "outs '0.1.0|v0.1.0|false' && [ \"\$(remote)\" = \"\$before\" ]"
 
@@ -77,8 +78,8 @@ printf '# Changelog\n\n%s' "$old" > "$D/CHANGELOG.md"; git -C "$D" add CHANGELOG
 git -C "$D" tag 0.10.2; c 'fix: a fix'; pushall
 rel
 check "b: 0.10.2 + fix -> 0.10.3 (bare prefix kept)" "outs '0.10.3|0.10.3|true'"
-check "b: header first, new section, old entries kept as the tail" \
-  "at_origin | head -1 | grep -qx '# Changelog' && at_origin | grep -q '^## 0.10.3 - ' && [ \"\$(at_origin | tail -n $(printf '%s' "$old" | wc -l | tr -d ' '))\" = \"\$(printf '%s' \"\$old\")\" ]"
+check "b: an existing CHANGELOG is left alone" \
+  "[ \"\$(at_origin)\" = \"\$(printf '# Changelog\\n\\n%s' \"\$old\")\" ]"
 
 # (c) Bump table (dry runs).
 nc=0
@@ -132,16 +133,18 @@ race() {
 }
 # A bot commit (no run of its own) lands: retry from the new tip.
 repo f; c 'chore: init'; git -C "$D" tag 0.1.0; c 'fix: already unreleased'; pushall
+sha_f=$(git -C "$D" rev-parse HEAD)
 race f 'chore(deploy): bump f image to 0123456789ab'
-check "f: bot commit races -> released on attempt 2" "outs '0.1.1|0.1.1|true' && grep -q 'attempt 1' <<<\"\$out\""
-check "f: changelog lists the unreleased commit" "at_origin | grep -qx -- '- Already unreleased'"
-check "f: tag on the release commit, above the bot commit" \
-  "[ \"\$(git -C '$O' rev-parse '0.1.1^{commit}')\" = \"\$(git -C '$O' rev-parse main)\" ] && [ \"\$(git -C '$O' log -1 --format=%s main~1)\" = 'chore(deploy): bump f image to 0123456789ab' ]"
+check "f: bot commit races -> released; a tag push does not care" "outs '0.1.1|0.1.1|true'"
+check "f: notes list the unreleased commit" "notes 0.1.1 | grep -qx -- '- Already unreleased'"
+check "f: tag on the triggering commit, below the bot commit" \
+  "[ \"\$(git -C '$O' rev-parse '0.1.1^{commit}')\" = '$sha_f' ] && [ \"\$(git -C '$O' log -1 --format=%s main)\" = 'chore(deploy): bump f image to 0123456789ab' ]"
 # A real commit lands: it has its own run, so this one releases nothing.
 repo f2; c 'chore: init'; git -C "$D" tag 0.1.0; c 'fix: already unreleased'; pushall
+sha_f2=$(git -C "$D" rev-parse HEAD)
 race f2 'fix: injected'
-check "f: real commit races -> nothing released, origin has no new tag" \
-  "outs '0.1.0||false' && [ \"\$(git -C '$O' log -1 --format=%s main)\" = 'fix: injected' ] && [ \"\$(git -C '$O' tag)\" = 0.1.0 ]"
+check "f: real commit lands after the fetch -> the checked commit is released, not the new one" \
+  "outs '0.1.1|0.1.1|true' && [ \"\$(git -C '$O' rev-parse '0.1.1^{commit}')\" = '$sha_f2' ] && [ \"\$(git -C '$O' log -1 --format=%s main)\" = 'fix: injected' ]"
 # Origin already past the triggering commit: never release unchecked commits.
 repo f4; c 'chore: init'; c 'feat: x'; c 'fix: newer'; pushall; before=$(remote)
 rel SHA="$(git -C "$D" rev-parse HEAD~1)"
@@ -152,11 +155,11 @@ printf '#!/bin/sh\nif [ ! -e %s ]; then : > %s; exit 1; fi\n' "$T/rej1" "$T/rej1
 rel
 check "f: rejected once -> released on attempt 2" "outs '0.1.0|v0.1.0|true'"
 
-# (g) Origin rejects the branch only: atomic, so the tag must not land either.
+# (g) Origin rejects tags (a protected tag rule): the step fails, origin unchanged.
 repo g; c 'chore: init'; c 'feat: x'; pushall; before=$(remote)
-printf '#!/bin/sh\ncase "$1" in refs/heads/*) exit 1;; esac\n' > "$O/hooks/update"; chmod +x "$O/hooks/update"
+printf '#!/bin/sh\ncase "$1" in refs/tags/*) exit 1;; esac\n' > "$O/hooks/update"; chmod +x "$O/hooks/update"
 rel
-check "g: branch rejected -> step fails, origin unchanged (no tag)" "[ '$rc' != 0 ] && [ \"\$(remote)\" = \"\$before\" ]"
+check "g: tag rejected -> step fails, origin unchanged" "[ '$rc' != 0 ] && [ \"\$(remote)\" = \"\$before\" ]"
 rm "$O/hooks/update"
 
 # (h) Config selection; the CLI tag pattern always wins.
@@ -185,7 +188,7 @@ repo i; c 'chore: init'; c 'feat: x'
 printf '[changelog]\nbody = "- something\\n"\n[git]\nconventional_commits = true\n' > "$D/cliff.toml"
 git -C "$D" add cliff.toml; c 'chore: config'; pushall; before=$(remote)
 rel
-check "i: version not in the changelog diff -> fails, origin unchanged" \
+check "i: version not in the notes -> fails, origin unchanged" \
   "[ '$rc' != 0 ] && grep -q 'did not land' <<<\"\$out\" && [ \"\$(remote)\" = \"\$before\" ]"
 
 # (i) A long changelog diff (well past a pipe buffer) still counts as landed.

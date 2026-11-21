@@ -73,6 +73,7 @@ hq-style layout (Dockerfile and context in a subdirectory):
 | `push-default-branch-only` | `false` | `true` builds on any ref but skips the registry login, push and deploy off the default branch, tag refs included (a release caller using it pushes nothing; the password is never read there). For a registry that keeps few tags per repo (zot keeps 2 for ukubi-stt), where a branch dispatch would evict the rollback image. Off the default branch `digest` is empty |
 | `extra-tags` | | multiline extra tags (e.g. `latest`), each `[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}`, pushed after the sha tag from the same local image, so with the same digest, and only on the default branch (a branch build never moves `latest`). A mismatch or a failed extra push only warns: the sha tag and digest are already pushed and the deploy runs. The deploy job still pins `sha@digest`, never an extra tag |
 | `values-key` | `.image.tag` | yq path; the value must be double-quoted, two-space indented |
+| `deploy-branch` | `deploy` | branch the bump commits to; the files in `values-file(s)` are pin files on that branch (created from `values-key` on first use, the branch as an orphan). ArgoCD layers them over the default branch's values. Set to `''` to commit to the default branch, as before 0.11 (branch protection then blocks it) |
 | `deploy` | `true` | `false` skips the deploy job (build and push only); bump with [deploy.yml](#deployyml) instead, to roll several images out in one commit |
 | `registry` | `registry.bnei.lan:5000` | |
 | `infisical-auth` | `auto` | the Infisical login: `oidc` (GitHub OIDC, `id-token: write`), `forgejo` (Forgejo's Actions OIDC token traded at Infisical's JWT auth, identity `ci-forgejo-tier1`; image.yml sets `enable-openid-connect` at workflow level; see MIGRATION.md), `universal` (secrets `infisical-client-id` and `infisical-client-secret`), `auto` = `oidc` on github.com, `forgejo` elsewhere (Forgejo sets `FORGEJO_ACTIONS` and its own `GITHUB_SERVER_URL`). Checked only on a publishing run, so PRs need neither |
@@ -182,6 +183,7 @@ jobs:
 | `pins` | required | one `<values file> <sha12>@sha256:<64 hex>` per line; each file once, every file must exist (no skip-if-missing), paths relative to the repo root, no `..`, no symlink |
 | `built-commit` | required | full sha the images were built from (image.yml's `commit`); all images come from one commit |
 | `values-key` | `.image.tag` | yq path in every file, as in image.yml |
+| `deploy-branch` | `deploy` | as in image.yml |
 | `runs-on` | `["ubuntu-latest"]` | JSON list; the runner needs bash, git and curl (yq is installed by a step) |
 | `commit-author` | `<repo>-ci` | bump commit author name |
 
@@ -192,10 +194,10 @@ fails before any file is edited.
 ## release.yml
 
 Cuts a release from Conventional Commits with git-cliff 2.14.2 (sha256-pinned):
-the next semver since the last `X.Y.Z` or `vX.Y.Z` tag, its section prepended
-to the CHANGELOG, a `chore(release): <tag>` commit by `release-ci` on the
-default branch and an annotated tag, pushed together with `git push --atomic`
-(3 attempts, each from the fresh tip). Only `push` and `workflow_dispatch` on
+the next semver since the last `X.Y.Z` or `vX.Y.Z` tag, pushed as an annotated
+tag by `release-ci` on the commit that triggered the run, its message the
+version's section (`git tag -n99 <tag>`). Nothing is committed to the default
+branch, so it can be protected (3 push attempts). Only `push` and `workflow_dispatch` on
 the default branch release; any other event, `pull_request` included, is a dry
 run that writes the would-be section to the step summary and pushes nothing.
 

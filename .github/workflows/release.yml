@@ -1,20 +1,17 @@
 # Cut a release from Conventional Commits with git-cliff: compute the next
-# semver since the last X.Y.Z / vX.Y.Z tag, prepend its section to the
-# CHANGELOG, commit `chore(release): <tag>` to the default branch, push an
-# annotated tag with it (one atomic push), and output the version for the
-# image workflow's VERSION build-arg.
+# semver since the last X.Y.Z / vX.Y.Z tag and push an annotated tag on the
+# commit that triggered the run, its message the release notes (the version's
+# section). Output the version for the image workflow's VERSION build-arg.
 #
 # Only push and workflow_dispatch on the default branch release. Any other
 # event (pull_request included) is a dry run: version and section go to the
-# step summary; nothing is committed, tagged or pushed.
+# step summary; nothing is tagged or pushed.
 #
-# A direct commit, not a PR: no caller protects its default branch today, and
-# image.yml's tag bump pushes the same way. A protected branch fails the
-# atomic push loudly, with nothing half-pushed.
-#
-# GITHUB_TOKEN pushes never trigger another run, so the release commit cannot
-# loop. The caller's job must grant `contents: write`, also on pull_request
-# (GitHub checks nested permissions before any job starts).
+# Nothing is committed to the default branch: it can be protected, and only
+# reviewed merges land there (ukubi option B). Read the notes with
+# `git tag -n99 <tag>`. The caller's job must grant `contents: write` (the tag
+# push), also on pull_request (GitHub checks nested permissions before any
+# job starts).
 # Inputs reach scripts through env only, never inline ${{ }}.
 name: release
 
@@ -32,7 +29,7 @@ on:
         type: string
         default: ''
       changelog:
-        description: The changelog file to prepend to (created on the first release).
+        description: Unused since releases stopped committing a changelog (kept so old callers still parse).
         type: string
         default: CHANGELOG.md
     outputs:
@@ -40,7 +37,7 @@ on:
         description: X.Y.Z without a v (the release cut, or on a dry run the one that would be). Feed it to image.yml as build-args VERSION=...
         value: ${{ jobs.release.outputs.version }}
       tag:
-        description: The release tag at the released commit, for image.yml's ref. Empty on a dry run, or when nothing was released and the tip is untagged.
+        description: The release tag at the released commit, for image.yml's ref. Empty on a dry run, or when nothing was released and the commit is untagged.
         value: ${{ jobs.release.outputs.tag }}
       released:
         description: true when this run pushed a new tag.
@@ -109,7 +106,6 @@ jobs:
           REF: ${{ github.ref }}
           BRANCH: ${{ github.event.repository.default_branch }}
           CONFIG: ${{ inputs.config }}
-          CHANGELOG: ${{ inputs.changelog }}
         run: |
           set -euo pipefail
           # Out of the environment before git-cliff runs: a cliff.toml
@@ -211,29 +207,27 @@ jobs:
               echo "::notice::$BRANCH moved past $SHA; the run for the newer commits releases them"
               unchanged; exit 0
             fi
-            # The tip, bot commits included, so the push fast-forwards.
-            git reset -q --hard "$tip"
+            # Nothing is committed to the branch (it is protected, ADR option B):
+            # the release is an annotated tag on $SHA whose message is the notes.
+            git reset -q --hard "$SHA"
             n=$(releasable)
             if [ "$n" = 0 ]; then unchanged; exit 0; fi
             t=$(next)
-            touch "$CHANGELOG"
-            cliff --unreleased --tag "$t" --prepend "$CHANGELOG"
-            git add -- "$CHANGELOG"
-            # git-cliff exits 0 on an IO error: the version must have landed.
-            # No grep -q: exiting early SIGPIPEs the writers and pipefail fails it.
-            git diff --cached -U0 -- "$CHANGELOG" | grep '^+' | grep -F "${t#v}" >/dev/null \
-              || { echo "::error::$t did not land in $CHANGELOG"; exit 1; }
+            notes=$(cliff --unreleased --tag "$t" --strip header)
+            # git-cliff exits 0 on a template that drops the version: it must be there.
+            # No grep -q: exiting early SIGPIPEs the writer and pipefail fails it.
+            printf '%s\n' "$notes" | grep -F "${t#v}" >/dev/null \
+              || { echo "::error::$t did not land in the release notes"; exit 1; }
             id=(-c user.name=release-ci -c user.email=noreply@bnei.dev)
-            git "${id[@]}" commit -q -m "chore(release): $t"
-            git "${id[@]}" tag -a "$t" -m "$t"
-            if git -c http.extraheader="$hdr" push --atomic origin "HEAD:refs/heads/$BRANCH" "refs/tags/$t"; then
+            printf '%s\n\n%s\n' "$t" "$notes" | git "${id[@]}" tag -a --cleanup=verbatim "$t" -F - "$SHA"
+            if git -c http.extraheader="$hdr" push origin "refs/tags/$t"; then
               echo "::notice::released $t"
               out "${t#v}" "$t" true
               exit 0
             fi
             # Not on origin: drop it, or the next attempt takes it for the last release.
             git tag -d "$t" >/dev/null
-            echo "::warning::push of $t rejected (attempt $attempt); retrying from the new tip"
+            echo "::warning::push of $t rejected (attempt $attempt); retrying"
             sleep 5
           done
           echo "::error::could not push $t"; exit 1

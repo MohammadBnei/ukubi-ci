@@ -247,6 +247,47 @@ multi() { # name want_commits files-of-commit(0|1|2) a-tag b-tag
   if [ "$2" = 2 ] && [ "$(git -C "$d" log -1 --format=%an%n%s)" != "app-ci"$'\n'"chore(deploy): bump app image to $PIN" ]; then bad "multi $1: author or subject"; return; fi
   ok "multi $1"
 }
+# 3c. Option B: bumps go to a deploy branch. Switch (orphan on first use, then
+#     the remote branch), bump (creating the pin file from the key), commit and
+#     push; the default branch is never written.
+step deploy "Switch to the deploy branch" > "$T/switch.sh"
+[ -s "$T/switch.sh" ] || { echo "FAIL extract switch block"; exit 1; }
+db() { # name key -- one deploy round; leaves $T/db
+  local d="$T/db" r="$T/db-remote.git" out; rm -rf "$d" "$r"; mkdir -p "$d"; git init -q --bare -b main "$r"
+  printf 'image:\n  tag: "keepme"\n' > "$d/values.yaml"
+  git -C "$d" init -q -b main; git -C "$d" remote add origin "$r"; git -C "$d" add .
+  git -C "$d" -c user.name=t -c user.email=t@t commit -qm init; git -C "$d" push -q origin main
+  local main0; main0=$(git -C "$r" rev-parse main)
+  for round in 1 2; do
+    out=$(cd "$d" && git checkout -q main && DEPLOY_BRANCH=deploy BRANCH=main bash "$T/switch.sh" 2>&1) || { bad "deploy branch $1: switch failed round $round ($out)"; return; }
+    out=$(cd "$d" && PINS="app/image.yaml $PIN" VALUES_KEY=$2 DEPLOY_BRANCH=deploy BRANCH=main bash "$T/bump.sh" 2>&1) || { bad "deploy branch $1: bump failed round $round ($out)"; return; }
+    out=$(cd "$d" && AUTHOR=app-ci MESSAGE="chore(deploy): bump app image to $PIN" PINS="app/image.yaml $PIN" DEPLOY_BRANCH=deploy BRANCH=main bash "$T/commit.sh" 2>&1) || { bad "deploy branch $1: commit failed round $round ($out)"; return; }
+  done
+  [ "$(git -C "$r" rev-parse main)" = "$main0" ] || { bad "deploy branch $1: the default branch was written"; return; }
+  [ "$(git -C "$r" show "deploy:app/image.yaml" | yq "$2")" = "$PIN" ] || { bad "deploy branch $1: pin not on deploy"; return; }
+  [ "$(git -C "$r" ls-tree -r --name-only deploy)" = app/image.yaml ] || { bad "deploy branch $1: deploy holds more than the pin file"; return; }
+  [ "$(git -C "$r" rev-list --count deploy)" = 1 ] || { bad "deploy branch $1: second round should be a no-op"; return; }
+  [ "$(git -C "$r" log -1 --format=%s deploy)" = "chore(deploy): bump app image to $PIN" ] || { bad "deploy branch $1: subject"; return; }
+  ok "deploy branch $1"
+}
+db "key .image.tag: orphan branch, pin file only, main untouched, re-run no-op" .image.tag
+db "nested key .api.image.tag" .api.image.tag
+# An existing deploy branch with an older pin: the pin moves, one commit on top.
+d="$T/db"; r="$T/db-remote.git"
+P2="fedcba987654@sha256:$(printf 'b%.0s' {1..64})"
+(cd "$d" && git checkout -q main && DEPLOY_BRANCH=deploy BRANCH=main bash "$T/switch.sh" >/dev/null 2>&1 \
+  && PINS="app/image.yaml $P2" VALUES_KEY=.api.image.tag DEPLOY_BRANCH=deploy BRANCH=main BUILT=fedcba987654fedcba987654fedcba987654fedc bash "$T/bump.sh" >/dev/null 2>&1 \
+  && AUTHOR=app-ci MESSAGE="chore(deploy): bump app image to $P2" PINS="app/image.yaml $P2" DEPLOY_BRANCH=deploy BRANCH=main bash "$T/commit.sh" >/dev/null 2>&1)
+if [ "$(git -C "$r" show deploy:app/image.yaml | yq .api.image.tag)" = "$P2" ] && [ "$(git -C "$r" rev-list --count deploy)" = 2 ]; then
+  ok "deploy branch: an existing pin moves, one more commit"; else bad "deploy branch: existing pin did not move"; fi
+# Only a lookalike branch (ci/deploy) on origin: still an orphan deploy, not a failed fetch.
+git -C "$r" branch -q ci/deploy deploy && git -C "$r" branch -q -D deploy
+if (cd "$d" && git checkout -q main && git branch -q -D deploy && DEPLOY_BRANCH=deploy BRANCH=main bash "$T/switch.sh" >/dev/null 2>&1) \
+  && [ "$(git -C "$d" ls-files)" = "" ]; then ok "deploy branch: a lookalike ref is not taken for the branch"; else bad "deploy branch: lookalike ref misread"; fi
+for n in -x 'a..b' 'x.lock' 'x/'; do
+  if DEPLOY_BRANCH=$n BRANCH=main bash "$T/switch.sh" >/dev/null 2>&1; then bad "deploy branch: '$n' must be refused"; else ok "deploy branch: '$n' refused"; fi
+done
+if DEPLOY_BRANCH='bad branch' BRANCH=main bash "$T/switch.sh" >/dev/null 2>&1; then bad "deploy branch: a bad name must fail"; else ok "deploy branch: a bad name fails"; fi
 multi "both stale: one commit touching both files" 2 2 aaaaaaaaaaaa bbbbbbbbbbbb
 multi "one file already pinned: bump still lands, one commit" 2 1 "$PIN" bbbbbbbbbbbb
 multi "first file pinned, second stale (order does not matter)" 2 1 aaaaaaaaaaaa "$PIN"

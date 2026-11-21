@@ -146,3 +146,22 @@ pilot first:
   file as a broken top-level workflow. The calls themselves work. The block
   stays, because GitHub needs it for callers that map secrets by name.
 
+## 0.11: bumps on a deploy branch, releases as tags (option B)
+
+The default branch only takes reviewed merges, so it can be protected.
+
+- **release.yml** pushes only an annotated tag on the triggering commit; the
+  notes are the tag message. No `chore(release)` commit, no CHANGELOG edit
+  (`changelog` is ignored). An existing CHANGELOG.md stays as history.
+- **image.yml and deploy.yml** commit the bump to `deploy-branch` (default
+  `deploy`). `values-file(s)` name pin files on that branch, not the default
+  branch's values: use a path of its own, e.g. `app/helm/image.yaml`. The
+  first run creates the branch (orphan) and the file from `values-key`. The
+  bump subject stays `chore(deploy): bump <app> image to <tag>@<digest>`.
+- **ArgoCD** must layer the pin file over the default branch's values
+  (infra-bootstrap ApplicationSet: a source at `targetRevision: deploy`, the
+  pin file last in `valueFiles`). Order per repo: switch the caller to 0.11,
+  let its first main run create `deploy`, then point the app's registry entry
+  at it. Until then new images build and push but do not deploy.
+- `deploy-branch: ''` keeps the old behaviour (bump on the default branch).
+

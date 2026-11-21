@@ -22,6 +22,14 @@ on:
         description: The full sha the images were built from (image.yml's commit output), for the stale-run guard.
         type: string
         required: true
+      deploy-branch:
+        description: >-
+          Branch the bump commits to. Default deploy: the default branch only
+          takes reviewed merges, and ArgoCD layers the pin files on this branch
+          over the default branch's values. Set it to '' to commit to the default
+          branch (the pre-0.11 behaviour).
+        type: string
+        default: deploy
       values-key:
         description: yq path of the quoted tag value in every file, two-space indented YAML.
         type: string
@@ -82,6 +90,7 @@ jobs:
       PINS: ${{ inputs.pins }}
       BUILT: ${{ inputs.built-commit }}
       VALUES_KEY: ${{ inputs.values-key }}
+      DEPLOY_BRANCH: ${{ inputs.deploy-branch }}
       BRANCH: ${{ github.event.repository.default_branch }}
       AUTHOR: ${{ inputs.commit-author != '' && inputs.commit-author || format('{0}-ci', github.event.repository.name) }}
       MESSAGE: 'chore(deploy): bump ${{ github.event.repository.name }} images'
@@ -101,6 +110,32 @@ jobs:
           chmod +x "$RUNNER_TEMP/yq"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
+      # Bumps land on their own branch (ukubi option B): the default branch only
+      # takes reviewed merges. A missing deploy branch starts as an orphan
+      # holding only the pin files; the stale check below still reaches the
+      # default branch's history (it unshallows it). A concurrent first push
+      # by another image of the same repo fails the rebase loudly; the next
+      # run lands. test/check.sh runs this block verbatim; keep the name.
+      - name: Switch to the deploy branch
+        run: |
+          set -euo pipefail
+          target=${DEPLOY_BRANCH:-$BRANCH}
+          [ "$target" != "$BRANCH" ] || exit 0
+          if [[ "$target" == -* ]] || ! git check-ref-format --branch "$target" >/dev/null 2>&1; then
+            echo "::error::bad deploy-branch: '$target'"; exit 1
+          fi
+          # The exact ref (ls-remote alone matches by suffix); a failing
+          # ls-remote fails the step instead of reading as "no branch".
+          head=$(git ls-remote origin "refs/heads/$target" | awk -v r="refs/heads/$target" '$2 == r')
+          if [ -n "$head" ]; then
+            git fetch -q origin "+refs/heads/$target:refs/remotes/origin/$target"
+            git checkout -q -B "$target" "refs/remotes/origin/$target"
+          else
+            git checkout -q --orphan "$target"
+            git rm -rqf --cached . >/dev/null
+            git clean -fdxq
+          fi
+
       - name: Check inputs
         run: |
           set -euo pipefail
@@ -117,7 +152,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$BUILT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::built commit missing or malformed ('$BUILT')"; exit 1; }
-          if [ "$(git rev-parse --is-shallow-repository)" = true ]; then git fetch -q --unshallow origin "$BRANCH" || true; fi
+          if [ "$(git rev-parse --is-shallow-repository)" = true ]; then git fetch -q --unshallow origin "$BRANCH"; fi
           # PINS: one "<values file> <sha12>@sha256:<64 hex>" per line.
           files=(); vals=()
           while read -r f v extra; do
@@ -180,6 +215,16 @@ jobs:
           indent=$(printf '%*s' $(( (${#dots} - 1) * 2 )) '')
           for i in "${!files[@]}"; do
             f=${files[$i]}; TAG=${vals[$i]}
+            # First bump on a deploy branch: the pin file starts as the key alone.
+            if [ -n "${DEPLOY_BRANCH:-}" ] && [ "$DEPLOY_BRANCH" != "${BRANCH:-}" ] && [ ! -e "$f" ]; then
+              mkdir -p "$(dirname "$f")"
+              read -ra segs <<< "${VALUES_KEY//./ }"; ind=''
+              {
+                echo "# Image pin, written by ukubi-ci on every deploy; ArgoCD layers it over the default branch's values."
+                for k in "${segs[@]:0:${#segs[@]}-1}"; do echo "$ind$k:"; ind="$ind  "; done
+                echo "$ind$leaf: \"none\""
+              } > "$f"
+            fi
             [ -f "$f" ] || { echo "::error::$f not found"; exit 1; }
             # Same sha and digest: nothing to bump. buildah bud is not reproducible
             # (created timestamp), so any rebuild gets a new digest and redeploys;
@@ -211,9 +256,15 @@ jobs:
           git add -- "${files[@]}"
           git diff --cached --quiet && exit 0
           git commit -m "$MESSAGE" -m "$PINS"
-          # The default branch also takes local pushes; retry if it moves.
+          target=${DEPLOY_BRANCH:-$BRANCH}
+          # Other bumps push to the same branch; retry if it moves.
           for _ in 1 2 3; do
-            git pull --rebase origin "$BRANCH" && git push origin "HEAD:$BRANCH" && exit 0
+            head=$(git ls-remote origin "refs/heads/$target" | awk -v r="refs/heads/$target" '$2 == r')
+            if [ -n "$head" ] && ! git pull -q --rebase origin "$target"; then
+              git rebase --abort 2>/dev/null || true
+              echo "::error::the bump does not rebase onto $target"; exit 1
+            fi
+            git push origin "HEAD:refs/heads/$target" && exit 0
             sleep 5
           done
           echo "::error::could not push the tag bump"; exit 1

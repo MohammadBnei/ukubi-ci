@@ -63,10 +63,10 @@ if d=$(diff <(yq -o=json -I0 "$sel" "$W/image.yml") <(yq -o=json -I0 "$sel" "$W/
 else bad "image-build: tag and Build steps drifted from image.yml: $d"; fi
 
 # 1b. deploy.yml's guard, bump and commit steps are image.yml's deploy steps, env and if included.
-sel='.jobs.deploy.steps[] | select(.name == "Skip a stale run" or .name == "Bump the pinned image tag" or .name == "Commit and push")'
+sel='.jobs.deploy.steps[] | select(.name == "Switch to the deploy branch" or .name == "Skip a stale run" or .name == "Bump the pinned image tag" or .name == "Commit and push")'
 n=$(yq "[$sel] | length" "$W/deploy.yml")
-if [ "$n" = 3 ] && d=$(diff <(yq -o=json -I0 "$sel" "$W/image.yml") <(yq -o=json -I0 "$sel" "$W/deploy.yml")); then
-  ok "deploy: stale guard, bump and commit steps == image.yml"
+if [ "$n" = 4 ] && d=$(diff <(yq -o=json -I0 "$sel" "$W/image.yml") <(yq -o=json -I0 "$sel" "$W/deploy.yml")); then
+  ok "deploy: switch, stale guard, bump and commit steps == image.yml"
 else bad "deploy: shared steps drifted from image.yml ($n found): ${d:-}"; fi
 for f in image deploy; do
   # shellcheck disable=SC2016 # a literal ${{, not a shell expansion
