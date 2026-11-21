@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.0 - 2026-11-21
+
+### Features
+
+- **image:** Forgejo OIDC login; publish decided in shell (#16)
+
 ## 0.9.0 - 2026-11-21
 
 ### Features
