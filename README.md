@@ -442,3 +442,129 @@ The forms are anchored, so prose about the rule passes.
 | `allow-prefixes` | | multiline literal subject prefixes exempt from the Conventional rule only, never from the ban |
 | `agent-trailers` | `any` | `forbid`: no agent `Co-Authored-By` or `Agent-Session` at all. `pair`: an agent commit carries both `Co-Authored-By: ukubi-claude-<host> <noreply@bnei.dev>` and `Agent-Session: <id>`, a human one neither |
 | `extra-banned` | | an extra case-insensitive ERE, e.g. `generated with` for a repo that bans the words anywhere |
+
+## dev-db and dev-db-release
+
+Composite actions (shell, curl, jq; psql for the expiry comment) that give a job
+a disposable, seeded Postgres database from the dev IntegreSQL (ADR-0088), on
+GitHub Actions and Forgejo Actions alike. Pin them by commit sha like the
+workflows: `MohammadBnei/ukubi-ci/actions/dev-db@<sha>`.
+
+```yaml
+steps:
+  - uses: actions/checkout@<sha>
+  - uses: MohammadBnei/ukubi-ci/actions/dev-db@<sha>
+    with:
+      integresql-url: https://integresql.dev.example
+      token: ${{ secrets.DEV_DB_TOKEN }}
+      # the template is keyed by a hash of migrations/ and seeds/ (and this command)
+      seed-command: ./scripts/migrate-and-seed.sh   # sees DATABASE_URL
+  - run: go test ./...                              # DATABASE_URL is exported
+  - if: always()
+    uses: MohammadBnei/ukubi-ci/actions/dev-db-release@<sha>
+    with:
+      token: ${{ secrets.DEV_DB_TOKEN }}
+```
+
+What `dev-db` does: `POST /templates {key}`, where the key is the first 32 hex
+of sha256(`GITHUB_REPOSITORY`, hash), so two repos never share a template by
+accident. A 200 means this job builds the template: it runs `seed-command`
+against the template database, then `PUT /templates/<key>`.
+
+Only that builder ever deletes the template, from its exit trap, and only while
+it knows the template is not final: the seed failed, or the step got SIGINT or
+SIGTERM during the seed. It forgets the template just before sending the PUT,
+because a PUT can land on IntegreSQL and still look failed to the client (a
+timeout or a lost answer). The PUT is retried on 000 and 5xx (a PUT on a final
+template answers 204 too), a 404 fails the step (someone deleted the key), and
+an answer that stays ambiguous fails the step with the recovery below. None of
+these delete.
+
+A 423 means another job built it or is building it: the action loops on
+`GET /templates/<key>/tests`, which IntegreSQL holds open until the template is
+final. A waiter never deletes. Any 500 keeps it polling until
+`timeout-seconds`, then fails the step: IntegreSQL's not-final
+`unexpected template state`, or another such as `timeout when waiting for ready
+db` when the template's pool (`INTEGRESQL_TEST_MAX_POOL_SIZE`) is all handed
+out. A refused connection or a 503 (IntegreSQL not up yet) is retried until
+`timeout-seconds` too, for `POST` as for `GET`. On success it writes
+`DATABASE_URL` (password masked) and `DEV_DB_*` to `GITHUB_ENV`, and sets the
+expiry with `COMMENT ON DATABASE`
+(`{"ttl":"<RFC 3339 UTC>","repo":..,"run":..,"keep":..}`), the format
+infra-bootstrap's TTL sweeper reads.
+
+### Stuck templates
+
+**On Forgejo Actions, a cancelled or timed-out build leaves the template stuck.**
+forgejo-runner (v13.2.2, podman) sends the step no signal on a run cancel or a
+step `timeout-minutes`: it drops the exec and removes the container, so the trap
+never runs. Tested on this repo: a cancel mid-seed ended the job within a
+second with no trap output, and after a step timeout a probe step found the
+template still there (`POST` answered 423). On GitHub Actions the runner sends
+SIGINT, then SIGTERM, before killing the step, so the trap discards the
+template there; that path is the one `test/dev-db/run.sh` tests, not tested on
+GitHub itself. A SIGKILL, or a cancel while the PUT is in flight, leaves the
+template unfinished on either platform.
+
+A stuck template fails every job with that key at `timeout-seconds`, with an
+error naming the key and this recovery. **Only if no job is building it now**,
+delete it and rerun:
+
+```sh
+curl -X DELETE <integresql-url>/api/v1/templates/<key>
+# add -H 'Authorization: Bearer <token>' behind the auth proxy
+```
+
+The action does not reclaim a stuck template itself: two waiters reclaiming
+the same dead template race, and the later one deletes the other's fresh build
+and the database it already handed out.
+
+`INTEGRESQL_TEMPLATE_FINALIZE_TIMEOUT_MS` (how long IntegreSQL holds a GET on
+an unfinished template, 60 s by default) must stay below the action's 90 s curl
+`--max-time`, or every such GET times out on the client.
+
+`keep: true` is best effort on IntegreSQL v1.1.0. A kept database stays handed
+out in the template's pool; once that pool is full and short of ready
+databases, IntegreSQL recreates the oldest handed-out one after 250 ms
+(`pool.autoCleanDirty`, `INTEGRESQL_TEST_DB_MINIMAL_LIFETIME_MS`), kept ones
+included, and the recreated database is a fresh copy without the ttl comment.
+Inspect a kept database soon, or copy what you need out of it.
+
+The credentials come from IntegreSQL. IntegreSQL v1.1.0 hands every caller,
+seeder and test alike, its own manager role, so that role must not be a
+superuser (on the dev Postgres it is `integresql`: NOSUPERUSER, CREATEDB). Until
+an auth proxy sits in front of IntegreSQL, any job can still reach another job's
+database with it, and can compute another repo's key; the proxy has to bind each
+token to its repo's keys and hand out a per-database role.
+
+| input | default | |
+|---|---|---|
+| `integresql-url` | required | base URL; its host is also the Postgres host unless `postgres-host` is set |
+| `token` | | bearer token for the auth proxy; empty sends no header |
+| `template-hash` | | `[A-Za-z0-9_-]{1,64}`; empty hashes `hash-paths` plus `seed-command`; hashed again with the repo name |
+| `hash-paths` | `migrations seeds` | space-separated files or directories hashed when `template-hash` is empty; missing ones are skipped, none found is an error |
+| `seed-command` | | runs only when the template is built, with `DATABASE_URL` set to it |
+| `postgres-host` | `''` | Postgres host when it is not on the IntegreSQL host (ukubi: `dev-postgres.bnei.lan`) |
+| `postgres-port` | `5432` | 1-65535; IntegreSQL reports its in-cluster address, so both host and port come from the caller |
+| `sslmode` | `disable` | `sslmode` in `DATABASE_URL`; the dev Postgres is LAN-only without TLS |
+| `ttl` | `2` | hours until the sweeper may drop the database; `0` skips the comment; no psql on the runner warns and skips |
+| `keep` | `false` | copy of the release input, stored in the comment; `true` needs `ttl` above 0 and psql; not durable, see above |
+| `timeout-seconds` | `600` | wait for IntegreSQL and a template build; at least `120` and longer than `seed-command` takes |
+
+`dev-db-release` (inputs `token`, `keep`) is a separate action because composite
+actions have no post step. It recreates the database unless `keep` is `true`; a
+failed recreate only warns, the sweeper cleans up at the ttl. With no `dev-db`
+step in the job it does nothing.
+
+Self-test: `test/dev-db/run.sh` runs both actions' blocks against
+`test/dev-db/compose.yml` (IntegreSQL + Postgres 18 by digest, both roles
+non-superusers as on the dev Postgres, no new Docker network): build, recreate,
+reuse, keep, the waiter, a failed and a cancelled seed, a killed builder with
+two waiters that delete nothing and the manual recovery, a PUT whose answer is
+lost, an exhausted pool, two repos with one hash, bad inputs and an IntegreSQL
+that is not up yet. `.github/workflows/dev-db-selftest.yml` runs IntegreSQL and
+Postgres as job services and covers build, recreate, reuse and keep only,
+through `uses: ./actions/...`. It reaches them by service name (`postgres`,
+`integresql`), which works on a container job (the Forgejo podman runner,
+`ubuntu-latest`); the cancel, kill, lost-PUT, exhausted-pool and two-repo
+cases run locally with `test/dev-db/run.sh`.

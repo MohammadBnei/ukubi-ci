@@ -1,0 +1,262 @@
+name: dev-db
+description: >-
+  Get a disposable, seeded Postgres database from IntegreSQL (ADR-0088) and
+  export DATABASE_URL. Pair it with dev-db-release in a final if-always step.
+inputs:
+  integresql-url:
+    description: Base URL of IntegreSQL (or its auth proxy), e.g. https://integresql.dev.example.
+    required: true
+  token:
+    description: Bearer token for the auth proxy in front of IntegreSQL. Empty sends no header.
+    default: ''
+  template-hash:
+    description: >-
+      Template key (letters, digits, - and _, up to 64). Empty hashes hash-paths
+      and seed-command. Either way it is hashed again with GITHUB_REPOSITORY,
+      so two repos never share a template by accident.
+    default: ''
+  hash-paths:
+    description: Space-separated files or directories (relative to the workspace, no spaces in names) hashed when template-hash is empty. Missing ones are skipped.
+    default: 'migrations seeds'
+  seed-command:
+    description: >-
+      Shell command that migrates and seeds the template database. Runs only
+      when the template must be built, with DATABASE_URL pointing at it.
+    default: ''
+  postgres-host:
+    description: >-
+      Host of the dev Postgres. Empty uses the integresql-url host. IntegreSQL
+      reports its own in-cluster address, so the host comes from the caller
+      (ukubi: dev-postgres.bnei.lan, its own LAN address next to IntegreSQL's).
+    default: ''
+  postgres-port:
+    description: Port of the dev Postgres. IntegreSQL reports its own in-cluster address, so both host and port come from the caller.
+    default: '5432'
+  sslmode:
+    description: sslmode in DATABASE_URL. The dev Postgres is LAN-only without TLS, hence disable.
+    default: 'disable'
+  ttl:
+    description: >-
+      Hours until the TTL sweeper may drop the database, written to COMMENT ON
+      DATABASE with psql. Without psql on the runner it warns and skips, unless
+      keep is true. 0 skips it.
+    default: '2'
+  keep:
+    description: >-
+      Pass the same value to dev-db-release. true leaves the database for the
+      sweeper instead of recreating it, and needs ttl above 0. Not durable on
+      IntegreSQL v1.1.0: once the template's pool is full, IntegreSQL recreates
+      the oldest handed-out database (after 250 ms), kept ones included, and
+      the recreated database has lost its ttl comment.
+    default: 'false'
+  timeout-seconds:
+    description: >-
+      How long to wait for IntegreSQL and for another job's template build; at
+      least 120, and longer than seed-command takes, or a waiter gives up on a
+      build that would have finished. A waiter never deletes a template: one
+      left unfinished fails waiters with the DELETE to run by hand. On Forgejo
+      Actions a cancelled or timed-out build always leaves it unfinished (the
+      runner sends no signal); see the README's stuck templates.
+    default: '600'
+runs:
+  using: composite
+  steps:
+    - name: Get a dev database
+      shell: bash
+      env:
+        IN_URL: ${{ inputs.integresql-url }}
+        IN_TOKEN: ${{ inputs.token }}
+        IN_HASH: ${{ inputs.template-hash }}
+        IN_PATHS: ${{ inputs.hash-paths }}
+        IN_SEED: ${{ inputs.seed-command }}
+        IN_HOST: ${{ inputs.postgres-host }}
+        IN_PORT: ${{ inputs.postgres-port }}
+        IN_SSLMODE: ${{ inputs.sslmode }}
+        IN_TTL: ${{ inputs.ttl }}
+        IN_KEEP: ${{ inputs.keep }}
+        IN_TIMEOUT: ${{ inputs.timeout-seconds }}
+      run: |
+        set -euo pipefail
+        url=${IN_URL%/}
+        [[ "$url" =~ ^https?://([^/:@]+)(:[0-9]+)?(/.*)?$ ]] || { echo "::error::integresql-url must be http(s)://host[:port]"; exit 1; }
+        pghost=${IN_HOST:-${BASH_REMATCH[1]}}
+        [[ "$pghost" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "::error::postgres-host must be a hostname or IPv4 address"; exit 1; }
+        [[ "$IN_PORT" =~ ^[0-9]{1,9}$ && "$IN_TTL" =~ ^[0-9]{1,9}$ && "$IN_TIMEOUT" =~ ^[0-9]{1,9}$ ]] || { echo "::error::postgres-port, ttl and timeout-seconds must be whole numbers"; exit 1; }
+        # Base 10, so 00 is 0 and 010 is 10; integer compares from here on.
+        port=$((10#$IN_PORT)) ttl=$((10#$IN_TTL)) timeout=$((10#$IN_TIMEOUT))
+        [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { echo "::error::postgres-port must be 1-65535"; exit 1; }
+        [ "$timeout" -ge 120 ] || { echo "::error::timeout-seconds must be at least 120 and longer than seed-command takes"; exit 1; }
+        [[ "$IN_SSLMODE" =~ ^(disable|allow|prefer|require|verify-ca|verify-full)$ ]] || { echo "::error::sslmode must be a libpq sslmode"; exit 1; }
+        if [ "$IN_KEEP" = true ] && [ "$ttl" -eq 0 ]; then echo "::error::keep=true needs ttl above 0, or the sweeper never drops the database"; exit 1; fi
+        [ -z "$IN_TOKEN" ] || echo "::add-mask::$IN_TOKEN"
+        for c in curl jq; do command -v "$c" >/dev/null || { echo "::error::$c is required"; exit 1; }; done
+
+        sha() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }
+        hash=$IN_HASH
+        if [ -z "$hash" ]; then
+          # shellcheck disable=SC2086 # splitting the path list is the point
+          files=$(for p in $IN_PATHS; do [ -e "$p" ] && find "$p" -type f; done | LC_ALL=C sort -u)
+          [ -n "$files" ] || { echo "::error::no files under hash-paths '$IN_PATHS' and template-hash is empty"; exit 1; }
+          # Names and contents in a fixed order, plus the seed command: change any and the template is rebuilt.
+          hash=$({ printf '%s\n' "$IN_SEED"; while IFS= read -r f; do printf '%s\n' "$f"; sha < "$f"; done <<<"$files"; } | sha | cut -c1-32)
+        fi
+        [[ "$hash" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { echo "::error::template-hash must match [A-Za-z0-9_-]{1,64}"; exit 1; }
+        # The key IntegreSQL sees: repo and hash, 32 hex. Keeps repos apart by
+        # accident only (anyone can compute another repo's key); the auth
+        # proxy in front of IntegreSQL has to enforce it. 32 also keeps
+        # integresql_test_<key>_<id> under Postgres's 63-byte name limit.
+        key=$(printf '%s\n%s\n' "${GITHUB_REPOSITORY:-}" "$hash" | sha | cut -c1-32)
+
+        body=$(mktemp)
+        building='' seedpid=''
+        # Only the job that created the template (POST 200: building=1) ever
+        # deletes it, from this trap, and only while it knows the template is
+        # not final: the seed failed or was cancelled (SIGINT/SIGTERM).
+        # building is cleared before the PUT is sent, since a PUT can land
+        # server-side and still look failed here (timeout, lost response).
+        # Waiters never delete: two waiters reclaiming one dead template race,
+        # and the later one drops the other's new build and handed-out
+        # database. A SIGKILL, or a cancel during the PUT, leaves the template
+        # unfinished; waiters then fail with the DELETE to run by hand. On
+        # Forgejo (runner v13.2.2) a cancel or step timeout sends no signal at
+        # all, so this trap never runs there (tested; README, stuck templates).
+        cleanup() {
+          # The seed runs in its own process group (setsid, where there is one): kill all of it.
+          [ -z "$seedpid" ] || kill -TERM -- "-$seedpid" 2>/dev/null || kill -TERM "$seedpid" 2>/dev/null || true
+          if [ -n "$building" ]; then
+            case "$(api_max=5 api DELETE "/templates/$key")" in
+              204) echo "::warning::template $key was not finished; discarded it so the next run rebuilds" ;;
+              # DiscardTemplateDatabase pops the key before its DROP, so a
+              # failed DROP (a lingering connection) leaves no stuck template.
+              500) echo "::warning::template $key was not finished; IntegreSQL forgot it but its DROP failed (a lingering connection); the next build drops it" ;;
+              *) echo "::warning::template $key was not finished and IntegreSQL did not answer the DELETE. Only if no job is building it now: $(recover)" ;;
+            esac
+          fi
+          rm -f "$body"
+        }
+        trap cleanup EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        # api METHOD PATH [JSON]: prints the HTTP status (000 when curl itself
+        # fails), leaves the body in $body.
+        api() {
+          local args=(-sS -o "$body" -w '%{http_code}' --max-time "${api_max:-90}" -X "$1") c
+          [ -z "$IN_TOKEN" ] || args+=(-H "Authorization: Bearer $IN_TOKEN")
+          [ -z "${3:-}" ] || args+=(-H 'Content-Type: application/json' -d "$3")
+          c=$(curl "${args[@]}" "$url/api/v1$2") || c=000
+          echo "$c"
+        }
+        # dburl: DATABASE_URL from the last response body; host and port come from the caller, not IntegreSQL.
+        dburl() {
+          jq -r --arg h "$pghost" --arg p "$port" --arg s "$IN_SSLMODE" \
+            '.database.config | "postgres://\(.username|@uri):\(.password|@uri)@\($h):\($p)/\(.database|@uri)?sslmode=\($s)"' "$body"
+        }
+        mask() { echo "::add-mask::$(jq -r '.database.config.password' "$body")"; }
+        # recover: the manual DELETE for a template stuck unfinished.
+        recover() { echo "curl -X DELETE${IN_TOKEN:+ -H 'Authorization: Bearer <token>'} $url/api/v1/templates/$key"; }
+
+        # say TEXT: print TEXT unless it repeats the last line said; keeps polls quiet.
+        said=''
+        say() { [ "$1" = "$said" ] || echo "$1"; said=$1; }
+        # IntegreSQL v1.1.0's GET /tests (internal/api/templates/templates.go,
+        # getTestDatabase) holds while the template is not final, then answers
+        # 500 {"message":"unexpected template state"} (manager.ErrInvalidTemplateState):
+        # still building, or a builder that died. Every other failure is a 500
+        # too, e.g. pool.ErrTimeout "timeout when waiting for ready db" when a
+        # FINALIZED template's pool (INTEGRESQL_TEST_MAX_POOL_SIZE) is in use.
+        # Either way the waiter polls until its deadline, then fails. 404 and
+        # 410 mean gone: this job may build it.
+        not_final='unexpected template state'
+        deadline=$((SECONDS + timeout))
+        while :; do
+          code=$(api POST /templates "$(jq -nc --arg h "$key" '{hash:$h}')")
+          case "$code" in
+            200|201)
+              building=1
+              mask
+              tpl=$(dburl)
+              echo "template $key (hash $hash) is new; building it"
+              # In the background so a signal reaches the trap now, not when the seed ends.
+              if command -v setsid >/dev/null; then
+                DATABASE_URL=$tpl setsid bash -c "${IN_SEED:-true}" & seedpid=$!
+              else
+                DATABASE_URL=$tpl bash -c "${IN_SEED:-true}" & seedpid=$!
+              fi
+              wait "$seedpid" || { echo "::error::seed-command failed"; exit 1; }
+              seedpid=''
+              # From here on the template may be final: never delete it.
+              building=''
+              # Finalize is in memory, so a short max-time; a PUT on a final
+              # template answers 204 too (ErrTemplateAlreadyInitialized), so
+              # retrying a lost answer is safe.
+              for try in 1 2 3; do
+                code=$(api_max=10 api PUT "/templates/$key")
+                case "$code" in 000|5??) [ "$try" = 3 ] || sleep 2 ;; *) break ;; esac
+              done
+              case "$code" in
+                204) deadline=$((SECONDS + timeout)) ;;
+                404) echo "::error::template $key vanished before it was finalized (someone deleted it)"; exit 1 ;;
+                *) echo "::error::finalizing template $key returned $code; it may be final or stuck unfinished. If waiters report it not final, and only if no job is building it: $(recover)"; exit 1 ;;
+              esac
+              ;;
+            423) echo "template $key exists or is being built; waiting for it" ;;
+            # Not up yet: connection refused (000) or manager not ready (503).
+            # IntegreSQL listens only once it reached Postgres (InitManager,
+            # 30 tries 1 s apart, then it exits).
+            000|503)
+              [ "$SECONDS" -lt "$deadline" ] || { echo "::error::IntegreSQL not ready after ${timeout}s: POST /templates returned $code"; exit 1; }
+              say "POST /templates returned $code; IntegreSQL is not up yet, retrying"
+              sleep 2; continue ;;
+            *) echo "::error::POST /templates returned $code"; exit 1 ;;
+          esac
+          while :; do
+            code=$(api GET "/templates/$key/tests")
+            [ "$code" = 200 ] && break 2
+            msg=''
+            [ "$code" != 500 ] || msg=$(jq -r '.message // empty' "$body" 2>/dev/null) || msg=''
+            case "$code" in
+              404|410)
+                [ "$SECONDS" -lt "$deadline" ] || { echo "::error::template $key keeps vanishing"; exit 1; }
+                echo "template $key is gone; trying to build it"; continue 2 ;;
+              500) [ "$msg" = "$not_final" ] || say "GET /templates/$key/tests returned 500 (${msg:-no message}); still polling" ;;
+              423|503|000) ;;
+              *) echo "::error::GET /templates/$key/tests returned $code"; exit 1 ;;
+            esac
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              if [ "$code" = 500 ] && [ "$msg" = "$not_final" ]; then
+                echo "::error::template $key still not final after ${timeout}s. A builder killed with SIGKILL, cancelled during its PUT, or cancelled or timed out on Forgejo, leaves it unfinished. Only if no job is building it, delete it and rerun: $(recover)"
+              else
+                echo "::error::template $key: no database after ${timeout}s; last GET returned $code${msg:+ ($msg)}"
+              fi
+              exit 1
+            fi
+            sleep 2
+          done
+        done
+        mask
+        db=$(jq -r '.database.config.database' "$body")
+        id=$(jq -r '.id' "$body")
+        [[ "$db" =~ ^[A-Za-z0-9_]+$ && "$id" =~ ^[0-9]+$ ]] || { echo "::error::unexpected database name or id in the response"; exit 1; }
+        dsn=$(dburl)
+        echo "::add-mask::$dsn"
+
+        if [ "$ttl" -gt 0 ]; then
+          if command -v psql >/dev/null; then
+            # The sweeper's format: {"ttl": <timestamptz>}; the rest is for people.
+            meta=$(jq -nc --argjson h "$ttl" --arg r "${GITHUB_REPOSITORY:-}" --arg run "${GITHUB_RUN_ID:-}" --arg k "$IN_KEEP" \
+              '{ttl:(now + $h*3600 | floor | todate), repo:$r, run:$run, keep:($k=="true")}' | sed "s/'/''/g")
+            psql "$dsn" -v ON_ERROR_STOP=1 -qc "COMMENT ON DATABASE \"$db\" IS '$meta'"
+          elif [ "$IN_KEEP" = true ]; then
+            echo "::error::keep=true needs psql on the runner to write the ttl"; exit 1
+          else
+            echo "::warning::no psql on the runner: no ttl comment; dev-db-release must run to free the database"
+          fi
+        fi
+
+        {
+          echo "DATABASE_URL=$dsn"
+          echo "DEV_DB_INTEGRESQL_URL=$url"
+          echo "DEV_DB_TEMPLATE_HASH=$key"
+          echo "DEV_DB_ID=$id"
+        } >> "$GITHUB_ENV"
+        echo "dev database $db ready (template $key, id $id)"
