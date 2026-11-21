@@ -582,5 +582,44 @@ for f in release image deploy trailers; do
   if [ -z "$ifs" ]; then ok "$f.yml: no if: reads github.event"; else bad "$f.yml: if: reads github.event: $ifs"; fi
 done
 
+# ci.yml's self-test picker: each self-test runs only for its own files; ci.yml
+# changes and pushes (no base) run all.
+yq '.jobs.changes.steps[] | select(.name == "Pick the self-tests") | .run' "$(dirname "$WF")/ci.yml" > "$T/pick.sh"
+[ -s "$T/pick.sh" ] || { echo "FAIL extract self-test picker"; exit 1; }
+pick() { # name want(go,status,bun,rust,image as 0/1 string) files...
+  local name=$1 want=$2 d base got; shift 2
+  d=$(mktemp -d "$T/pick.XXXX"); git init -q "$d"; git -C "$d" -c user.name=t -c user.email=t@t commit -q --allow-empty -m base
+  base=$(git -C "$d" rev-parse HEAD)
+  for f in "$@"; do mkdir -p "$d/$(dirname "$f")"; echo x > "$d/$f"; done
+  if [ $# -gt 0 ]; then git -C "$d" add -A; git -C "$d" -c user.name=t -c user.email=t@t commit -q -m change; fi
+  [ "$name" = "push runs all" ] && base=''
+  : > "$T/pout"; (cd "$d" && BASE=$base GITHUB_OUTPUT="$T/pout" bash "$T/pick.sh") || { bad "self-test picker: $name: failed"; return; }
+  got=$(for k in go status bun rust image; do [ "$(sed -n "s/^$k=//p" "$T/pout")" = true ] && printf 1 || printf 0; done)
+  if [ "$got" = "$want" ]; then ok "self-test picker: $name"; else bad "self-test picker: $name (got $got want $want)"; fi
+}
+pick "go-checks.yml runs go and status" 11000 .github/workflows/go-checks.yml
+pick "a rust fixture runs rust only" 00010 test/fixture-rust/src/lib.rs
+pick "image.yml runs the image tests" 00001 .github/workflows/image.yml
+pick "release.yml runs the image tests" 00001 .github/workflows/release.yml
+pick "README runs nothing" 00000 README.md
+pick "ci.yml runs all" 11111 .github/workflows/ci.yml
+pick "push runs all" 11111 README.md
+pick "cliff.toml runs the image tests" 00001 cliff.toml
+# A move out of a covered path still runs that self-test (--no-renames).
+d=$(mktemp -d "$T/pick.XXXX"); git init -q "$d"; mkdir -p "$d/standard-status"; echo x > "$d/standard-status/a.go"
+git -C "$d" add -A; git -C "$d" -c user.name=t -c user.email=t@t commit -q -m base; b=$(git -C "$d" rev-parse HEAD)
+mkdir -p "$d/elsewhere"; git -C "$d" mv standard-status/a.go elsewhere/a.go; git -C "$d" -c user.name=t -c user.email=t@t commit -q -m move
+: > "$T/pout"; (cd "$d" && BASE=$b GITHUB_OUTPUT="$T/pout" bash "$T/pick.sh")
+if [ "$(sed -n 's/^status=//p' "$T/pout")" = true ]; then ok "self-test picker: a move out of standard-status runs status"; else bad "self-test picker: a rename hid the old path"; fi
+# A failing diff runs everything.
+: > "$T/pout"; (cd "$d" && BASE=0000000000000000000000000000000000000000 GITHUB_OUTPUT="$T/pout" bash "$T/pick.sh" 2>/dev/null)
+if [ "$(grep -c '=true$' "$T/pout")" = 5 ]; then ok "self-test picker: an unknown base runs all"; else bad "self-test picker: an unknown base must run all"; fi
+# Every gate reads an output the changes job sets, and needs it.
+CI=$(dirname "$WF")/ci.yml
+for j in $(yq -r '.jobs | to_entries[] | select((.value.if // "") | test("needs.changes.outputs")) | .key' "$CI"); do
+  k=$(yq -r ".jobs.\"$j\".if" "$CI" | sed -nE 's/.*needs\.changes\.outputs\.([a-z]+).*/\1/p')
+  if [ "$(yq -r ".jobs.changes.outputs.$k // \"\"" "$CI")" != "" ] && yq -r ".jobs.\"$j\".needs" "$CI" | grep -qw changes; then ok "ci.yml $j gate wired to changes.$k"; else bad "ci.yml $j gate not wired ($k)"; fi
+done
+
 echo "failures: $fails"
 [ "$fails" = 0 ]

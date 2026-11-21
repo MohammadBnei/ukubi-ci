@@ -74,7 +74,11 @@ jobs:
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: ${{ inputs.working-directory }}/go.mod
-          cache: false # the runner user's ~/go persists between jobs: no tar restore/save each run
+          # Container jobs (the default runner) start with an empty ~/go: restore
+          # it from the runner's cache server, keyed on go.mod and go.sum (a module
+          # without dependencies has no go.sum).
+          cache: true
+          cache-dependency-path: ${{ inputs.working-directory }}/go.*
 
       # gofmt -l exits 0 on unformatted files, so the output is the check.
       # -r: no .go files must not hang gofmt on stdin. vendor/ and testdata/

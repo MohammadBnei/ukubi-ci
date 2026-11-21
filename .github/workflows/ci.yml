@@ -8,7 +8,49 @@ on:
 permissions:
   contents: read
 
+# Forgejo honours only workflow-level concurrency: a newer PR push cancels the
+# older run; main runs queue (release.yml pushes a tag there).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # Which self-tests a PR needs: each runs only when its workflow or fixture
+  # changed (ci.yml or actionlint.yaml changes run all). A push to main runs
+  # all. Decided in shell; the jobs below only compare these outputs.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.d.outputs.go }}
+      status: ${{ steps.d.outputs.status }}
+      bun: ${{ steps.d.outputs.bun }}
+      rust: ${{ steps.d.outputs.rust }}
+      image: ${{ steps.d.outputs.image }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+      # test/check.sh runs this block verbatim; keep the name.
+      - name: Pick the self-tests
+        id: d
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          all=false files=''
+          # --no-renames: a moved file counts on both its old and new path. A diff
+          # that fails runs everything rather than nothing.
+          if [ -z "$BASE" ]; then all=true; else files=$(git diff --no-renames --name-only "$BASE"...HEAD) || all=true; fi
+          if grep -qE '^\.github/(workflows/ci\.yml|actionlint\.yaml)$' <<<"$files"; then all=true; fi
+          out() { # name regex
+            if $all || grep -qE "$2" <<<"$files"; then echo "$1=true"; else echo "$1=false"; fi >> "$GITHUB_OUTPUT"
+          }
+          out go '^(\.github/workflows/go-checks\.yml|test/fixture-go/)'
+          out status '^(\.github/workflows/go-checks\.yml|standard-status/)'
+          out bun '^(\.github/workflows/bun-checks\.yml|test/fixture-bun/)'
+          out rust '^(\.github/workflows/rust-checks\.yml|test/fixture-rust/)'
+          out image '^(\.github/workflows/(image|image-build|release)\.yml|test/fixture/|cliff\.toml$)'
+
   actionlint:
     runs-on: ubuntu-latest
     env:
@@ -69,7 +111,8 @@ jobs:
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: test/fixture-go/go.mod
-          cache: false # the runner user's ~/go persists between jobs
+          cache: true
+          cache-dependency-path: '**/go.mod'
       - name: shellcheck
         run: shellcheck test/check.sh test/reusable.sh test/release.sh
       # release.yml's own install block: one copy of the git-cliff pin.
@@ -96,8 +139,8 @@ jobs:
   # skips Infisical, login, push and deploy). The grants are needed even so:
   # GitHub checks the nested jobs' permissions before any job starts.
   self-test:
-    if: github.event_name == 'pull_request'
-    needs: release-self-test
+    if: github.event.pull_request && needs.changes.outputs.image == 'true'
+    needs: [release-self-test, changes]
     permissions:
       contents: write
       id-token: write
@@ -116,6 +159,8 @@ jobs:
 
   # The C2 reusable checks, each called the way a caller will, on its fixture.
   go-self-test:
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/go-checks.yml
@@ -127,6 +172,8 @@ jobs:
       govulncheck: true
 
   status-self-test:
+    needs: changes
+    if: needs.changes.outputs.status == 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/go-checks.yml
@@ -135,6 +182,8 @@ jobs:
       golangci-lint-version: v2.14.0
 
   bun-self-test:
+    needs: changes
+    if: needs.changes.outputs.bun == 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/bun-checks.yml
@@ -144,6 +193,8 @@ jobs:
       lint-script: lint
 
   rust-self-test:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/rust-checks.yml
@@ -154,7 +205,8 @@ jobs:
       audit-ignore: RUSTSEC-2026-0414
 
   image-build-self-test:
-    needs: release-self-test
+    needs: [release-self-test, changes]
+    if: needs.changes.outputs.image == 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/image-build.yml
@@ -170,6 +222,7 @@ jobs:
 
   # This PR's own commits, with this repo's rule. On push it is the no-op path.
   trailers-self-test:
+    # Always: it checks the PR's own commits and title, whatever they touch.
     permissions:
       contents: read
     uses: ./.github/workflows/trailers.yml
