@@ -1,9 +1,14 @@
 # Runs the dev-db and dev-db-release actions against a throwaway IntegreSQL +
 # Postgres started as job services. It runs on the podman runner
 # (ubuntu-latest): the host runner has no container engine for jobs.
-# roles.sql runs before the first IntegreSQL call, which is when IntegreSQL
-# first dials Postgres. test/dev-db/run.sh does the same locally with
-# test/dev-db/compose.yml.
+# IntegreSQL dials Postgres at startup (InitManager: 30 tries 1 s apart, then
+# it exits) and listens only once that works, so roles.sql must land within
+# about 30 s of the services starting: it is the first step after checkout,
+# with no install in between when the image has psql. Until IntegreSQL
+# listens, the action retries POST (000/503); timeout-seconds 120 makes an
+# IntegreSQL that gave up fail the job in 2 min, not at its 10 min timeout.
+# Covers build, recreate, reuse and keep; test/dev-db/run.sh adds the cancel,
+# kill, exhausted-pool and two-repo cases locally with test/dev-db/compose.yml.
 name: dev-db-selftest
 
 on:
@@ -38,18 +43,19 @@ jobs:
           INTEGRESQL_ROOT_TEMPLATE: template1
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-      - name: Install psql
-        run: command -v psql || { sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client; }
-      - name: Create IntegreSQL's roles
+      - name: Install psql and create IntegreSQL's roles
         env:
           PGPASSWORD: pgpass
-        run: psql -h postgres -U postgres -v ON_ERROR_STOP=1 -f test/dev-db/roles.sql
+        run: |
+          command -v psql || { sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client; }
+          psql -h postgres -U postgres -v ON_ERROR_STOP=1 -f test/dev-db/roles.sql
       - name: Build the template and get a database
         uses: ./actions/dev-db
         with:
           integresql-url: http://integresql:5000
           postgres-host: postgres
           template-hash: selftest
+          timeout-seconds: '120'
           seed-command: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'CREATE TABLE t(id int); INSERT INTO t VALUES (1)'
       - run: bash test/dev-db/check.sh seeded
       - name: Release (recreate)

@@ -11,15 +11,21 @@ bad() { echo "FAIL $1"; fails=$((fails + 1)); }
 yq '.runs.steps[0].run' "$A/dev-db/action.yml" > "$T/get.sh"
 yq '.runs.steps[0].run' "$A/dev-db-release/action.yml" > "$T/rel.sh"
 [ -s "$T/get.sh" ] && [ -s "$T/rel.sh" ] || { echo "FAIL extract run blocks"; exit 1; }
+# The deadline checks (4c, 4e) would wait timeout-seconds' 120 s floor; fast.sh
+# is get.sh with only that floor lowered. Everything else runs get.sh itself.
+sed 's/"\$timeout" -ge 120 ]/"$timeout" -ge 1 ]/' "$T/get.sh" > "$T/fast.sh"
+cmp -s "$T/get.sh" "$T/fast.sh" && { echo "FAIL lower the timeout floor in fast.sh"; exit 1; }
 
 docker compose -f "$D/compose.yml" up -d --wait >/dev/null 2>&1 || { echo "FAIL compose up"; exit 1; }
 sleep 3
 : > "$T/env"
-# get hash seed [ttl] [files]: the inputs' defaults, then the overrides.
+# get hash seed [ttl]: the inputs' defaults, then the overrides. S=script,
+# TO=timeout-seconds, KEEP=keep.
 get() {
   env GITHUB_ENV="$T/env" IN_URL=http://localhost:15000 IN_TOKEN= IN_HASH="$1" IN_PATHS="migrations seeds" \
-    IN_SEED="$2" IN_PORT=15432 IN_SSLMODE=disable IN_TTL="${3:-2}" IN_KEEP=false IN_TIMEOUT=30 bash "$T/get.sh"
+    IN_SEED="$2" IN_PORT=15432 IN_SSLMODE=disable IN_TTL="${3:-2}" IN_KEEP="${KEEP:-false}" IN_TIMEOUT="${TO:-120}" bash "${S:-$T/get.sh}"
 }
+pgsu() { PGPASSWORD=pgpass psql -h localhost -p 15432 -U postgres -Atqc "$1"; }
 load() { set -a; # shellcheck disable=SC1090
   . "$T/env"; set +a; }
 release() { (load; IN_TOKEN= IN_KEEP="${1:-false}" bash "$T/rel.sh"); }
@@ -59,7 +65,7 @@ out=$(get c1 "$seed" 2>&1) && grep -q 'is new; building it' <<<"$out" && (load; 
 get k1 "sleep 60" >/dev/null 2>&1 & p=$!
 sleep 2; pkill -KILL -f "$T/get.sh"; wait "$p" 2>/dev/null
 : > "$T/env"
-out=$(env GITHUB_ENV="$T/env" IN_URL=http://localhost:15000 IN_TOKEN= IN_HASH=k1 IN_PATHS=x IN_SEED="$seed" IN_PORT=15432 IN_SSLMODE=disable IN_TTL=2 IN_KEEP=false IN_TIMEOUT=5 bash "$T/get.sh" 2>&1) \
+out=$(S=$T/fast.sh TO=5 get k1 "$seed" 2>&1) \
   && grep -q 'discarding it and building it here' <<<"$out" && ok "killed builder reclaimed after timeout" || bad "killed builder: $out"
 
 # 4d. Two repos with the same template-hash get different templates.
@@ -67,16 +73,50 @@ key_of() { GITHUB_REPOSITORY=$1 get r1 true 2>/dev/null | sed -n 's/.*ready (tem
 k_a=$(key_of a/x); k_b=$(key_of b/x)
 [ -n "$k_a" ] && [ -n "$k_b" ] && [ "$k_a" != "$k_b" ] && ok "repo is part of the template key" || bad "repo key: '$k_a' '$k_b'"
 
+# 4e. A FINALIZED template whose pool is all handed out answers GET with 500
+# "timeout when waiting for ready db", not "unexpected template state"
+# (compose.yml: max pool 3, minimal lifetime 10 min, get timeout 3 s). The
+# waiter keeps polling, fails at its deadline and never deletes the template,
+# which would drop the three databases other jobs hold.
+for i in 1 2 3; do : > "$T/env"; get x1 "$seed" >/dev/null 2>&1 || bad "exhaust pool: get $i"; done
+xkey=$(sed -n 's/^DEV_DB_TEMPLATE_HASH=//p' "$T/env")
+: > "$T/env"
+out=$(S=$T/fast.sh TO=8 get x1 "exit 1" 2>&1)
+rc=$?
+n=$(pgsu "SELECT count(*) FROM pg_database WHERE datname LIKE '%${xkey:-none}%'")
+[ "$rc" != 0 ] && grep -q 'returned 500 (timeout when waiting for ready db); still polling' <<<"$out" \
+  && grep -q 'no database after 8s; last GET returned 500 (timeout when waiting for ready db)' <<<"$out" \
+  && ! grep -q discarding <<<"$out" && [ "$n" = 4 ] \
+  && ok "exhausted pool: waiter fails without deleting the template" || bad "exhausted pool (rc=$rc dbs=$n): $out"
+
 # 5. Default hash from files; a changed file changes the template.
 mkdir "$T/w" && ( cd "$T/w" && mkdir migrations && echo a > migrations/1.sql
-  h1=$(GITHUB_ENV="$T/e1" IN_URL=http://localhost:15000 IN_TOKEN= IN_HASH= IN_PATHS=migrations IN_SEED=true IN_PORT=15432 IN_SSLMODE=disable IN_TTL=0 IN_KEEP=false IN_TIMEOUT=30 bash "$T/get.sh" >/dev/null 2>&1; sed -n 's/^DEV_DB_TEMPLATE_HASH=//p' "$T/e1")
+  h1=$(GITHUB_ENV="$T/e1" IN_URL=http://localhost:15000 IN_TOKEN= IN_HASH= IN_PATHS=migrations IN_SEED=true IN_PORT=15432 IN_SSLMODE=disable IN_TTL=0 IN_KEEP=false IN_TIMEOUT=120 bash "$T/get.sh" >/dev/null 2>&1; sed -n 's/^DEV_DB_TEMPLATE_HASH=//p' "$T/e1")
   echo b > migrations/1.sql
-  h2=$(GITHUB_ENV="$T/e2" IN_URL=http://localhost:15000 IN_TOKEN= IN_HASH= IN_PATHS=migrations IN_SEED=true IN_PORT=15432 IN_SSLMODE=disable IN_TTL=0 IN_KEEP=false IN_TIMEOUT=30 bash "$T/get.sh" >/dev/null 2>&1; sed -n 's/^DEV_DB_TEMPLATE_HASH=//p' "$T/e2")
+  h2=$(GITHUB_ENV="$T/e2" IN_URL=http://localhost:15000 IN_TOKEN= IN_HASH= IN_PATHS=migrations IN_SEED=true IN_PORT=15432 IN_SSLMODE=disable IN_TTL=0 IN_KEEP=false IN_TIMEOUT=120 bash "$T/get.sh" >/dev/null 2>&1; sed -n 's/^DEV_DB_TEMPLATE_HASH=//p' "$T/e2")
   [ -n "$h1" ] && [ -n "$h2" ] && [ "$h1" != "$h2" ] ) && ok "file hash changes with content" || bad "file hash"
 
 # 6. keep=true leaves the database; bad inputs fail early.
+: > "$T/env"; get kp true >/dev/null 2>&1
 (load; IN_KEEP=true bash "$T/rel.sh" 2>&1 | grep -q 'leaving database') && ok "keep=true skips recreate" || bad "keep"
-get 'bad hash!' true >/dev/null 2>&1 && bad "bad hash accepted" || ok "bad template-hash refused"
-env GITHUB_ENV="$T/e3" IN_URL=http://localhost:15000 IN_TOKEN= IN_HASH=x IN_PATHS=x IN_SEED=true IN_PORT=15432 IN_SSLMODE=disable IN_TTL=0 IN_KEEP=true IN_TIMEOUT=5 bash "$T/get.sh" >/dev/null 2>&1 && bad "keep=true with ttl=0 accepted" || ok "keep=true with ttl=0 refused"
+# refused INPUT EXPECTED-ERROR CMD...: the step fails with that error.
+refused() { local name=$1 want=$2 o; shift 2
+  o=$("$@" 2>&1) && { bad "$name accepted"; return; }
+  grep -q "$want" <<<"$o" && ok "$name refused" || bad "$name: $o"; }
+: > "$T/env"
+refused "bad template-hash" 'template-hash must match' get 'bad hash!' true
+KEEP=true refused "keep=true with ttl=0" 'keep=true needs ttl above 0' get x true 0
+KEEP=true refused "keep=true with ttl=00" 'keep=true needs ttl above 0' get x true 00
+TO=119 refused "timeout-seconds 119" 'timeout-seconds must be at least 120' get x true
+
+# 7. IntegreSQL not up yet (000, as on a runner whose service still waits for
+# its roles): POST is retried until it answers. Last: the restart drops
+# IntegreSQL's in-memory templates.
+docker compose -f "$D/compose.yml" stop integresql >/dev/null 2>&1
+: > "$T/env"
+( get p1 "$seed" > "$T/p1.out" 2>&1 ) & p=$!
+sleep 4; docker compose -f "$D/compose.yml" start integresql >/dev/null 2>&1
+wait "$p" && grep -q 'IntegreSQL is not up yet, retrying' "$T/p1.out" && (load; bash "$D/check.sh" seeded) >/dev/null \
+  && ok "POST retried until IntegreSQL is up" || bad "POST retry: $(cat "$T/p1.out")"
 
 echo; [ "$fails" = 0 ] && echo "all dev-db checks passed" || { echo "$fails failed"; exit 1; }

@@ -473,12 +473,25 @@ against the template database, then `PUT /templates/<key>`. A template this job
 created but did not finalize (failed seed, cancel, step timeout, failed PUT) is
 deleted by an exit trap, so the next run rebuilds. A 423 means another job built
 it or is building it: the action loops on `GET /templates/<key>/tests`, which
-IntegreSQL holds open until the template is final. If it is still not final
-after `timeout-seconds` (its builder was killed outright), the action deletes it
-and builds it once itself. It then writes `DATABASE_URL` (password masked) and
+IntegreSQL holds open until the template is final. If the last answer at
+`timeout-seconds` is still IntegreSQL's not-final 500 (`unexpected template
+state`: its builder was killed outright), the action deletes it and builds it
+once itself. Any other 500, such as `timeout when waiting for ready db` when
+the template's pool (`INTEGRESQL_TEST_MAX_POOL_SIZE`) is all handed out, keeps
+it polling and then fails the step without the delete, which would drop every
+other job's database of that template. A refused connection or a 503
+(IntegreSQL not up yet) is retried until `timeout-seconds` too, for `POST` as
+for `GET`. It then writes `DATABASE_URL` (password masked) and
 `DEV_DB_*` to `GITHUB_ENV`, and sets the expiry with `COMMENT ON DATABASE`
 (`{"ttl":"<RFC 3339 UTC>","repo":..,"run":..,"keep":..}`), the format
 infra-bootstrap's TTL sweeper reads.
+
+`keep: true` is best effort on IntegreSQL v1.1.0. A kept database stays handed
+out in the template's pool; once that pool is full and short of ready
+databases, IntegreSQL recreates the oldest handed-out one after 250 ms
+(`pool.autoCleanDirty`, `INTEGRESQL_TEST_DB_MINIMAL_LIFETIME_MS`), kept ones
+included, and the recreated database is a fresh copy without the ttl comment.
+Inspect a kept database soon, or copy what you need out of it.
 
 The credentials come from IntegreSQL. IntegreSQL v1.1.0 hands every caller,
 seeder and test alike, its own manager role, so that role must not be a
@@ -498,8 +511,8 @@ token to its repo's keys and hand out a per-database role.
 | `postgres-port` | `5432` | IntegreSQL reports its in-cluster address, so only the port comes from the caller |
 | `sslmode` | `disable` | `sslmode` in `DATABASE_URL`; the dev Postgres is LAN-only without TLS |
 | `ttl` | `2` | hours until the sweeper may drop the database; `0` skips the comment; no psql on the runner warns and skips |
-| `keep` | `false` | copy of the release input, stored in the comment; `true` needs `ttl` above 0 and psql |
-| `timeout-seconds` | `600` | wait for another job's template build |
+| `keep` | `false` | copy of the release input, stored in the comment; `true` needs `ttl` above 0 and psql; not durable, see above |
+| `timeout-seconds` | `600` | wait for IntegreSQL and another job's template build; at least `120`, and longer than `seed-command` takes, or a waiter reclaims a template still being seeded |
 
 `dev-db-release` (inputs `token`, `keep`) is a separate action because composite
 actions have no post step. It recreates the database unless `keep` is `true`; a
@@ -508,7 +521,12 @@ step in the job it does nothing.
 
 Self-test: `test/dev-db/run.sh` runs both actions' blocks against
 `test/dev-db/compose.yml` (IntegreSQL + Postgres 18 by digest, both roles
-non-superusers as on the dev Postgres, no new Docker network), including a
-cancelled seed, a killed builder and two repos with one hash;
-`.github/workflows/dev-db-selftest.yml` does the same through `uses: ./actions/...`
-on a runner with docker compose and psql.
+non-superusers as on the dev Postgres, no new Docker network): build, recreate,
+reuse, keep, the waiter, a failed and a cancelled seed, a killed builder, an
+exhausted pool, two repos with one hash, bad inputs and an IntegreSQL that is
+not up yet. `.github/workflows/dev-db-selftest.yml` runs IntegreSQL and Postgres
+as job services and covers build, recreate, reuse and keep only, through
+`uses: ./actions/...`. It reaches them by service name (`postgres`,
+`integresql`), which works on a container job (the Forgejo podman runner,
+`ubuntu-latest`); the cancel, kill, exhausted-pool and two-repo cases run
+locally with `test/dev-db/run.sh`.

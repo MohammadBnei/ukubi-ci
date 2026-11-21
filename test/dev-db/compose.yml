@@ -34,4 +34,12 @@ services:
       # A GET on an unfinished template answers 500 after this, not 60 s,
       # so the killed-builder check in run.sh takes seconds.
       INTEGRESQL_TEMPLATE_FINALIZE_TIMEOUT_MS: "3000"
+      # A small pool that stays full, for run.sh's exhausted-pool check (4e):
+      # 3 databases per template, a handed-out one is not auto-recreated for
+      # 10 min (pool.autoCleanDirty), and a GET on a full pool answers 500
+      # "timeout when waiting for ready db" after 3 s.
+      INTEGRESQL_TEST_INITIAL_POOL_SIZE: "1"
+      INTEGRESQL_TEST_MAX_POOL_SIZE: "3"
+      INTEGRESQL_TEST_DB_MINIMAL_LIFETIME_MS: "600000"
+      INTEGRESQL_TEST_DB_GET_TIMEOUT_MS: "3000"
     ports: ["15000:5000"]
