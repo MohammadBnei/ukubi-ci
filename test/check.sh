@@ -327,7 +327,7 @@ if yq '.jobs.deploy.if' "$WF" | grep -qF '&& inputs.deploy'; then ok "image.yml 
 for o in tag commit digest; do
   if [ "$(yq ".on.workflow_call.outputs.$o.value" "$WF")" = "\${{ jobs.build.outputs.$o }}" ]; then ok "image.yml output $o comes from the build job"; else bad "image.yml output $o"; fi
 done
-ev="(github.event_name == 'push' || github.event_name == 'workflow_dispatch')"
+ev="(github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))"
 br="github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"
 if [ "$(yq '.jobs.deploy.if' "$DWF")" = "$ev && $br" ] && [[ "$(yq '.jobs.deploy.if' "$WF")" == *"$ev"*"$br"* ]]; then
   ok "deploy.yml deploys on the same events and branch as image.yml"
@@ -456,6 +456,21 @@ keep "missing file fails" 1 -
 keep "empty value fails" 1 "REGISTRY_PASSWORD=''"
 keep "multi-line value fails" 1 "REGISTRY_PASSWORD='line1
 line2'"
+
+# Forgejo runs a called workflow's jobs with event_name workflow_call; the
+# caller's event survives only in the payload. Every event gate and every
+# EVENT value in the reusable workflows must be exactly one of these two
+# expressions (an image that never publishes, a release that is always a dry
+# run, or a PR that publishes, otherwise).
+gate="(github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))"
+emap="\${{ github.event_name != 'workflow_call' && github.event_name || github.event.pull_request && 'pull_request' || github.event.workflow_run && 'workflow_run' || github.event.pusher && 'push' || github.event.workflow && 'workflow_dispatch' || 'workflow_call' }}"
+for f in release image deploy trailers; do
+  w=.github/workflows/$f.yml
+  # Blank out the two allowed forms; any github.event_name left is a gate that skips them.
+  left=$(G=$gate E=$emap python3 -c 'import os,sys; s=open(sys.argv[1]).read().replace(os.environ["G"],"").replace(os.environ["E"],""); print(s.count("github.event_name"))' "$w")
+  if [ "$left" = 0 ]; then ok "$f.yml: every event read is the workflow_call-aware gate or map"
+  else bad "$f.yml: $left event read(s) outside the canonical gate/map"; fi
+done
 
 echo "failures: $fails"
 [ "$fails" = 0 ]

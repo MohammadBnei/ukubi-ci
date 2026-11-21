@@ -50,7 +50,9 @@ jobs:
         shell: bash
     steps:
       # The head commit, full history, no token: the scan only reads git objects.
-      - if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
+      # It also runs for pull_request_target callers, so this job must stay free
+      # of secrets and of steps that execute the checked-out tree.
+      - if: github.event.pull_request
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -62,7 +64,7 @@ jobs:
       # test/reusable.sh runs this block verbatim against throwaway repos; keep the name.
       - name: Check commits and PR text
         env:
-          EVENT: ${{ github.event_name }}
+          EVENT: ${{ github.event_name != 'workflow_call' && github.event_name || github.event.pull_request && 'pull_request' || github.event.workflow_run && 'workflow_run' || github.event.pusher && 'push' || github.event.workflow && 'workflow_dispatch' || 'workflow_call' }}
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}

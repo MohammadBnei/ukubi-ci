@@ -191,7 +191,7 @@ jobs:
       - name: Decide whether this run may publish
         id: publish
         env:
-          EVENT: ${{ github.event_name }}
+          EVENT: ${{ github.event_name != 'workflow_call' && github.event_name || github.event.pull_request && 'pull_request' || github.event.workflow_run && 'workflow_run' || github.event.pusher && 'push' || github.event.workflow && 'workflow_dispatch' || 'workflow_call' }}
         run: |
           set -euo pipefail
           # An allowlist: any other event (pull_request, pull_request_target, anything new) is build-only.
@@ -325,7 +325,7 @@ jobs:
       # verbatim; keep the name.
       - name: Pick the Infisical login
         if: >-
-          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))
           && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
           && needs.guard.outputs.publish == 'true'
         id: infisical
@@ -351,7 +351,7 @@ jobs:
 
       - name: Read the registry password from Infisical
         if: >-
-          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))
           && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
           && needs.guard.outputs.publish == 'true'
         uses: Infisical/secrets-action@a663da43e1541832614bfd9dcf9ab67381ea2b98 # v1.0.12
@@ -375,7 +375,7 @@ jobs:
       # test/check.sh runs this block verbatim; keep the name.
       - name: Keep only the registry password
         if: >-
-          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))
           && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
           && needs.guard.outputs.publish == 'true'
         run: |
@@ -398,7 +398,7 @@ jobs:
 
       - name: Registry login
         if: >-
-          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))
           && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
           && needs.guard.outputs.publish == 'true'
         run: |
@@ -415,7 +415,7 @@ jobs:
       - name: Push
         id: push
         if: >-
-          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))
           && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
           && needs.guard.outputs.publish == 'true'
         env:
@@ -460,7 +460,7 @@ jobs:
       # The runner user cannot sudo rm, but buildah can clear its own entry.
       - name: Registry logout
         if: >-
-          always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+          always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))
           && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
           && needs.guard.outputs.publish == 'true'
         run: sudo -n buildah logout --authfile "$RUNNER_TEMP/registry-auth.json" "$REGISTRY" || true
@@ -471,7 +471,7 @@ jobs:
     # deploy: false leaves the bump to deploy.yml (several images, one commit).
     if: >-
       always() && needs.build.result == 'success' && inputs.deploy
-      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))
       && (inputs.values-files != '' || inputs.values-file != '')
       && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
       && needs.guard.outputs.publish == 'true'

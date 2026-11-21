@@ -123,3 +123,20 @@ pilot first:
   `actionlint` and `check` jobs run there).
 - `github.event.repository.default_branch` is set on push and dispatch, since
   every publish and deploy gate compares against it.
+
+## Known Forgejo 15 behaviour
+
+- **A called workflow sees `github.event_name == 'workflow_call'`**, not the
+  caller's event. The caller's payload is passed through unchanged, so the
+  event gates in release.yml, image.yml, deploy.yml and trailers.yml read it
+  from there: `pull_request` in the payload means a PR, `pusher` a push,
+  `workflow` a dispatch, `workflow_run` never publishes. Anything else (schedule
+  sends only `action`) is treated as build-only. On GitHub
+  `event_name` is already the caller's event and the extra clause never
+  applies. `test/check.sh` fails on any `github.event_name` read in these files that is
+  not one of the two canonical expressions.
+- **image.yml and image-build.yml show as failing runs in this repo.** Forgejo
+  does not parse `on.workflow_call.secrets` (forgejo#14674) and reports the
+  file as a broken top-level workflow. The calls themselves work. The block
+  stays, because GitHub needs it for callers that map secrets by name.
+

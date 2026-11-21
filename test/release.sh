@@ -214,7 +214,7 @@ check "k: checkout full history, persist-credentials false" \
   "[ \"\$(yq -o=json -I0 '.jobs.release.steps[0].with' '$WF')\" = '{\"fetch-depth\":0,\"persist-credentials\":false}' ]"
 check "k: install checks sha256" "step 'Install git-cliff' | grep -q 'sha256sum -c'"
 check "k: TOKEN only on a real release" \
-  "[ \"\$(yq '.jobs.release.steps[] | select(.name == \"Release\") | .env.TOKEN' '$WF')\" = \"\\\${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.token || '' }}\" ]"
+  "[ \"\$(yq '.jobs.release.steps[] | select(.name == \"Release\") | .env.TOKEN' '$WF')\" = \"\\\${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow)) && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.token || '' }}\" ]"
 check "k: TOKEN only in the Release step" "[ \"\$(yq '[.jobs.release.steps[] | select(.env.TOKEN) | .name] | join(\",\")' '$WF')\" = Release ]"
 check "k: every fetch and push carries the auth header" \
   "[ \"\$(grep -cE 'git .*(fetch|push) ' '$T/rel.sh')\" = 2 ] && ! grep -E 'git .*(fetch|push) ' '$T/rel.sh' | grep -vq 'http.extraheader=\"\$hdr\"'"
