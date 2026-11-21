@@ -471,17 +471,32 @@ of sha256(`GITHUB_REPOSITORY`, hash), so two repos never share a template by
 accident. A 200 means this job builds the template: it runs `seed-command`
 against the template database, then `PUT /templates/<key>`. A template this job
 created but did not finalize (failed seed, cancel, step timeout, failed PUT) is
-deleted by an exit trap, so the next run rebuilds. A 423 means another job built
-it or is building it: the action loops on `GET /templates/<key>/tests`, which
-IntegreSQL holds open until the template is final. If the last answer at
-`timeout-seconds` is still IntegreSQL's not-final 500 (`unexpected template
-state`: its builder was killed outright), the action deletes it and builds it
-once itself. Any other 500, such as `timeout when waiting for ready db` when
-the template's pool (`INTEGRESQL_TEST_MAX_POOL_SIZE`) is all handed out, keeps
-it polling and then fails the step without the delete, which would drop every
-other job's database of that template. A refused connection or a 503
-(IntegreSQL not up yet) is retried until `timeout-seconds` too, for `POST` as
-for `GET`. It then writes `DATABASE_URL` (password masked) and
+deleted by an exit trap, so the next run rebuilds; that trap is the only place
+the action ever deletes a template, and a PUT answering 404 (no longer ours)
+skips it. A 423 means another job built it or is building it: the action loops
+on `GET /templates/<key>/tests`, which IntegreSQL holds open until the template
+is final. A waiter never deletes. Any 500, IntegreSQL's not-final `unexpected
+template state` or another such as `timeout when waiting for ready db` when the
+template's pool (`INTEGRESQL_TEST_MAX_POOL_SIZE`) is all handed out, keeps it
+polling until `timeout-seconds`, then fails the step. A refused connection or a
+503 (IntegreSQL not up yet) is retried until `timeout-seconds` too, for `POST`
+as for `GET`.
+
+A builder killed with SIGKILL (not TERM) runs no trap and leaves its template
+unfinished: every job with that key then fails at `timeout-seconds` with an
+error naming the key and the recovery. Check no job is still building it, then
+delete it and rerun:
+
+```sh
+curl -X DELETE [-H 'Authorization: Bearer <token>'] <integresql-url>/api/v1/templates/<key>
+```
+
+The action does not reclaim such a template itself: two waiters reclaiming the
+same dead template race, and the later one deletes the other's fresh build and
+the database it already handed out. `INTEGRESQL_TEMPLATE_FINALIZE_TIMEOUT_MS`
+(how long IntegreSQL holds a GET on an unfinished template, 60 s by default)
+must stay below the action's 90 s curl `--max-time`, or every such GET times
+out on the client. It then writes `DATABASE_URL` (password masked) and
 `DEV_DB_*` to `GITHUB_ENV`, and sets the expiry with `COMMENT ON DATABASE`
 (`{"ttl":"<RFC 3339 UTC>","repo":..,"run":..,"keep":..}`), the format
 infra-bootstrap's TTL sweeper reads.
@@ -508,11 +523,11 @@ token to its repo's keys and hand out a per-database role.
 | `hash-paths` | `migrations seeds` | space-separated files or directories hashed when `template-hash` is empty; missing ones are skipped, none found is an error |
 | `seed-command` | | runs only when the template is built, with `DATABASE_URL` set to it |
 | `postgres-host` | `''` | Postgres host when it is not on the IntegreSQL host (ukubi: `dev-postgres.bnei.lan`) |
-| `postgres-port` | `5432` | IntegreSQL reports its in-cluster address, so only the port comes from the caller |
+| `postgres-port` | `5432` | 1-65535; IntegreSQL reports its in-cluster address, so both host and port come from the caller |
 | `sslmode` | `disable` | `sslmode` in `DATABASE_URL`; the dev Postgres is LAN-only without TLS |
 | `ttl` | `2` | hours until the sweeper may drop the database; `0` skips the comment; no psql on the runner warns and skips |
 | `keep` | `false` | copy of the release input, stored in the comment; `true` needs `ttl` above 0 and psql; not durable, see above |
-| `timeout-seconds` | `600` | wait for IntegreSQL and another job's template build; at least `120`, and longer than `seed-command` takes, or a waiter reclaims a template still being seeded |
+| `timeout-seconds` | `600` | wait for IntegreSQL and another job's template build; at least `120`, and longer than `seed-command` takes, or waiters give up on a build that would have finished; waiters never delete |
 
 `dev-db-release` (inputs `token`, `keep`) is a separate action because composite
 actions have no post step. It recreates the database unless `keep` is `true`; a
@@ -522,8 +537,8 @@ step in the job it does nothing.
 Self-test: `test/dev-db/run.sh` runs both actions' blocks against
 `test/dev-db/compose.yml` (IntegreSQL + Postgres 18 by digest, both roles
 non-superusers as on the dev Postgres, no new Docker network): build, recreate,
-reuse, keep, the waiter, a failed and a cancelled seed, a killed builder, an
-exhausted pool, two repos with one hash, bad inputs and an IntegreSQL that is
+reuse, keep, the waiter, a failed and a cancelled seed, a killed builder with
+two waiters that delete nothing and the manual recovery, an exhausted pool, two repos with one hash, bad inputs and an IntegreSQL that is
 not up yet. `.github/workflows/dev-db-selftest.yml` runs IntegreSQL and Postgres
 as job services and covers build, recreate, reuse and keep only, through
 `uses: ./actions/...`. It reaches them by service name (`postgres`,

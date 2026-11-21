@@ -30,7 +30,7 @@ inputs:
       (ukubi: dev-postgres.bnei.lan, its own LAN address next to IntegreSQL's).
     default: ''
   postgres-port:
-    description: Port of the dev Postgres. IntegreSQL reports its own in-cluster address, so only the caller's port is trusted.
+    description: Port of the dev Postgres. IntegreSQL reports its own in-cluster address, so both host and port come from the caller.
     default: '5432'
   sslmode:
     description: sslmode in DATABASE_URL. The dev Postgres is LAN-only without TLS, hence disable.
@@ -52,8 +52,10 @@ inputs:
   timeout-seconds:
     description: >-
       How long to wait for IntegreSQL and for another job's template build; at
-      least 120, and longer than seed-command takes, or a waiter reclaims a
-      template that is still being seeded.
+      least 120, and longer than seed-command takes, or a waiter gives up on a
+      build that would have finished. A waiter never deletes a template: one
+      left unfinished by a SIGKILLed builder fails waiters with the DELETE to
+      run by hand.
     default: '600'
 runs:
   using: composite
@@ -81,6 +83,7 @@ runs:
         [[ "$IN_PORT" =~ ^[0-9]{1,9}$ && "$IN_TTL" =~ ^[0-9]{1,9}$ && "$IN_TIMEOUT" =~ ^[0-9]{1,9}$ ]] || { echo "::error::postgres-port, ttl and timeout-seconds must be whole numbers"; exit 1; }
         # Base 10, so 00 is 0 and 010 is 10; integer compares from here on.
         port=$((10#$IN_PORT)) ttl=$((10#$IN_TTL)) timeout=$((10#$IN_TIMEOUT))
+        [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { echo "::error::postgres-port must be 1-65535"; exit 1; }
         [ "$timeout" -ge 120 ] || { echo "::error::timeout-seconds must be at least 120 and longer than seed-command takes"; exit 1; }
         [[ "$IN_SSLMODE" =~ ^(disable|allow|prefer|require|verify-ca|verify-full)$ ]] || { echo "::error::sslmode must be a libpq sslmode"; exit 1; }
         if [ "$IN_KEEP" = true ] && [ "$ttl" -eq 0 ]; then echo "::error::keep=true needs ttl above 0, or the sweeper never drops the database"; exit 1; fi
@@ -105,10 +108,13 @@ runs:
 
         body=$(mktemp)
         building='' seedpid=''
-        # A template this job created but did not finalize is deleted on any
-        # exit: a failed seed, a cancel (SIGINT/SIGTERM), a step timeout, a
-        # failed PUT. Otherwise every later run with this key waits on it.
-        # SIGKILL skips this; the waiter's reclaim below covers that.
+        # Only the job that created the template (POST 200: building=1) ever
+        # deletes it, from this trap, before its PUT succeeded: a failed seed,
+        # a cancel (SIGINT/SIGTERM), a step timeout, a failed PUT. Waiters
+        # never delete: two waiters reclaiming one dead template race, and the
+        # later one drops the other's new build and handed-out database.
+        # SIGKILL skips this trap and leaves the template unfinished; waiters
+        # then fail with the DELETE to run by hand.
         cleanup() {
           # The seed runs in its own process group (setsid, where there is one): kill all of it.
           [ -z "$seedpid" ] || kill -TERM -- "-$seedpid" 2>/dev/null || kill -TERM "$seedpid" 2>/dev/null || true
@@ -116,7 +122,7 @@ runs:
             if [ "$(api_max=5 api DELETE "/templates/$key")" = 204 ]; then
               echo "::warning::template $key was not finished; discarded it so the next run rebuilds"
             else
-              echo "::warning::template $key was not finished and discarding it failed; the next run reclaims it after timeout-seconds"
+              echo "::warning::template $key was not finished and discarding it failed; delete it by hand: $(recover)"
             fi
           fi
           rm -f "$body"
@@ -139,6 +145,8 @@ runs:
             '.database.config | "postgres://\(.username|@uri):\(.password|@uri)@\($h):\($p)/\(.database|@uri)?sslmode=\($s)"' "$body"
         }
         mask() { echo "::add-mask::$(jq -r '.database.config.password' "$body")"; }
+        # recover: the manual DELETE for a template stuck unfinished.
+        recover() { echo "curl -X DELETE${IN_TOKEN:+ -H 'Authorization: Bearer <token>'} $url/api/v1/templates/$key"; }
 
         # say TEXT: print TEXT unless it repeats the last line said; keeps polls quiet.
         said=''
@@ -149,10 +157,10 @@ runs:
         # still building, or a builder that died. Every other failure is a 500
         # too, e.g. pool.ErrTimeout "timeout when waiting for ready db" when a
         # FINALIZED template's pool (INTEGRESQL_TEST_MAX_POOL_SIZE) is in use.
-        # Only the first may be reclaimed: DELETE stops the pool and drops every
-        # job's test databases. 404 and 410 mean gone: this job may build it.
+        # Either way the waiter polls until its deadline, then fails. 404 and
+        # 410 mean gone: this job may build it.
         not_final='unexpected template state'
-        deadline=$((SECONDS + timeout)); reclaimed=
+        deadline=$((SECONDS + timeout))
         while :; do
           code=$(api POST /templates "$(jq -nc --arg h "$key" '{hash:$h}')")
           case "$code" in
@@ -169,9 +177,17 @@ runs:
               fi
               wait "$seedpid" || { echo "::error::seed-command failed"; exit 1; }
               seedpid=''
-              code=$(api PUT "/templates/$key")
+              # Hold INT/TERM across the PUT (curl ignores them, this shell
+              # defers them), so a cancel never lands between a PUT that
+              # succeeded and building='' and deletes a final template.
+              sig=''
+              trap 'sig=130' INT; trap 'sig=143' TERM
+              code=$(trap '' INT TERM; api PUT "/templates/$key")
+              # 404: the key is no longer ours (someone deleted it); never delete it.
+              [ "$code" != 204 ] && [ "$code" != 404 ] || building=''
+              trap 'exit 130' INT; trap 'exit 143' TERM
+              [ -z "$sig" ] || exit "$sig"
               [ "$code" = 204 ] || { echo "::error::finalizing template $key returned $code"; exit 1; }
-              building=''
               ;;
             423) echo "template $key exists or is being built; waiting for it" ;;
             # Not up yet: connection refused (000) or manager not ready (503).
@@ -197,14 +213,12 @@ runs:
               *) echo "::error::GET /templates/$key/tests returned $code"; exit 1 ;;
             esac
             if [ "$SECONDS" -ge "$deadline" ]; then
-              if [ "$code" != 500 ] || [ "$msg" != "$not_final" ] || [ -n "$reclaimed" ]; then
-                echo "::error::template $key: no database after ${timeout}s; last GET returned $code${msg:+ ($msg)}"; exit 1
+              if [ "$code" = 500 ] && [ "$msg" = "$not_final" ]; then
+                echo "::error::template $key still not final after ${timeout}s. A builder killed with SIGKILL (not TERM) leaves it unfinished; if no job is building it, delete it and rerun: $(recover)"
+              else
+                echo "::error::template $key: no database after ${timeout}s; last GET returned $code${msg:+ ($msg)}"
               fi
-              # Not final at the deadline: its builder was killed without its trap running. Take it over once.
-              echo "::warning::template $key not final after ${timeout}s; discarding it and building it here"
-              api DELETE "/templates/$key" >/dev/null || true
-              reclaimed=1; deadline=$((SECONDS + timeout))
-              continue 2
+              exit 1
             fi
             sleep 2
           done

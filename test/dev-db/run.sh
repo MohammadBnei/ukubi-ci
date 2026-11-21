@@ -57,16 +57,31 @@ get f1 "$seed" >/dev/null 2>&1 && ok "retry rebuilds after a failed seed" || bad
 get c1 "sleep 30" >/dev/null 2>&1 & p=$!
 sleep 2; pkill -TERM -f "$T/get.sh"; wait "$p" 2>/dev/null
 : > "$T/env"
-# Built at once, not reclaimed after timeout-seconds: the trap deleted it.
+# Built at once: the trap deleted it, so no waiter is left stuck on it.
 out=$(get c1 "$seed" 2>&1) && grep -q 'is new; building it' <<<"$out" && (load; bash "$D/check.sh" seeded) >/dev/null \
   && ok "cancelled seed frees the template" || bad "cancelled seed wedged the template: $out"
 
-# 4c. A builder killed outright (no trap runs) is reclaimed by the next job after timeout-seconds.
+# 4c. A builder killed outright (SIGKILL: no trap runs) leaves the template
+# unfinished. Two waiters at once: both fail at their deadline with the manual
+# DELETE, neither deletes anything (the template database is still there).
+# After that DELETE by hand, the next run builds it.
 get k1 "sleep 60" >/dev/null 2>&1 & p=$!
 sleep 2; pkill -KILL -f "$T/get.sh"; wait "$p" 2>/dev/null
-: > "$T/env"
-out=$(S=$T/fast.sh TO=5 get k1 "$seed" 2>&1) \
-  && grep -q 'discarding it and building it here' <<<"$out" && ok "killed builder reclaimed after timeout" || bad "killed builder: $out"
+( S=$T/fast.sh TO=6 get k1 "$seed" > "$T/wa.out" 2>&1; echo $? > "$T/wa.rc" ) &
+( S=$T/fast.sh TO=6 get k1 "$seed" > "$T/wb.out" 2>&1; echo $? > "$T/wb.rc" ) &
+wait
+recov=$(sed -n 's/.*delete it and rerun: //p' "$T/wa.out")
+kkey=$(sed -n 's/.*template \([0-9a-f]\{32\}\) still not final.*/\1/p' "$T/wa.out")
+tpl=$(pgsu "SELECT count(*) FROM pg_database WHERE datname LIKE 'integresql_template_%${kkey:-none}%'")
+for w in wa wb; do
+  [ "$(cat "$T/$w.rc")" != 0 ] && grep -q 'killed with SIGKILL (not TERM) leaves it unfinished' "$T/$w.out" \
+    && grep -q "curl -X DELETE http://localhost:15000/api/v1/templates/$kkey" "$T/$w.out" && ! grep -q 'is new; building it' "$T/$w.out" \
+    && ok "killed builder: waiter $w fails with the manual DELETE" || bad "killed builder, waiter $w: $(cat "$T/$w.out")"
+done
+[ -n "$kkey" ] && [ "$tpl" = 1 ] && ok "two waiters delete nothing: template $kkey still there" || bad "template gone after the waiters (key '$kkey', dbs $tpl)"
+[ -n "$recov" ] && eval "$recov -sS -o /dev/null -w '%{http_code}'" | grep -q 204 && : > "$T/env" \
+  && out=$(get k1 "$seed" 2>&1) && grep -q 'is new; building it' <<<"$out" && (load; bash "$D/check.sh" seeded) >/dev/null \
+  && ok "after the manual DELETE the next run builds" || bad "manual recovery ($recov): $out"
 
 # 4d. Two repos with the same template-hash get different templates.
 key_of() { GITHUB_REPOSITORY=$1 get r1 true 2>/dev/null | sed -n 's/.*ready (template \([0-9a-f]*\),.*/\1/p'; }
