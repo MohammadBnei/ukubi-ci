@@ -128,9 +128,10 @@ on:
       infisical-auth:
         description: >-
           How the build job logs in to Infisical for REGISTRY_PASSWORD: oidc
-          (the GitHub OIDC identity), universal (universal-auth with the
+          (the GitHub OIDC identity), forgejo (Forgejo's Actions OIDC token
+          against the JWT-auth identity), universal (universal-auth with the
           infisical-client-id and infisical-client-secret secrets), or auto:
-          oidc on github.com, universal anywhere else (Forgejo).
+          oidc on github.com, forgejo anywhere else.
         type: string
         default: auto
     secrets:
@@ -168,6 +169,11 @@ env:
   INFISICAL_PROJECT_SLUG: platform-commons-76pb
   INFISICAL_ENV: dev
   INFISICAL_IDENTITY_ID: 19807471-d73a-48d4-9e58-1dc34255ef77
+  # ci-forgejo-tier1: JWT auth holding Forgejo's Actions signing key, bound to
+  # issuer https://git.bnei.dev/api/actions, aud infisical, repository_owner
+  # MohammadBnei and event_name push/workflow_dispatch; viewer on
+  # platform-commons. A PR run is refused by Infisical itself.
+  INFISICAL_FORGEJO_IDENTITY_ID: e49781b3-9cf2-4964-be5b-da50ce8007a2
 
 jobs:
   # Runs on the passed runner (self-hosted: every job of every repo does).
@@ -210,6 +216,8 @@ jobs:
     permissions:
       contents: read
       id-token: write # the Infisical OIDC login
+    # Forgejo's switch for the Actions OIDC token (it ignores permissions:).
+    enable-openid-connect: true
     outputs:
       tag: ${{ steps.tag.outputs.value }}
       commit: ${{ steps.commit.outputs.value }}
@@ -320,8 +328,10 @@ jobs:
       # the build) and the next step lifts REGISTRY_PASSWORD alone. The identity's
       # bound claims allow push and workflow_dispatch only, so nothing else asks.
       # A dedicated folder (input registry-secret-path) stops them being fetched.
-      # Forgejo Actions has no proven OIDC token for Infisical yet, so off
-      # github.com the login is universal-auth. test/check.sh runs this block
+      # On Forgejo the login is Forgejo's own OIDC token (method forgejo):
+      # Infisical cannot discover a LAN issuer, so the identity is JWT auth
+      # with the key pasted in, which the action does not speak; the step
+      # after it does the two calls with curl. test/check.sh runs this block
       # verbatim; keep the name.
       - name: Pick the Infisical login
         if: >-
@@ -335,14 +345,14 @@ jobs:
         run: |
           set -euo pipefail
           case "$AUTH" in
-            oidc|universal) m=$AUTH ;;
+            oidc|forgejo|universal) m=$AUTH ;;
             # Forgejo's runner sets FORGEJO_ACTIONS (Gitea's GITEA_ACTIONS) and its own server URL.
             auto) if [ -n "${FORGEJO_ACTIONS:-}${GITEA_ACTIONS:-}" ] || [ "${GITHUB_SERVER_URL:-https://github.com}" != https://github.com ]; then
-                    m=universal
+                    m=forgejo
                   else
                     m=oidc
                   fi ;;
-            *) echo "::error::infisical-auth is auto, oidc or universal, got '$AUTH'"; exit 1 ;;
+            *) echo "::error::infisical-auth is auto, oidc, forgejo or universal, got '$AUTH'"; exit 1 ;;
           esac
           if [ "$m" = universal ] && [ "$HAVE_CLIENT" != true ]; then
             echo "::error::the universal Infisical login needs the infisical-client-id and infisical-client-secret secrets"; exit 1
@@ -354,6 +364,7 @@ jobs:
           (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))
           && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
           && needs.guard.outputs.publish == 'true'
+          && steps.infisical.outputs.method != 'forgejo'
         uses: Infisical/secrets-action@a663da43e1541832614bfd9dcf9ab67381ea2b98 # v1.0.12
         with:
           method: ${{ steps.infisical.outputs.method }}
@@ -368,6 +379,42 @@ jobs:
           secret-path: ${{ inputs.registry-secret-path }}
           export-type: file
           file-output-path: /.infisical-secrets
+
+      # Same file and format as the action writes, REGISTRY_PASSWORD only.
+      # Nothing here echoes a token or the value. test/check.sh runs this
+      # block verbatim; keep the name.
+      - name: Read the registry password over Forgejo OIDC
+        if: >-
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' && !github.event.pull_request && !github.event.workflow_run && (github.event.pusher || github.event.workflow))
+          && (!inputs.push-default-branch-only || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+          && needs.guard.outputs.publish == 'true'
+          && steps.infisical.outputs.method == 'forgejo'
+        env:
+          IDENTITY: ${{ env.INFISICAL_FORGEJO_IDENTITY_ID }}
+          SECRET_PATH: ${{ inputs.registry-secret-path }}
+        run: |
+          set -euo pipefail
+          [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] \
+            || { echo "::error::no Forgejo OIDC token: the job needs enable-openid-connect"; exit 1; }
+          jwt=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=infisical" | jq -r '.value // empty')
+          [ -n "$jwt" ] || { echo "::error::Forgejo returned no OIDC token"; exit 1; }
+          echo "::add-mask::$jwt"
+          r=$(jq -n --arg i "$IDENTITY" --arg j "$jwt" '{identityId: $i, jwt: $j}' \
+            | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$INFISICAL_DOMAIN/api/v1/auth/jwt-auth/login")
+          tok=$(jq -r '.accessToken // empty' <<<"$r")
+          [ -n "$tok" ] || { echo "::error::Infisical login refused: $(jq -r '.message // "no message"' <<<"$r")"; exit 1; }
+          echo "::add-mask::$tok"
+          # The token goes to curl on stdin, not argv.
+          v=$(printf 'header = "Authorization: Bearer %s"\n' "$tok" | curl -sSf -K - -G \
+            --data-urlencode "workspaceSlug=$INFISICAL_PROJECT_SLUG" --data-urlencode "environment=$INFISICAL_ENV" \
+            --data-urlencode "secretPath=$SECRET_PATH" "$INFISICAL_DOMAIN/api/v3/secrets/raw/REGISTRY_PASSWORD" \
+            | jq -r '.secret.secretValue // empty')
+          printf 'header = "Authorization: Bearer %s"\n' "$tok" | curl -sS -o /dev/null -K - -X POST \
+            -H 'Content-Type: application/json' --data "{\"accessToken\":\"$tok\"}" "$INFISICAL_DOMAIN/api/v1/auth/token/revoke" || true
+          [ -n "$v" ] || { echo "::error::Infisical returned no REGISTRY_PASSWORD"; exit 1; }
+          echo "::add-mask::$v"
+          printf "REGISTRY_PASSWORD='%s'\n" "$v" > "$GITHUB_WORKSPACE/.infisical-secrets"
 
       # GitHub masks only secrets.*; an unmasked Infisical value leaked a token
       # in this estate once. The file holds KEY='value' lines; only this one

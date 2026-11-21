@@ -1,3 +1,8 @@
 self-hosted-runner:
   labels:
     - ukubi-build
+paths:
+  .github/workflows/image.yml:
+    ignore:
+      # Forgejo's switch for the Actions OIDC token; GitHub has no such key.
+      - 'unexpected key "enable-openid-connect" for "job" section'

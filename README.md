@@ -40,10 +40,6 @@ jobs:
       # pull_request nothing logs in, reads Infisical, pushes or bumps.
       runs-on: '["ukubi-build"]'
       image: drop
-    # Forgejo only (no OIDC there yet): the universal-auth identity's pair.
-    secrets:
-      infisical-client-id: ${{ secrets.INFISICAL_CLIENT_ID }}
-      infisical-client-secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
 ```
 
 hq-style layout (Dockerfile and context in a subdirectory):
@@ -79,7 +75,7 @@ hq-style layout (Dockerfile and context in a subdirectory):
 | `values-key` | `.image.tag` | yq path; the value must be double-quoted, two-space indented |
 | `deploy` | `true` | `false` skips the deploy job (build and push only); bump with [deploy.yml](#deployyml) instead, to roll several images out in one commit |
 | `registry` | `registry.bnei.lan:5000` | |
-| `infisical-auth` | `auto` | the Infisical login: `oidc` (GitHub OIDC, `id-token: write`), `universal` (secrets `infisical-client-id` and `infisical-client-secret`), `auto` = `oidc` on github.com, `universal` elsewhere (Forgejo sets `FORGEJO_ACTIONS` and its own `GITHUB_SERVER_URL`). Checked only on a publishing run, so PRs need neither |
+| `infisical-auth` | `auto` | the Infisical login: `oidc` (GitHub OIDC, `id-token: write`), `forgejo` (Forgejo's Actions OIDC token traded at Infisical's JWT auth, identity `ci-forgejo-tier1`; the build job sets `enable-openid-connect`; see MIGRATION.md), `universal` (secrets `infisical-client-id` and `infisical-client-secret`), `auto` = `oidc` on github.com, `forgejo` elsewhere (Forgejo sets `FORGEJO_ACTIONS` and its own `GITHUB_SERVER_URL`). Checked only on a publishing run, so PRs need neither |
 
 Secret `build-secrets` (optional): multiline `id=value`. Each becomes
 `--secret id=<id>`, read in the Dockerfile with
