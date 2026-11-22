@@ -257,22 +257,27 @@ else
 fi
 
 # 6. Cache model: a pull request restores and saves; everything else never restores.
+# Both save under <base>-<run id> and restore by prefix, so the newest entry wins.
 for f in go rust; do
   w=$f-checks; N=Go; [ "$f" = rust ] && N=Rust
   gate "$w" "Restore $N cache" "steps.cachekeys.outputs.pr == 'true'"
-  gate "$w" "Save $N cache" "success() && steps.restore.outputs.cache-hit != 'true'"
+  gate "$w" "Save $N cache" "success()"
   if yq '.jobs[].steps[] | select(.uses != null) | .uses' "$W/$w.yml" | grep -qE 'rust-cache|actions/cache@'; then
     bad "$w: a combined cache action (it restores on main)"
   else ok "$w: no combined cache action"; fi
   if yq '.jobs[].steps[] | select(.with.cache != null) | .with.cache' "$W/$w.yml" | grep -qx true; then
     bad "$w: a built-in cache is on"
   else ok "$w: no built-in cache"; fi
+  if [ "$(yq ".jobs[].steps[] | select(.name == \"Save $N cache\") | .with.key" "$W/$w.yml")" = '${{ steps.cachekeys.outputs.base }}-${{ github.run_id }}' ]; then
+    ok "$w: saves under <base>-<run id>"; else bad "$w: save key is not <base>-<run id>"; fi
+  if yq ".jobs[].steps[] | select(.name == \"Restore $N cache\") | .with[\"restore-keys\"]" "$W/$w.yml" | grep -q 'outputs.base }}-$'; then
+    ok "$w: restores by the base- prefix"; else bad "$w: no base- restore key"; fi
   extract "$w.yml" "Cache keys" "$T/ck-$f.sh"
 done
 ck() { # want-pr dir ref pr-number
   local out="$T/out"; : > "$out"
   (cd "$2" && REF=$3 PR_NUMBER=$4 EPOCH=e1 RUNNER_OS=Linux GITHUB_OUTPUT=$out bash "$T/ck-$5.sh") >/dev/null 2>&1 || { bad "cache keys $5 $3: script failed"; return; }
-  if grep -qx "pr=$1" "$out" && grep -q '^key=e1-'"$5"'-Linux-' "$out"; then ok "cache keys $5: pr=$1 for '$3' '$4'"
+  if grep -qx "pr=$1" "$out" && grep -q '^base=e1-'"$5"'-Linux-' "$out" && grep -q '^prefix=e1-'"$5"'-Linux-$' "$out"; then ok "cache keys $5: pr=$1 for '$3' '$4'"
   else bad "cache keys $5: want pr=$1 for '$3' '$4': $(cat "$out")"; fi
 }
 if command -v go >/dev/null; then

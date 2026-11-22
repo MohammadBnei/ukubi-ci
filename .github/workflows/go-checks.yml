@@ -97,7 +97,7 @@ jobs:
           h=$({ cat go.mod; [ ! -f go.sum ] || cat go.sum; } | sha256sum | cut -c1-16)
           {
             echo "pr=$pr"
-            echo "key=${EPOCH}-go-${RUNNER_OS}-${h}"
+            echo "base=${EPOCH}-go-${RUNNER_OS}-${h}"
             echo "prefix=${EPOCH}-go-${RUNNER_OS}-"
             echo "mod=$(go env GOMODCACHE)"
             echo "build=$(go env GOCACHE)"
@@ -111,8 +111,12 @@ jobs:
           path: |
             ${{ steps.cachekeys.outputs.mod }}
             ${{ steps.cachekeys.outputs.build }}
-          key: ${{ steps.cachekeys.outputs.key }}
-          restore-keys: ${{ steps.cachekeys.outputs.prefix }}
+          # Never an exact hit (the run id is new): restore-keys picks the newest
+          # entry for this lockfile, else the newest for this runner.
+          key: ${{ steps.cachekeys.outputs.base }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ steps.cachekeys.outputs.base }}-
+            ${{ steps.cachekeys.outputs.prefix }}
 
       # gofmt -l exits 0 on unformatted files, so the output is the check.
       # -r: no .go files must not hang gofmt on stdin. vendor/ and testdata/
@@ -175,13 +179,13 @@ jobs:
           GOBIN="$RUNNER_TEMP/govulncheck" go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
           "$RUNNER_TEMP/govulncheck/govulncheck" ./...
 
-      # Last, so it holds what the tests and tools built. Skipped on an exact
-      # restore hit (the key already exists); on push nothing restored, so it runs.
+      # Last, so it holds what the tests and tools built. Saved under a key with
+      # this run's id, so the newest run's cache is the one the next PR restores.
       - name: Save Go cache
-        if: success() && steps.restore.outputs.cache-hit != 'true'
+        if: success()
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ${{ steps.cachekeys.outputs.mod }}
             ${{ steps.cachekeys.outputs.build }}
-          key: ${{ steps.cachekeys.outputs.key }}
+          key: ${{ steps.cachekeys.outputs.base }}-${{ github.run_id }}

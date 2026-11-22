@@ -57,19 +57,20 @@ jobs:
             [[ "$p" =~ ^[a-z0-9][a-z0-9.+-]+$ ]] || { echo "::error::bad apt package name '$p'"; exit 1; }
           done
 
-      # The runner has no rustup. A pinned rustup-init, checked by sha256, once
-      # per runner user (~/.cargo persists); the toolchain comes from rust-toolchain.toml below.
+      # The Talos image bakes rustup (CARGO_HOME=/opt/cargo). Elsewhere: a pinned
+      # rustup-init, checked by sha256, once per runner user (~/.cargo persists);
+      # the toolchain comes from rust-toolchain.toml below.
       - name: Install rustup
         run: |
           set -euo pipefail
-          if ! PATH="$HOME/.cargo/bin:$PATH" command -v rustup >/dev/null; then
+          if ! PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH" command -v rustup >/dev/null; then
             sha=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
             curl -sSfLo "$RUNNER_TEMP/rustup-init" "https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init"
             echo "$sha  $RUNNER_TEMP/rustup-init" | sha256sum -c -
             chmod +x "$RUNNER_TEMP/rustup-init"
             "$RUNNER_TEMP/rustup-init" -y --profile minimal --default-toolchain none --no-modify-path
           fi
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
 
       # No arguments: installs exactly what rust-toolchain.toml names, components
       # included. The second line fails if that file is not what is active.
@@ -116,8 +117,9 @@ jobs:
           h=$({ cat Cargo.lock; [ ! -f rust-toolchain.toml ] || cat rust-toolchain.toml; } | sha256sum | cut -c1-16)
           {
             echo "pr=$pr"
-            echo "key=${EPOCH}-rust-${RUNNER_OS}-${h}"
+            echo "base=${EPOCH}-rust-${RUNNER_OS}-${h}"
             echo "prefix=${EPOCH}-rust-${RUNNER_OS}-"
+            echo "cargo=${CARGO_HOME:-$HOME/.cargo}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Restore Rust cache
@@ -126,11 +128,15 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            ${{ steps.cachekeys.outputs.cargo }}/registry
+            ${{ steps.cachekeys.outputs.cargo }}/git
             ${{ inputs.working-directory }}/target
-          key: ${{ steps.cachekeys.outputs.key }}
-          restore-keys: ${{ steps.cachekeys.outputs.prefix }}
+          # Never an exact hit (the run id is new): restore-keys picks the newest
+          # entry for this lockfile, else the newest for this runner.
+          key: ${{ steps.cachekeys.outputs.base }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ steps.cachekeys.outputs.base }}-
+            ${{ steps.cachekeys.outputs.prefix }}
 
       - name: Format
         run: cargo fmt --all --check
@@ -142,14 +148,14 @@ jobs:
         run: cargo test --locked --workspace
 
       - name: Save Rust cache
-        if: success() && steps.restore.outputs.cache-hit != 'true'
+        if: success()
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            ${{ steps.cachekeys.outputs.cargo }}/registry
+            ${{ steps.cachekeys.outputs.cargo }}/git
             ${{ inputs.working-directory }}/target
-          key: ${{ steps.cachekeys.outputs.key }}
+          key: ${{ steps.cachekeys.outputs.base }}-${{ github.run_id }}
 
   # Blocking. An accepted advisory goes in audit-ignore (or .cargo/audit.toml)
   # with its reason; this job is never made non-blocking. "error loading
