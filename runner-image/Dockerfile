@@ -10,7 +10,7 @@ ARG GO_SHA256=7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840
 #   <RUNNER_TOOL_CACHE>/<tool>/<version>/<arch>   and   <that path>.complete
 # (tool-cache.ts: cachePath = path.join(_getCacheDirectory(), toolName, version, arch);
 # found only if cachePath and `${cachePath}.complete` both exist). setup-go asks for
-# tool "go", arch x64 on amd64. The catthehacker image sets RUNNER_TOOL_CACHE=/opt/hostedtoolcache.
+# tool "go", arch x64 on amd64. The catthehacker image sets AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache, which the runner uses as RUNNER_TOOL_CACHE.
 RUN set -eux; \
     d=/opt/hostedtoolcache/go/${GO_VERSION}/x64; \
     mkdir -p "$d"; \
