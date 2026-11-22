@@ -232,7 +232,7 @@ LABEL org.opencontainers.image.version=$VERSION
 
 | input | default | |
 |---|---|---|
-| `runs-on` | `["ubuntu-latest"]` | JSON list of runner labels; the default is the Forgejo container runner |
+| `runs-on` | `["k8s-ubuntu-latest"]` | JSON list of runner labels; the default is the Talos runner (ephemeral unprivileged pod, image `ukubi-ci-runner`). CT 103 callers pass `["ubuntu-latest"]` |
 | `config` | | git-cliff config. Empty: `cliff.toml` at the repo root if present, else this repo's [`cliff.toml`](cliff.toml) (embedded in release.yml). A non-empty path must exist |
 | `changelog` | `CHANGELOG.md` | created on the first release |
 
@@ -306,19 +306,32 @@ Sources step and paste the output under a `## Standard status` heading in
 When `gh` is not authenticated the review should write `Standard status not
 generated`. That hq change is not part of this repo.
 
-## Checks: go-checks, bun-checks, rust-checks, image-build, trailers
+## Checks: go-checks, bun-checks, rust-checks, dockerfile-lint, trailers
 
-Five least-privilege checks for a caller's `checks.yml`. Each takes a
-`runs-on` input (a JSON list): `["ubuntu-latest"]` by default, the Forgejo
-container runner, and `["ukubi-build"]` for image-build (buildah). Every job is
-`contents: read`, and none touches Infisical, OIDC or the registry. The checks
-install what else they need (bun from npm, Go through setup-go, rustup, yq); the
-image needs bash, git, curl, jq, tar and xz, plus gcc for `go test -race` and a
-C linker for Rust. Inputs reach scripts through env
-only. `test/reusable.sh` runs their run blocks against throwaway repos, and
-`ci.yml` calls each one on a fixture under `test/`, except image-build: PR image
-builds were dropped in the CI/CD split, and the host runner it defaults to
-serves only ukubi-cd, so no caller is left (it is kept until a release removes it).
+Least-privilege checks for a caller's `checks.yml`. Each takes a `runs-on`
+input (a JSON list) that defaults to `["k8s-ubuntu-latest"]`: the Talos runner,
+an ephemeral one-job pod running as uid 1001 (no root, no apt, no sudo, no
+`services:`, no `container:`, no image builds) on the `ukubi-ci-runner` image,
+which bakes Go, Node 22, bun, Rust, protoc, buf, golangci-lint, hadolint, helm,
+uv, yq and Playwright's Chromium (see `runner-image/README.md`). release.yml has
+the same default. image.yml and deploy.yml keep the CT 103 labels: images build
+and deploy only on main and tags. Every job is `contents: read`, and none
+touches Infisical, OIDC or the registry. Inputs reach scripts through env only.
+`test/reusable.sh` runs their run blocks against throwaway repos, and `ci.yml`
+calls each one on a fixture under `test/`.
+
+Caches (go-checks, rust-checks): a pull request restores and saves; main, push,
+tag, schedule and dispatch never restore, they only save. The key is
+`${{ vars.CACHE_EPOCH || 'e1' }}-<tool>-<os>-<lockfile hash>-<run id>`, restored by
+prefix, so the newest entry wins and the cache refreshes on every run.
+
+PRs never build images: image.yml's build job is skipped on `pull_request`, and
+`dockerfile-lint.yml` lints Dockerfiles with hadolint instead (image-build.yml,
+the PR build, is removed).
+
+DB-backed tests: the Talos runner has no `services:` and no container engine.
+Run them in the caller's own job with the `dev-db` action (below), against the
+dev IntegreSQL, and keep them out of the go-checks call.
 
 ```yaml
 # .github/workflows/checks.yml in the app repo
@@ -339,12 +352,10 @@ jobs:
     uses: MohammadBnei/ukubi-ci/.github/workflows/bun-checks.yml@<40-char sha>
     with:
       working-directory: app/web
-  image:
-    uses: MohammadBnei/ukubi-ci/.github/workflows/image-build.yml@<40-char sha>
+  dockerfiles:
+    uses: MohammadBnei/ukubi-ci/.github/workflows/dockerfile-lint.yml@<40-char sha>
     with:
-      image: hq
-      context: app
-      dockerfile: app/Dockerfile
+      dockerfiles: app/Dockerfile
 ```
 
 ```yaml
@@ -372,7 +383,7 @@ with Go from the module's `go.mod`.
 
 | input | default | |
 |---|---|---|
-| `runs-on` | `["ubuntu-latest"]` | JSON list of runner labels; the default is the Forgejo container runner |
+| `runs-on` | `["k8s-ubuntu-latest"]` | JSON list of runner labels; the default is the Talos runner (ephemeral unprivileged pod, image `ukubi-ci-runner`). CT 103 callers pass `["ubuntu-latest"]` |
 | `working-directory` | `.` | a module directory (holds `go.mod`); a `go.work` root that is not a module rejects `./...` |
 | `golangci-lint-version` | | `vX.Y.Z`; empty skips. Built with `go install` |
 | `vettool` | | `pkg@vX.Y.Z` (never `@latest`), run as `go vet -vettool`; empty skips. The hook for ukubicheck |
@@ -395,7 +406,7 @@ typecheck, test and the package's real build script.
 
 | input | default | |
 |---|---|---|
-| `runs-on` | `["ubuntu-latest"]` | JSON list of runner labels; the default is the Forgejo container runner |
+| `runs-on` | `["k8s-ubuntu-latest"]` | JSON list of runner labels; the default is the Talos runner (ephemeral unprivileged pod, image `ukubi-ci-runner`). CT 103 callers pass `["ubuntu-latest"]` |
 | `working-directory` | `.` | holds `package.json` and `bun.lock` |
 | `typecheck-script` | `typecheck` | empty skips |
 | `lint-script` | | package.json script run after the typecheck; empty skips |
@@ -414,19 +425,21 @@ dependencies, so no advisory is ever hit in CI: the blocking exit and the
 
 | input | default | |
 |---|---|---|
-| `runs-on` | `["ubuntu-latest"]` | JSON list of runner labels; the default is the Forgejo container runner |
+| `runs-on` | `["k8s-ubuntu-latest"]` | JSON list of runner labels; the default is the Talos runner (ephemeral unprivileged pod, image `ukubi-ci-runner`). CT 103 callers pass `["ubuntu-latest"]` |
 | `working-directory` | `.` | holds `Cargo.toml`, `Cargo.lock` and `rust-toolchain.toml` |
 | `apt-packages` | | space-separated, e.g. `protobuf-compiler`; checked with `dpkg -s`, not installed: they must be baked into the runner image (or the build-runner playbook for a host runner) |
 | `audit-ignore` | | multiline `RUSTSEC-YYYY-NNNN`, each passed as `--ignore`. `.cargo/audit.toml` is read too; keep the reasons there |
 
-### image-build.yml
+### dockerfile-lint.yml
 
-The image build as a PR check: image.yml's tag and Build steps byte for byte
-(`sudo -n buildah bud --isolation chroot`, build-args, build-secrets), tagged
-`localhost/<image>:<sha>`, with no login and no push. Inputs `image`
-(required), `runs-on` (default `["ukubi-build"]`), `context`, `dockerfile`,
-`target`, `build-args`, `layers`, `pull-newer`, `build-timeout-minutes` and
-secret `build-secrets`, as in image.yml.
+hadolint over the named Dockerfiles, or every tracked `Dockerfile` and
+`*.Dockerfile` when none are named. No build, no registry.
+
+| input | default | |
+|---|---|---|
+| `runs-on` | `["k8s-ubuntu-latest"]` | JSON list of runner labels; needs hadolint on PATH (the runner image has it) |
+| `dockerfiles` | | multiline paths relative to the repo root; empty lints every tracked Dockerfile |
+| `failure-threshold` | `warning` | lowest severity that fails: error, warning, info, style |
 
 ### trailers.yml
 
@@ -444,7 +457,7 @@ The forms are anchored, so prose about the rule passes.
 
 | input | default | |
 |---|---|---|
-| `runs-on` | `["ubuntu-latest"]` | JSON list of runner labels; the default is the Forgejo container runner |
+| `runs-on` | `["k8s-ubuntu-latest"]` | JSON list of runner labels; the default is the Talos runner (ephemeral unprivileged pod, image `ukubi-ci-runner`). CT 103 callers pass `["ubuntu-latest"]` |
 | `conventional` | `false` | Conventional Commit subjects on non-merge commits (git's `Revert "..."` passes, `fixup!` does not), and the PR title (a trailing ` (#N)` is ignored), since a squash lands the title |
 | `allow-prefixes` | | multiline literal subject prefixes exempt from the Conventional rule only, never from the ban |
 | `agent-trailers` | `any` | `forbid`: no agent `Co-Authored-By` or `Agent-Session` at all. `pair`: an agent commit carries both `Co-Authored-By: ukubi-agent[-<host>] <noreply@bnei.dev>` and `Agent-Session: <id>`, a human one neither |

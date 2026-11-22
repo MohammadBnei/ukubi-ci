@@ -9,10 +9,10 @@ on:
     inputs:
       runs-on:
         description: >-
-          JSON list of runner labels; needs bash, git and jq. The default is the
-          container runner label on Forgejo; GitHub callers pass their own.
+          JSON list of runner labels; needs bash, git and jq. The default is the Talos runner label
+          (ephemeral unprivileged pods, image ukubi-ci-runner); CT 103 callers pass '["ubuntu-latest"]', GitHub callers their own.
         type: string
-        default: '["ubuntu-latest"]'
+        default: '["k8s-ubuntu-latest"]'
       working-directory:
         description: The package directory (holds package.json and bun.lock), relative to the repo root.
         type: string

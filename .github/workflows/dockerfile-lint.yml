@@ -1,0 +1,59 @@
+# Lint Dockerfiles with hadolint on a pull request. PRs never build images
+# (owner decision, CI/CD split): images build on main and tags, on CT 103, with
+# image.yml. This replaces the PR build that image-build.yml ran.
+# Inputs reach scripts through env only, never inline ${{ }}.
+name: dockerfile-lint
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: >-
+          JSON list of runner labels; needs bash and git, and hadolint on PATH (the ukubi-ci-runner image
+          bakes it). The default is the Talos runner label.
+        type: string
+        default: '["k8s-ubuntu-latest"]'
+      dockerfiles:
+        description: Multiline Dockerfile paths relative to the repo root, e.g. app/Dockerfile. Empty lints every tracked Dockerfile and *.Dockerfile.
+        type: string
+        default: ''
+      failure-threshold:
+        description: Lowest hadolint severity that fails the job (error, warning, info, style).
+        type: string
+        default: warning
+
+jobs:
+  lint:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      # test/reusable.sh runs this block verbatim; keep the name.
+      - name: hadolint
+        env:
+          DOCKERFILES: ${{ inputs.dockerfiles }}
+          THRESHOLD: ${{ inputs.failure-threshold }}
+        run: |
+          set -euo pipefail
+          command -v hadolint >/dev/null || { echo "::error::hadolint is not on PATH (use the ukubi-ci-runner image)"; exit 1; }
+          [[ "$THRESHOLD" =~ ^(error|warning|info|style)$ ]] || { echo "::error::failure-threshold must be error, warning, info or style, got '$THRESHOLD'"; exit 1; }
+          files=()
+          while IFS= read -r f; do
+            f=${f//[[:space:]]/}
+            [ -n "$f" ] || continue
+            [ -f "$f" ] || { echo "::error::dockerfiles: no such file '$f'"; exit 1; }
+            files+=("$f")
+          done <<<"$DOCKERFILES"
+          if [ ${#files[@]} -eq 0 ]; then
+            while IFS= read -r -d '' f; do files+=("$f"); done < <(git ls-files -z -- '*Dockerfile' '*.Dockerfile' ':!:*/testdata/*')
+          fi
+          [ ${#files[@]} -gt 0 ] || { echo "::notice::no Dockerfile to lint"; exit 0; }
+          hadolint --failure-threshold "$THRESHOLD" "${files[@]}"

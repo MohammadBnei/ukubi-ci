@@ -26,7 +26,7 @@ expect() {
 }
 
 # 0. Shape: least privilege, inputs through env only, optional steps gated.
-for f in go-checks bun-checks rust-checks image-build trailers; do
+for f in go-checks bun-checks rust-checks dockerfile-lint trailers; do
   p=$(yq -o=json -I0 '[.jobs[].permissions] | unique' "$W/$f.yml")
   if [ "$p" = '[{"contents":"read"}]' ]; then ok "$f: every job is contents: read"; else bad "$f: permissions $p"; fi
   # shellcheck disable=SC2016 # a literal ${{, not a shell expansion
@@ -56,11 +56,28 @@ gate rust-checks Format ''
 gate rust-checks Clippy ''
 gate rust-checks Audit ''
 
-# 1. image-build's tag and Build steps are image.yml's, env included.
-sel='.jobs[].steps[] | select(.name == "Build" or .id == "tag")'
-if d=$(diff <(yq -o=json -I0 "$sel" "$W/image.yml") <(yq -o=json -I0 "$sel" "$W/image-build.yml")); then
-  ok "image-build: tag and Build steps == image.yml"
-else bad "image-build: tag and Build steps drifted from image.yml: $d"; fi
+# 1. PRs never build an image: image-build.yml is gone, the Dockerfile lint replaces it.
+if [ ! -e "$W/image-build.yml" ]; then ok "no image-build.yml (PR image builds dropped)"; else bad "image-build.yml still exists"; fi
+for f in go-checks rust-checks bun-checks trailers release dockerfile-lint; do
+  # shellcheck disable=SC2016 # a literal ${{, not a shell expansion
+  if [ "$(yq '.on.workflow_call.inputs["runs-on"].default' "$W/$f.yml")" = '["k8s-ubuntu-latest"]' ]; then ok "$f: runs-on defaults to the Talos label"
+  else bad "$f: runs-on default is not [\"k8s-ubuntu-latest\"]"; fi
+done
+for f in image deploy; do
+  if yq '.on.workflow_call.inputs["runs-on"].default // ""' "$W/$f.yml" | grep -q k8s; then bad "$f: must keep the CT 103 labels"; else ok "$f: no Talos default"; fi
+done
+extract dockerfile-lint.yml hadolint "$T/hadolint.sh"
+mkdir -p "$T/bin"; printf '#!/bin/sh\necho "hadolint $*"\n' > "$T/bin/hadolint"; chmod +x "$T/bin/hadolint"
+H=$T/dfrepo; git init -q -b main "$H"; mkdir -p "$H/app"; : > "$H/Dockerfile"; : > "$H/app/x.Dockerfile"; : > "$H/app/other"
+git -C "$H" add -A
+hl() { # want name files threshold [substring]
+  local rc=0 out; out=$(cd "$H" && PATH="$T/bin:$PATH" DOCKERFILES=$3 THRESHOLD=$4 bash "$T/hadolint.sh" 2>&1) || rc=$?
+  expect "$1" "dockerfile-lint: $2" "$rc" "$out" "${5:-}"
+}
+hl 0 "empty lints every tracked Dockerfile" '' warning 'hadolint --failure-threshold warning Dockerfile app/x.Dockerfile'
+hl 0 "named file" app/x.Dockerfile error 'hadolint --failure-threshold error app/x.Dockerfile'
+hl 1 "missing file refused" nope warning "no such file"
+hl 1 "bad threshold refused" '' loud "failure-threshold"
 
 # 1b. deploy.yml's guard, bump and commit steps are image.yml's deploy steps, env and if included.
 sel='.jobs.deploy.steps[] | select(.name == "Switch to the deploy branch" or .name == "Skip a stale run" or .name == "Bump the pinned image tag" or .name == "Commit and push")'

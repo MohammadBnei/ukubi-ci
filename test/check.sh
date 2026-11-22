@@ -51,6 +51,17 @@ pr false false "pull_request_target builds only"         pull_request_target $M
 pr false false "workflow_run builds only"                workflow_run      $M
 pr false false "an unlisted event builds only"           schedule          $M
 pr false false "an empty event builds only"              ""                $M
+# PRs never build an image: the build job reads the guard's build output, false only for pull_request(_target).
+bd() { # want name EVENT
+  : > "$T/gout"; EVENT=$3 REF=$M DEFAULT_BRANCH=main PDBO=false DEPLOY=true VALUES=helm/values.yaml GITHUB_OUTPUT="$T/gout" bash "$T/pr.sh" >/dev/null 2>&1
+  if [ "$(sed -n 's/^build=//p' "$T/gout")" = "$1" ]; then ok "build guard: $2"; else bad "build guard: $2"; fi
+}
+bd false "pull_request builds nothing"         pull_request
+bd false "pull_request_target builds nothing" pull_request_target
+bd true  "push builds"                         push
+bd true  "workflow_dispatch builds"            workflow_dispatch
+bd true  "workflow_run builds"                 workflow_run
+if [ "$(yq '.jobs.build.if' "$WF")" = "needs.guard.outputs.build == 'true'" ]; then ok "build job reads the guard's build"; else bad "build job if is not the guard's build"; fi
 # Every step that logs in, reads Infisical or pushes, and the deploy job, also ask the guard.
 for sn in "Pick the Infisical login" "Read the registry password from Infisical" "Read the registry password over Forgejo OIDC" "Keep only the registry password" "Registry login" "Push" "Registry logout"; do
   if [[ "$(yq ".jobs.build.steps[] | select(.name == \"$sn\") | .if" "$WF")" == *"needs.guard.outputs.publish == 'true'"* ]]; then ok "publish gate on '$sn'"; else bad "no guard gate on '$sn'"; fi
@@ -60,7 +71,7 @@ if [ "$(yq '.jobs.deploy.if' "$WF")" = "always() && needs.build.result == 'succe
 # exception is the bare label ubuntu-latest: on Forgejo it is the self-hosted
 # container runner, and it is a JSON default or ci.yml's own label only.
 if grep -rniE 'ubuntu-|macos-|windows-' "$(dirname "$WF")" | grep -v '^\S*:[0-9]*:\s*#' \
-  | grep -vE "^[^:]*:[0-9]+:\s*(default: '\[\"ubuntu-latest\"\]'|runs-on: ubuntu-latest)$"; then
+  | grep -vE "^[^:]*:[0-9]+:\s*(default: '\[\"(k8s-)?ubuntu-latest\"\]'|runs-on: (k8s-)?ubuntu-latest|\(ephemeral unprivileged pods.*|.*ukubi-ci-runner.*)$"; then
   bad "a workflow names a GitHub-hosted runner"
 else ok "no GitHub-hosted runner in the workflows"; fi
 # The build job's runner comes from the caller: buildah runs only where it is granted.
@@ -542,7 +553,7 @@ a=$(build_args '')
 if [[ "$a" == *"--build-arg A=b"* && "$a" != *VERSION* ]]; then ok "Build without VERSION_ARG adds no VERSION arg"; else bad "Build without VERSION_ARG: '$a'"; fi
 
 # 9. Every job has a timeout; only REGISTRY_PASSWORD leaves the Infisical file.
-for f in "$WF" "$(dirname "$WF")/image-build.yml"; do
+for f in "$WF"; do
   for j in $(yq '.jobs | keys | .[]' "$f"); do
     if [ "$(yq ".jobs.$j.timeout-minutes // \"\"" "$f")" != "" ]; then ok "$(basename "$f") job $j has timeout-minutes"; else bad "$(basename "$f") job $j has no timeout-minutes"; fi
   done

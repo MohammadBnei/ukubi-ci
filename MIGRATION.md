@@ -60,9 +60,11 @@ folder when the repo has no `.forgejo/workflows/`, so do not add one.
    ```
    Keep the `permissions:` blocks. GitHub needs them and Forgejo ignores them.
 3. **Checks and release callers** (go-checks, bun-checks, rust-checks,
-   trailers, release, deploy) need no change. Their new `runs-on` input defaults
-   to `["ubuntu-latest"]`, the container runner. image-build defaults to
-   `["ukubi-build"]`. A caller still on GitHub passes
+   trailers, release) default `runs-on` to `["k8s-ubuntu-latest"]`, the Talos
+   runner (unprivileged pod, no services:, no container:, no image builds);
+   pass `'["ubuntu-latest"]'` to stay on CT 103. deploy defaults to
+   `["ubuntu-latest"]` and image to what you pass. image-build is gone: PRs lint
+   Dockerfiles with dockerfile-lint.yml and never build. A caller still on GitHub passes
    `runs-on: '["self-hosted","ukubi-build"]'` to keep today's runner.
 4. **Do not set `runs-on` on a `uses:` job.** GitHub refuses it. On Forgejo,
    leaving it out lets the server expand the called workflow into its own
@@ -141,7 +143,7 @@ pilot first:
   `event_name` is already the caller's event and the extra clause never
   applies. `test/check.sh` fails on any `github.event_name` read in these files that is
   not one of the two canonical expressions.
-- **image.yml and image-build.yml show as failing runs in this repo.** Forgejo
+- **image.yml shows as failing runs in this repo.** Forgejo
   does not parse `on.workflow_call.secrets` (forgejo#14674) and reports the
   file as a broken top-level workflow. The calls themselves work. The block
   stays, because GitHub needs it for callers that map secrets by name.
