@@ -84,6 +84,7 @@ RUN set -eux; \
     dl al.tgz "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" "$ACTIONLINT_SHA256"; \
     tar -xzf al.tgz actionlint; install -m 0755 actionlint /usr/local/bin/actionlint; \
     cd /; rm -rf "$t"; \
+    chown -R 1001:1001 /opt/hostedtoolcache; \
     /opt/hostedtoolcache/go/${GO_VERSION}/x64/bin/go version; \
     node --version; bun --version; buf --version; golangci-lint --version; hadolint --version; \
     helm version --short; uv --version; yq --version; shellcheck --version | head -2; actionlint -version | head -1; \
@@ -101,18 +102,19 @@ RUN set -eux; \
     for tc in ${RUST_TOOLCHAINS}; do rustup toolchain install "$tc" --profile minimal -c clippy -c rustfmt; done; \
     rustup default "${RUST_TOOLCHAINS%% *}"; \
     for b in rustup cargo rustc rustfmt cargo-fmt cargo-clippy clippy-driver; do ln -s "/opt/cargo/bin/$b" "/usr/local/bin/$b"; done; \
+    chown -R 1001:1001 /opt/rustup /opt/cargo; \
     cargo --version
 
 # Layer 3: Playwright's Chromium (full and headless shell) and the OS libraries
 # it links (install-deps needs root, so it happens here, not in a job). Browsers
-# sit in PLAYWRIGHT_BROWSERS_PATH, world-readable; callers run
-# `playwright install` without --with-deps (a no-op) and pin the same version.
-# Then hand the writable trees to uid 1001, the Talos runner job user, so
-# setup-* actions can add tool versions and rustup can add toolchains; root
-# (the podman runner) can still write.
+# sit in PLAYWRIGHT_BROWSERS_PATH, owned by uid 1001 because `playwright install`
+# takes a lock and writes .links there even when nothing needs downloading;
+# callers run it without --with-deps and pin the same version.
+# Each tree is chowned in the RUN that creates it (a later chown -R would copy
+# every file into a new overlay layer). uid 1001 is the Talos runner job user, so
+# setup-* actions can add tool versions and rustup can add toolchains.
 RUN set -eux; \
     npm install --no-save --no-package-lock --prefix /tmp/pw "playwright@${PLAYWRIGHT_VERSION}"; \
     /tmp/pw/node_modules/.bin/playwright install --with-deps chromium chromium-headless-shell; \
     rm -rf /tmp/pw /var/lib/apt/lists/* /root/.npm /root/.cache; \
-    chmod -R a+rX /opt/ms-playwright; \
-    chown -R 1001:1001 /opt/hostedtoolcache /opt/rustup /opt/cargo
+    chown -R 1001:1001 /opt/ms-playwright

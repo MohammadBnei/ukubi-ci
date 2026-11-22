@@ -49,7 +49,7 @@ jobs:
           out status '^(\.github/workflows/go-checks\.yml|standard-status/)'
           out bun '^(\.github/workflows/bun-checks\.yml|test/fixture-bun/)'
           out rust '^(\.github/workflows/rust-checks\.yml|test/fixture-rust/)'
-          out image '^(\.github/workflows/(image|image-build|release)\.yml|test/fixture/|cliff\.toml$)'
+          out image '^(\.github/workflows/(image|release)\.yml|test/fixture/|cliff\.toml$)'
 
   actionlint:
     runs-on: k8s-ubuntu-latest
@@ -134,7 +134,7 @@ jobs:
   # run, on push to main the real release (CHANGELOG commit + tag).
   # No image self-test builds here: PR image builds were dropped (owner
   # decision, CI/CD split) and the host executor they ran on serves only
-  # ukubi-cd. image.yml and image-build.yml keep their static
+  # ukubi-cd. image.yml keeps its static
   # checks (test/check.sh, test/reusable.sh); a real build test of image.yml
   # moves with it to ukubi-cd. The `image` output above still marks what a
   # change touches.

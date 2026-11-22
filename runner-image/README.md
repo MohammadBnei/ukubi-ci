@@ -19,8 +19,8 @@ root, no apt, no sudo), each tool pinned and sha256-checked in the Dockerfile:
   `playwright install` WITHOUT `--with-deps` (that needs root) and pin the same
   Playwright version, or the browser revision will not match.
 
-`/opt/hostedtoolcache`, `/opt/rustup` and `/opt/cargo` are owned by uid 1001 so
-`setup-*` actions and rustup can add versions.
+`/opt/hostedtoolcache`, `/opt/rustup`, `/opt/cargo` and `/opt/ms-playwright` are owned by uid 1001 so
+`setup-*` actions and rustup can add versions and `playwright install` can take its lock.
 
 `.github/workflows/runner-image.yml` builds and pushes it from main only, as
 `registry.bnei.lan:5000/ukubi-ci-runner:<sha12>`. The podman runner label and
