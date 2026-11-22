@@ -22,3 +22,6 @@ RUN set -eux; \
     rm /tmp/go.tgz; \
     touch "$d.complete"; \
     "$d/bin/go" version
+# Owned by uid 1001, the Talos runner job user, so setup-* actions can add tool versions;
+# root (the podman runner) can still write regardless of ownership.
+RUN chown -R 1001:1001 /opt/hostedtoolcache

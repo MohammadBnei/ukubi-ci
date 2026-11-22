@@ -3,6 +3,7 @@
 The CI job image: `catthehacker/ubuntu:act-24.04` (pinned by digest) plus Go
 in `/opt/hostedtoolcache/go/<version>/x64` with its `x64.complete` marker, so
 `actions/setup-go` with a matching `go-version` finds it and downloads nothing.
+`/opt/hostedtoolcache` is owned by uid 1001 (the Talos runner job user) so other `setup-*` actions can add tool versions.
 
 `.github/workflows/runner-image.yml` builds and pushes it from main only, as
 `registry.bnei.lan:5000/ukubi-ci-runner:<sha12>`. The podman runner label and
