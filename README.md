@@ -380,6 +380,13 @@ with Go from the module's `go.mod`.
 | `pre-test` | | a command run at the repo root before the tests, e.g. `docker compose up -d --wait postgres` |
 | `govulncheck` | `false` | run `govulncheck ./...` (v1.9.0, built with the module's toolchain). Fails only on vulnerabilities the code calls; unreachable module advisories pass. Default is off because every current caller fails today on stdlib fixes (go1.27.3/1.27.4) and `golang.org/x/net` v0.60.0; bump `go.mod`, then enable |
 
+Caching (go-checks and rust-checks): a pull request restores the module/build (Go) or cargo
+(Rust) cache and saves it; a push, tag, dispatch or schedule never restores, it runs cold and only saves
+(`actions/cache/save`). A PR job can forge the runner cache's write key, so an entry read on main would be
+untrusted. Key: `<CACHE_EPOCH>-<go|rust>-<os>-<hash of go.mod+go.sum | Cargo.lock+rust-toolchain.toml>`; restore-keys
+(PR only) match the prefix. `CACHE_EPOCH` is a user-level Forgejo variable (default `e1`): bump it to purge every
+cache at once. The cache is never restored in CD.
+
 ### bun-checks.yml
 
 Bun is pinned exactly from `package.json` `packageManager` (`bun@X.Y.Z`; a

@@ -256,5 +256,34 @@ else
   echo "skip go absent: gofmt and vettool cases not run"
 fi
 
+# 6. Cache model: a pull request restores and saves; everything else never restores.
+for f in go rust; do
+  w=$f-checks; N=Go; [ "$f" = rust ] && N=Rust
+  gate "$w" "Restore $N cache" "steps.cachekeys.outputs.pr == 'true'"
+  gate "$w" "Save $N cache" "success() && steps.restore.outputs.cache-hit != 'true'"
+  if yq '.jobs[].steps[] | select(.uses != null) | .uses' "$W/$w.yml" | grep -qE 'rust-cache|actions/cache@'; then
+    bad "$w: a combined cache action (it restores on main)"
+  else ok "$w: no combined cache action"; fi
+  if yq '.jobs[].steps[] | select(.with.cache != null) | .with.cache' "$W/$w.yml" | grep -qx true; then
+    bad "$w: a built-in cache is on"
+  else ok "$w: no built-in cache"; fi
+  extract "$w.yml" "Cache keys" "$T/ck-$f.sh"
+done
+ck() { # want-pr dir ref pr-number
+  local out="$T/out"; : > "$out"
+  (cd "$2" && REF=$3 PR_NUMBER=$4 EPOCH=e1 RUNNER_OS=Linux GITHUB_OUTPUT=$out bash "$T/ck-$5.sh") >/dev/null 2>&1 || { bad "cache keys $5 $3: script failed"; return; }
+  if grep -qx "pr=$1" "$out" && grep -q '^key=e1-'"$5"'-Linux-' "$out"; then ok "cache keys $5: pr=$1 for '$3' '$4'"
+  else bad "cache keys $5: want pr=$1 for '$3' '$4': $(cat "$out")"; fi
+}
+if command -v go >/dev/null; then
+  ck true "$M" refs/pull/7/head 7 go
+  ck true "$M" refs/pull/7/merge '' go
+  ck false "$M" refs/heads/main '' go
+  ck false "$M" refs/heads/main 7 go # pull_request_target: base ref, never restores
+  ck false "$M" refs/tags/v1.0.0 '' go
+fi
+ck true "$(dirname "$0")/fixture-rust" refs/pull/7/head 7 rust
+ck false "$(dirname "$0")/fixture-rust" refs/heads/main '' rust
+
 echo "failures: $fails"
 [ "$fails" = 0 ]

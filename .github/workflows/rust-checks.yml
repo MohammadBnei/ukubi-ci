@@ -98,9 +98,39 @@ jobs:
           fi
           echo "::error::not installed on this runner (sudo apt-get does not work here; add them to the build-runner playbook): ${missing[*]}"; exit 1
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Swatinem/rust-cache always restores, so the PR/main split is explicit.
+      # Same model as go-checks: a pull request restores and saves; anything
+      # else runs cold and only saves. CACHE_EPOCH: a user-level Forgejo
+      # variable; bump it to purge every cache at once.
+      - name: Cache keys
+        id: cachekeys
+        env:
+          REF: ${{ github.ref }}
+          EPOCH: ${{ vars.CACHE_EPOCH || 'e1' }}
+        run: |
+          set -euo pipefail
+          pr=false
+          # The ref alone decides: pull_request_target runs base code on the base
+          # ref and must never restore what a PR job can write.
+          if [[ "$REF" == refs/pull/* ]]; then pr=true; fi
+          h=$({ cat Cargo.lock; [ ! -f rust-toolchain.toml ] || cat rust-toolchain.toml; } | sha256sum | cut -c1-16)
+          {
+            echo "pr=$pr"
+            echo "key=${EPOCH}-rust-${RUNNER_OS}-${h}"
+            echo "prefix=${EPOCH}-rust-${RUNNER_OS}-"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore Rust cache
+        id: restore
+        if: steps.cachekeys.outputs.pr == 'true'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          workspaces: ${{ inputs.working-directory }} -> target
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ inputs.working-directory }}/target
+          key: ${{ steps.cachekeys.outputs.key }}
+          restore-keys: ${{ steps.cachekeys.outputs.prefix }}
 
       - name: Format
         run: cargo fmt --all --check
@@ -110,6 +140,16 @@ jobs:
 
       - name: Test
         run: cargo test --locked --workspace
+
+      - name: Save Rust cache
+        if: success() && steps.restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ inputs.working-directory }}/target
+          key: ${{ steps.cachekeys.outputs.key }}
 
   # Blocking. An accepted advisory goes in audit-ignore (or .cargo/audit.toml)
   # with its reason; this job is never made non-blocking. "error loading
