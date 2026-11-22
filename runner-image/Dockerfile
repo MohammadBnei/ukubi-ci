@@ -53,7 +53,7 @@ ENV RUSTUP_HOME=/opt/rustup \
 RUN set -eux; \
     apt-get update -qq; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-      protobuf-compiler xz-utils unzip python3 python3-venv pkg-config libssl-dev; \
+      protobuf-compiler xz-utils unzip rsync python3 python3-venv pkg-config libssl-dev; \
     rm -rf /var/lib/apt/lists/*; \
     t=$(mktemp -d); cd "$t"; \
     dl() { curl -fsSL -o "$1" "$2"; echo "$3  $1" | sha256sum -c -; }; \
