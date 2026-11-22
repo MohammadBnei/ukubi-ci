@@ -378,7 +378,7 @@ jobs:
 
 ### go-checks.yml
 
-gofmt (over `git ls-files '*.go'`, minus `vendor/` and `testdata/`), `go vet ./...`, `go test -race -count=1 ./...`,
+gofmt (over `git ls-files '*.go'`, minus `vendor/` and `testdata/`), `go vet ./...`, `go test -race ./...` (Go's test cache stays on: `uncached-packages` names the packages that read files outside the module or external state and run again with `-count=1`),
 with Go from the module's `go.mod`.
 
 | input | default | |

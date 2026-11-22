@@ -238,13 +238,16 @@ audit 0 "ignoring that id passes" 'RUSTSEC-2026-0414' ''
 extract go-checks.yml "Check inputs" "$T/go-in.sh"
 extract go-checks.yml "gofmt" "$T/gofmt.sh"
 extract go-checks.yml "go vet -vettool" "$T/vettool.sh"
+extract go-checks.yml "go test" "$T/gotest.sh"
 M=$T/mod; git init -q -b main "$M"; printf 'module example.com/m\n\ngo 1.24\n' > "$M/go.mod"
-go_in() { # want name lint vettool test-flags [substring]
-  local rc=0 out; out=$(cd "$M" && LINT_VERSION=$3 VETTOOL=$4 TEST_FLAGS=$5 bash "$T/go-in.sh" 2>&1) || rc=$?
+go_in() { # want name lint vettool test-flags [substring] [uncached]
+  local rc=0 out; out=$(cd "$M" && LINT_VERSION=$3 VETTOOL=$4 TEST_FLAGS=$5 UNCACHED=${7:-} bash "$T/go-in.sh" 2>&1) || rc=$?
   expect "$1" "go inputs: $2" "$rc" "$out" "${6:-}"
 }
 go_in 0 "all empty passes" '' '' ''
 go_in 0 "pinned lint, vettool and -p 1 pass" v2.14.0 golang.org/x/tools/go/analysis/passes/nilness/cmd/nilness@v0.52.0 '-p 1'
+go_in 0 "uncached-packages passes" '' '' '' '' './core/internal/buildguard ./db/...'
+go_in 1 "uncached-packages with ; refused" '' '' '' "uncached-packages" './a;id'
 go_in 1 "lint latest refused" latest '' '' "vX.Y.Z"
 go_in 1 "lint without v refused" 2.14.0 '' '' "vX.Y.Z"
 go_in 1 "vettool @latest refused" '' example.com/x@latest '' "never @latest"
@@ -269,6 +272,14 @@ if command -v go >/dev/null && command -v gofmt >/dev/null; then
   vt_run 0 "nilness passes on clean code"
   printf 'package m\n\nfunc G(p *int) int {\n\tif p == nil {\n\t\treturn *p\n\t}\n\treturn 0\n}\n' > "$M/g.go"
   vt_run 1 "nilness flags a planted nil dereference" "nil dereference"
+  # go test: the cache is on, and uncached-packages run again with -count=1.
+  G=$T/gomod; mkdir -p "$G/a" "$G/b"; printf 'module example.com/g\n\ngo 1.24\n' > "$G/go.mod"
+  for p in a b; do printf 'package %s\n' "$p" > "$G/$p/$p.go"; printf 'package %s\nimport "testing"\nfunc TestX(t *testing.T) {}\n' "$p" > "$G/$p/${p}_test.go"; done
+  gt_run() { (cd "$G" && GOCACHE=$T/gocache RUNNER_TEMP=$T TEST_FLAGS='' UNCACHED=$1 bash "$T/gotest.sh" 2>&1); }
+  gt_run '' >/dev/null; out=$(gt_run '')
+  if [[ "$out" == *"example.com/g/a	(cached)"* && "$out" == *"example.com/g/b	(cached)"* ]]; then ok "go test: a second run is served from the test cache"; else bad "go test: not cached: $out"; fi
+  out=$(gt_run './b')
+  if [[ "$out" == *"example.com/g/a	(cached)"* && "$out" != *"example.com/g/b	(cached)"* && "$out" == *"example.com/g/b"* ]]; then ok "go test: an uncached package reruns, the rest stay cached"; else bad "go test: uncached-packages: $out"; fi
 else
   echo "skip go absent: gofmt and vettool cases not run"
 fi

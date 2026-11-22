@@ -27,7 +27,15 @@ on:
         type: string
         default: ''
       test-flags:
-        description: Extra go test flags after -race -count=1, e.g. '-p 1' for tests sharing one database.
+        description: Extra go test flags after -race, e.g. '-p 1' for tests sharing one database. Go's per-package test-result cache is on (no -count=1); see uncached-packages.
+        type: string
+        default: ''
+      uncached-packages:
+        description: >-
+          Space-separated package patterns (e.g. ./core/internal/buildguard) whose tests read files outside their
+          module or depend on state Go cannot track (DB-backed tests). They run in a second go test with
+          -count=1 and the same flags, so the compiled test binaries are shared; every other package may be
+          served from Go's test cache. Empty runs everything through the cache.
         type: string
         default: ''
       pre-test:
@@ -63,6 +71,7 @@ jobs:
           LINT_VERSION: ${{ inputs.golangci-lint-version }}
           VETTOOL: ${{ inputs.vettool }}
           TEST_FLAGS: ${{ inputs.test-flags }}
+          UNCACHED: ${{ inputs.uncached-packages }}
         run: |
           set -euo pipefail
           [ -f go.mod ] || { echo "::error::working-directory must be a Go module (no go.mod)"; exit 1; }
@@ -74,6 +83,8 @@ jobs:
             || { echo "::error::vettool must be pkg@vX.Y.Z (never @latest), got '$VETTOOL'"; exit 1; }
           f='^[A-Za-z0-9 ._=,/:-]*$'
           [[ "$TEST_FLAGS" =~ $f ]] || { echo "::error::test-flags has characters outside [A-Za-z0-9 ._=,/:-]"; exit 1; }
+          u='^[A-Za-z0-9 ._/-]*$'
+          [[ "$UNCACHED" =~ $u ]] || { echo "::error::uncached-packages has characters outside [A-Za-z0-9 ._/-]"; exit 1; }
 
       # No setup-go cache: the split below is explicit (see "Cache keys").
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
@@ -144,10 +155,22 @@ jobs:
       - name: go test
         env:
           TEST_FLAGS: ${{ inputs.test-flags }}
+          UNCACHED: ${{ inputs.uncached-packages }}
         run: |
           set -euo pipefail
           read -ra flags <<<"$TEST_FLAGS"
-          go test -race -count=1 ${flags[@]+"${flags[@]}"} ./...
+          read -ra unc <<<"$UNCACHED"
+          if [ ${#unc[@]} -eq 0 ]; then
+            go test -race ${flags[@]+"${flags[@]}"} ./...
+            exit 0
+          fi
+          # Everything else through Go's test cache, then the uncached packages
+          # with -count=1; the same build flags, so the binaries are shared.
+          go list "${unc[@]}" > "$RUNNER_TEMP/uncached.txt"
+          rest=()
+          while IFS= read -r pkg; do rest+=("$pkg"); done < <(go list ./... | grep -vxFf "$RUNNER_TEMP/uncached.txt" || true)
+          [ ${#rest[@]} -eq 0 ] || go test -race ${flags[@]+"${flags[@]}"} "${rest[@]}"
+          go test -race -count=1 ${flags[@]+"${flags[@]}"} "${unc[@]}"
 
       # Built with the module's own toolchain; the module proxy and sumdb check it.
       - name: golangci-lint
