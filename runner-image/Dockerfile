@@ -21,4 +21,8 @@ RUN set -eux; \
     tar -xzf /tmp/go.tgz -C "$d" --strip-components=1; \
     rm /tmp/go.tgz; \
     touch "$d.complete"; \
-    "$d/bin/go" version
+    "$d/bin/go" version; \
+    # Owned by uid 1001, the Talos runner job user, so setup-* actions can add
+    # tool versions; root (the podman runner) can still write. Same RUN, so the
+    # toolchain is not copied into a second layer.
+    chown -R 1001:1001 /opt/hostedtoolcache
