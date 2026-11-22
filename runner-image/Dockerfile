@@ -1,6 +1,7 @@
 # CI job image for the Talos runners (uid 1001: no root, no apt, no sudo) and the
 # podman runner. Everything a pull-request job needs is baked in, pinned and
-# checksummed, so no job installs anything: base + Go + Node + bun + Rust + the
+# checksummed (except apt packages and Playwright, which are version-pinned only),
+# so no job installs anything: base + Go + Node + bun + Rust + the
 # lint/codegen binaries + Playwright's Chromium and its OS libraries.
 FROM catthehacker/ubuntu:act-24.04@sha256:f68a2abac9c927421fd5a38e23d3610c7804916ffdb2491d7e669fe0ebbe1979
 
