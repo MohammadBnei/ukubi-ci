@@ -316,7 +316,9 @@ install what else they need (bun from npm, Go through setup-go, rustup, yq); the
 image needs bash, git, curl, jq, tar and xz, plus gcc for `go test -race` and a
 C linker for Rust. Inputs reach scripts through env
 only. `test/reusable.sh` runs their run blocks against throwaway repos, and
-`ci.yml` calls each one on a fixture under `test/`.
+`ci.yml` calls each one on a fixture under `test/`, except image-build: PR image
+builds were dropped in the CI/CD split, and the host runner it defaults to
+serves only ukubi-cd, so no caller is left (it is kept until a release removes it).
 
 ```yaml
 # .github/workflows/checks.yml in the app repo
