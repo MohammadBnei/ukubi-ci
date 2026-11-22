@@ -1,6 +1,7 @@
 self-hosted-runner:
   labels:
     - ukubi-build
+    - k8s-ubuntu-latest
 paths:
   .github/workflows/image.yml:
     ignore:

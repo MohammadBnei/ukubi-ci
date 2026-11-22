@@ -19,7 +19,7 @@ jobs:
   # changed (ci.yml or actionlint.yaml changes run all). A push to main runs
   # all. Decided in shell; the jobs below only compare these outputs.
   changes:
-    runs-on: ubuntu-latest
+    runs-on: k8s-ubuntu-latest
     outputs:
       go: ${{ steps.d.outputs.go }}
       status: ${{ steps.d.outputs.status }}
@@ -52,7 +52,7 @@ jobs:
           out image '^(\.github/workflows/(image|image-build|release)\.yml|test/fixture/|cliff\.toml$)'
 
   actionlint:
-    runs-on: ubuntu-latest
+    runs-on: k8s-ubuntu-latest
     env:
       VERSION: 1.7.12
       SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
@@ -83,7 +83,7 @@ jobs:
           "$RUNNER_TEMP/actionlint" -color
 
   check:
-    runs-on: ubuntu-latest
+    runs-on: k8s-ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # The runner has no yq and sudo is buildah-only: a pinned release, checked by sha256.
@@ -126,6 +126,10 @@ jobs:
       - name: release.yml's Release block against throwaway repos
         run: test/release.sh
 
+  # Every job here runs on the Talos runner (k8s-ubuntu-latest, no root, no
+  # services:). Image self-tests would need buildah, which only CT 103 has; there
+  # are none (image.yml's and the guard's logic are covered by test/check.sh),
+  # and dev-db-selftest.yml, which needs services:, runs there on main only.
   # release.yml as callers chain it: after the checks; on pull_request a dry
   # run, on push to main the real release (CHANGELOG commit + tag).
   # No image self-test builds here: PR image builds were dropped (owner

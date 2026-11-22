@@ -1,6 +1,8 @@
 # Runs the dev-db and dev-db-release actions against a throwaway IntegreSQL +
 # Postgres started as job services. It runs on the podman runner
-# (ubuntu-latest): the host runner has no container engine for jobs.
+# (ubuntu-latest, CT 103): the Talos runner has no container engine for services:.
+# Main and dispatch only, so no pull-request job leaves Talos; run it by
+# dispatch on a branch before merging a change to the dev-db actions.
 # IntegreSQL dials Postgres at startup (InitManager: 30 tries 1 s apart, then
 # it exits) and listens only once that works, so roles.sql must land within
 # about 30 s of the services starting: it is the first step after checkout,
@@ -12,7 +14,8 @@
 name: dev-db-selftest
 
 on:
-  pull_request:
+  push:
+    branches: [main]
     paths: [actions/dev-db/**, actions/dev-db-release/**, test/dev-db/**, .github/workflows/dev-db-selftest.yml]
   workflow_dispatch:
 
