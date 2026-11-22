@@ -1,0 +1,29 @@
+# Build and push the CI job image (runner-image/Dockerfile) with this repo's
+# own image.yml. Main only: no pull_request trigger, so no PR builds. No helm
+# pin to bump, hence deploy: false; the runners pin the digest by hand.
+name: runner-image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'runner-image/**'
+      - '.github/workflows/runner-image.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@a1fff4170c861af16467a99fe5185bbb85bdfd08 # v0.11.3
+    with:
+      runs-on: '["ukubi-build"]'
+      image: ukubi-ci-runner
+      context: runner-image
+      dockerfile: runner-image/Dockerfile
+      deploy: false
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      id-token: write
