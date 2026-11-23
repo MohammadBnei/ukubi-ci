@@ -296,6 +296,7 @@ for f in go rust; do
   if yq '.jobs[].steps[] | select(.with.cache != null) | .with.cache' "$W/$w.yml" | grep -qx true; then
     bad "$w: a built-in cache is on"
   else ok "$w: no built-in cache"; fi
+  # shellcheck disable=SC2016 # a literal ${{ }} expression, compared as text
   if [ "$(yq ".jobs[].steps[] | select(.name == \"Save $N cache\") | .with.key" "$W/$w.yml")" = '${{ steps.cachekeys.outputs.base }}-${{ github.run_id }}' ]; then
     ok "$w: saves under <base>-<run id>"; else bad "$w: save key is not <base>-<run id>"; fi
   if yq ".jobs[].steps[] | select(.name == \"Restore $N cache\") | .with[\"restore-keys\"]" "$W/$w.yml" | grep -q 'outputs.base }}-$'; then
