@@ -48,12 +48,12 @@ ENV RUSTUP_HOME=/opt/rustup \
     PATH=/opt/cargo/bin:/usr/local/bin:$PATH
 
 # One RUN per concern keeps the layers few and each cacheable on its own.
-# Layer 1: apt packages (protoc for tonic/prost, xz and unzip for the archives
+# Layer 1: apt packages (protoc for tonic/prost, psql for the dev-db roles, xz and unzip for the archives
 # below), then every pinned binary. Nothing here needs root at run time.
 RUN set -eux; \
     apt-get update -qq; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-      protobuf-compiler xz-utils unzip rsync python3 python3-venv pkg-config libssl-dev; \
+      protobuf-compiler xz-utils unzip rsync python3 python3-venv pkg-config libssl-dev postgresql-client; \
     rm -rf /var/lib/apt/lists/*; \
     t=$(mktemp -d); cd "$t"; \
     dl() { curl -fsSL -o "$1" "$2"; echo "$3  $1" | sha256sum -c -; }; \
