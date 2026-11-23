@@ -44,6 +44,10 @@ jobs:
           INTEGRESQL_TEST_PGUSER: integresql_test
           INTEGRESQL_TEST_PGPASSWORD: testpass
           INTEGRESQL_ROOT_TEMPLATE: template1
+        # IntegreSQL exits when it cannot log in at start, and its roles exist only after the first step creates
+        # them: restart it until they do (it raced and lost under load, 2026-11-23: "Could not resolve host: integresql").
+        options: >-
+          --restart on-failure:20
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Install psql and create IntegreSQL's roles
