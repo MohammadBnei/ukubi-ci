@@ -553,10 +553,9 @@ a=$(build_args '')
 if [[ "$a" == *"--build-arg A=b"* && "$a" != *VERSION* ]]; then ok "Build without VERSION_ARG adds no VERSION arg"; else bad "Build without VERSION_ARG: '$a'"; fi
 
 # 9. Every job has a timeout; only REGISTRY_PASSWORD leaves the Infisical file.
-for f in "$WF"; do
-  for j in $(yq '.jobs | keys | .[]' "$f"); do
-    if [ "$(yq ".jobs.$j.timeout-minutes // \"\"" "$f")" != "" ]; then ok "$(basename "$f") job $j has timeout-minutes"; else bad "$(basename "$f") job $j has no timeout-minutes"; fi
-  done
+f=$WF # image-build.yml is gone (#28): one file left, no loop
+for j in $(yq '.jobs | keys | .[]' "$f"); do
+  if [ "$(yq ".jobs.$j.timeout-minutes // \"\"" "$f")" != "" ]; then ok "$(basename "$f") job $j has timeout-minutes"; else bad "$(basename "$f") job $j has no timeout-minutes"; fi
 done
 if [ "$(yq '.jobs.build.steps[] | select(.name == "Remove the Infisical secrets file") | .if' "$WF")" = "always()" ]; then ok "cleanup step runs always()"; else bad "cleanup step missing or not always()"; fi
 step build "Keep only the registry password" > "$T/keep.sh"
