@@ -13,7 +13,7 @@ root, no apt, no sudo), each tool pinned and sha256-checked in the Dockerfile:
   toolchains 1.99.1 and 1.98.0 with clippy and rustfmt (the pins in
   rust-toolchain.toml); any other toolchain downloads into the writable home.
 - apt: protobuf-compiler (protoc), pkg-config, libssl-dev, python3, unzip, xz.
-- buf 1.72.0, golangci-lint v2.14.0, hadolint, helm, uv, yq, shellcheck, actionlint.
+- buf 1.72.0, golangci-lint v2.14.0, hadolint, helm, uv, yq, shellcheck, actionlint, lychee 0.24.2 (docs.yml).
 - Playwright 1.62.1 Chromium (full and headless shell) and its OS libraries,
   browsers in `/opt/ms-playwright` (`PLAYWRIGHT_BROWSERS_PATH`). Callers run
   `playwright install` WITHOUT `--with-deps` (that needs root) and pin the same

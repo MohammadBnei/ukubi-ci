@@ -28,6 +28,8 @@ ARG SHELLCHECK_VERSION=0.10.0
 ARG SHELLCHECK_SHA256=6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
 ARG ACTIONLINT_VERSION=1.7.12
 ARG ACTIONLINT_SHA256=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+ARG LYCHEE_VERSION=0.24.2
+ARG LYCHEE_SHA256=1f4e0ef7f6554a6ed33dd7ac144fb2e1bbed98598e7af973042fc5cd43951c9a
 ARG RUSTUP_VERSION=1.28.2
 ARG RUSTUP_SHA256=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
 # The toolchains the repos pin in rust-toolchain.toml (ukubi-stt, ukubi-meet).
@@ -92,6 +94,8 @@ RUN set -eux; \
     d=/opt/hostedtoolcache/go/${GO_VERSION}/x64; mkdir -p "$d"; \
     dl go.tgz "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" "$GO_SHA256"; \
     tar -xzf go.tgz -C "$d" --strip-components=1; touch "$d.complete"; \
+    dl ly.tgz "https://github.com/lycheeverse/lychee/releases/download/lychee-v${LYCHEE_VERSION}/lychee-x86_64-unknown-linux-gnu.tar.gz" "$LYCHEE_SHA256"; \
+    tar -xzf ly.tgz --strip-components=1 lychee-x86_64-unknown-linux-gnu/lychee; install -m 0755 lychee /usr/local/bin/lychee; \
     cd /; rm -rf "$t"; \
     chown -R 1001:1001 /opt/hostedtoolcache; \
     /opt/hostedtoolcache/go/${GO_VERSION}/x64/bin/go version
@@ -139,6 +143,6 @@ RUN set -eux; \
     cd /; rm -rf "$t"; \
     /opt/hostedtoolcache/go/${GO_VERSION}/x64/bin/go version; cargo --version; \
     node --version; bun --version; buf --version; golangci-lint --version; hadolint --version; \
-    helm version --short; uv --version; yq --version; shellcheck --version | head -2; actionlint -version | head -1; \
+    helm version --short; uv --version; yq --version; shellcheck --version | head -2; actionlint -version | head -1; lychee --version; \
     protoc --version; psql --version
 
