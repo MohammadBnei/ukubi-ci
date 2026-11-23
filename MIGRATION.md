@@ -1,3 +1,5 @@
+> Historical: written for the GitHub to Forgejo move (v0.8.0, 2026-11). Forgejo (https://git.bnei.dev) is now the primary forge for every active repo and GitHub is a push mirror; read the GitHub Actions remarks below as that period.
+
 # Moving a caller to Forgejo Actions
 
 From v0.8.0 the workflows run on Forgejo Actions and on GitHub Actions. This

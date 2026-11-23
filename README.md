@@ -80,7 +80,7 @@ hq-style layout (Dockerfile and context in a subdirectory):
 
 Secret `build-secrets` (optional): multiline `id=value`. Each becomes
 `--secret id=<id>`, read in the Dockerfile with
-`RUN --mount=type=secret,id=<id>`. Example: `build-secrets: github_token=${{ github.token }}`.
+`RUN --mount=type=secret,id=<id>`. Example: `build-secrets: token=${{ secrets.EXAMPLE_TOKEN }}`.
 Secrets `infisical-client-id` and `infisical-client-secret` (optional): the
 universal-auth login; a publishing run with `universal` and either missing fails.
 Outputs: `tag`, the pushed tag; `digest`, the pushed manifest digest;
@@ -150,8 +150,6 @@ jobs:
       image: ukubi-game
       build-args: BIN=game
       deploy: false
-    secrets:
-      build-secrets: mountain_token=${{ secrets.MOUNTAIN_READ_TOKEN }}
   realm:
     permissions:
       contents: write
@@ -162,8 +160,6 @@ jobs:
       image: ukubi-realm
       build-args: BIN=realm
       deploy: false
-    secrets:
-      build-secrets: mountain_token=${{ secrets.MOUNTAIN_READ_TOKEN }}
   deploy:
     # Skipped unless both builds succeed: never one image without the other.
     needs: [game, realm]
@@ -275,19 +271,52 @@ Rules:
   ukubi-ci is public: real mode on a private repo is first proven by the first
   private caller's run on its default branch.
 
+## docs.yml
+
+Offline markdown check with lychee: relative links, files and heading anchors
+(`--include-fragments`) resolve; `#L<n>` line anchors are skipped. It never
+touches the network, so an external URL is not checked. Contents read only.
+
+| input | default | |
+|---|---|---|
+| `runs-on` | `["k8s-ubuntu-latest"]` | JSON list of runner labels; the default is the Talos runner (ephemeral unprivileged pod, image `ukubi-ci-runner`) |
+| `paths` | `**/*.md` | multiline files or globs, relative to the repo root; empty fails |
+| `exclude` | `^file:///Users/` | multiline regexes of link targets to skip (`lychee --exclude`), so absolute `/Users/` paths pass. Setting it replaces the default |
+| `exclude-path` | `history/` | multiline regexes of file paths to skip (`lychee --exclude-path`). Setting it replaces the default |
+
+```yaml
+# .github/workflows/docs.yml in the app repo
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  docs:
+    uses: MohammadBnei/ukubi-ci/.github/workflows/docs.yml@<40-char sha>
+    with:
+      exclude-path: |
+        history/
+        docs/design
+```
+
 ## standard-status
 
 Reports which Code Standard mechanisms each repo's origin default branch has,
 as the markdown tables for standard §18 (one row per mechanism) and §19 (one
-row per repo: tier, head, n/10). Stdlib Go; it shallow-clones each repo with
-`gh repo clone`, so it needs `gh` authenticated for the repos (private ones
-included) and runs only in local sessions, not in agent-fleet. It reads, prints
-and writes no token.
+row per repo: tier, head, n/10). Stdlib Go; it shallow-clones each `owner/repo`
+over the Forgejo SSH remote (`git@git.bnei.lan:<owner>/<repo>.git`), so it needs
+an SSH key Forgejo accepts, and it reads an argument that is an existing
+directory (a local checkout) in place. It runs only in local sessions, not in
+agent-fleet. It scans `.github/workflows/` (where workflows still live) and
+`.forgejo/workflows/`. It reads, prints and writes no token.
 
 ```sh
 go run github.com/MohammadBnei/ukubi-ci/standard-status@<40-char sha> \
   MohammadBnei/hq MohammadBnei/drop MohammadBnei/ukubi-bridge MohammadBnei/mountain \
   MohammadBnei/ukubi-game MohammadBnei/agent-fleet MohammadBnei/pi-lab
+# or a local checkout: go run ...standard-status@<sha> ~/Code/ukubi/hq
 ```
 
 The output depends only on the repos' heads, so the same heads print the same
@@ -303,8 +332,8 @@ found.
 Intended call convention: hq's weekly-review should call it once in its
 Sources step and paste the output under a `## Standard status` heading in
 `reviews/YYYY-MM-DD.md`, and the standard's §18 and §19 are updated from that.
-When `gh` is not authenticated the review should write `Standard status not
-generated`. That hq change is not part of this repo.
+When the clone fails (no Forgejo SSH access) the review should write `Standard
+status not generated`. That hq change is not part of this repo.
 
 ## Checks: go-checks, bun-checks, rust-checks, dockerfile-lint, trailers
 
