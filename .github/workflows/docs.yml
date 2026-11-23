@@ -1,0 +1,71 @@
+# Offline markdown link and heading-anchor check with lychee: relative links,
+# files and #fragments only, never the network. Modeled on wird's docs.yml.
+# Inputs reach scripts through env only, never inline ${{ }}.
+name: docs
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: >-
+          JSON list of runner labels; needs bash and git. The default is the Talos runner label
+          (ephemeral unprivileged pods, image ukubi-ci-runner).
+        type: string
+        default: '["k8s-ubuntu-latest"]'
+      paths:
+        description: Multiline files or globs to check, relative to the repo root.
+        type: string
+        default: '**/*.md'
+      exclude:
+        description: Multiline regexes of link targets to skip (lychee --exclude). Setting it replaces the default.
+        type: string
+        default: '^file:///Users/'
+      exclude-path:
+        description: Multiline regexes of file paths to skip (lychee --exclude-path). Setting it replaces the default.
+        type: string
+        default: 'history/'
+
+jobs:
+  docs:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Build lychee arguments
+        id: args
+        env:
+          PATHS: ${{ inputs.paths }}
+          EXCLUDE: ${{ inputs.exclude }}
+          EXCLUDE_PATH: ${{ inputs.exclude-path }}
+        run: |
+          set -euo pipefail
+          args="--offline --include-fragments --no-progress --exclude '#L[0-9]'"
+          add() { # flag, multiline values; a single quote would break the quoting below
+            local flag=$1 v
+            while IFS= read -r v; do
+              v=${v//[[:space:]]/}
+              [ -n "$v" ] || continue
+              case $v in *\'*) echo "::error::$flag: a single quote is not allowed in '$v'"; exit 1 ;; esac
+              args+=" $flag '$v'"
+            done <<<"$2"
+          }
+          add --exclude "$EXCLUDE"
+          add --exclude-path "$EXCLUDE_PATH"
+          n=${#args}
+          add "" "$PATHS"
+          [ ${#args} -gt "$n" ] || { echo "::error::paths is empty"; exit 1; }
+          echo "args=$args" >>"$GITHUB_OUTPUT"
+
+      - name: Links and heading anchors
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          fail: true
+          args: ${{ steps.args.outputs.args }}
