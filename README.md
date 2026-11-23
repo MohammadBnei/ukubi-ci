@@ -274,8 +274,11 @@ Rules:
 ## docs.yml
 
 Offline markdown check with lychee: relative links, files and heading anchors
-(`--include-fragments`) resolve; `#L<n>` line anchors are skipped. It never
-touches the network, so an external URL is not checked. Contents read only.
+(`--include-fragments`) resolve; `#L<n>` line anchors are skipped. It runs the
+`lychee` baked into the `ukubi-ci-runner` image (no download at run time) with
+`--offline`, so it never touches the network and an external URL is not checked.
+A repo with no links in its files passes (lychee exits 0 on zero links); a
+missing `paths` input or a missing `lychee` binary fails. Contents read only.
 
 | input | default | |
 |---|---|---|
@@ -307,9 +310,11 @@ Reports which Code Standard mechanisms each repo has (an `owner/repo` is read at
 as the markdown tables for standard §18 (one row per mechanism) and §19 (one
 row per repo: tier, head, n/10). Stdlib Go; it shallow-clones each `owner/repo`
 over the Forgejo SSH remote (`git@git.bnei.lan:<owner>/<repo>.git`), so it needs
-an SSH key Forgejo accepts, and it reads an argument that is an existing
-directory (a local checkout) in place: that reports the checkout's current HEAD (possibly a feature branch) under
-its path, not under a repo name. It runs only in local sessions, not in
+an SSH key Forgejo accepts and `git.bnei.lan` must resolve (an ssh config alias
+or LAN DNS). An argument that is an existing directory (a local checkout) is
+shallow-cloned from its committed HEAD, so uncommitted files are not scanned; it
+is reported under its path, not under a repo name, at the checkout's current HEAD
+(possibly a feature branch). It runs only in local sessions, not in
 agent-fleet. It scans `.github/workflows/` (where workflows still live) and
 `.forgejo/workflows/`. It reads, prints and writes no token.
 
