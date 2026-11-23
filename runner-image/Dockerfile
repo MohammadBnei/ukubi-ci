@@ -50,6 +50,10 @@ ENV RUSTUP_HOME=/opt/rustup \
 # One RUN per concern keeps the layers few and each cacheable on its own.
 # Layer 1: apt packages (protoc for tonic/prost, psql for the dev-db roles, xz and unzip for the archives
 # below), then every pinned binary. Nothing here needs root at run time.
+# apt must not hang a build: 2026-11-23 an IPv6 fetch from the Ubuntu mirror stalled for 17 min inside
+# playwright install-deps (which calls apt itself, so the options live in apt.conf, not on one command line).
+RUN printf '%s\n' 'Acquire::ForceIPv4 "true";' 'Acquire::Retries "5";' 'Acquire::http::Timeout "30";' 'Acquire::https::Timeout "30";' \
+      > /etc/apt/apt.conf.d/99ci-network
 RUN set -eux; \
     apt-get update -qq; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
