@@ -186,11 +186,17 @@ func run(name string, args ...string) (string, error) {
 }
 
 // dir is per call: repo names can collide once flattened, or repeat.
-// An existing directory is a local checkout and is read in place.
+// An existing directory is a local checkout: its HEAD is cloned, not its working tree.
 func read(repo, dir string) Result {
+	src := "git@git.bnei.lan:" + repo + ".git"
 	if fi, err := os.Stat(repo); err == nil && fi.IsDir() {
-		dir = repo
-	} else if _, err := run("git", "clone", "--depth", "1", "--single-branch", "-q", "git@git.bnei.lan:"+repo+".git", dir); err != nil {
+		abs, err := filepath.Abs(repo)
+		if err != nil {
+			return Result{Repo: repo, Err: strings.ReplaceAll(err.Error(), "|", "/")}
+		}
+		src = "file://" + abs
+	}
+	if _, err := run("git", "clone", "--depth", "1", "--single-branch", "-q", src, dir); err != nil {
 		return Result{Repo: repo, Err: strings.ReplaceAll(err.Error(), "|", "/")}
 	}
 	br, e1 := run("git", "-C", dir, "rev-parse", "--abbrev-ref", "HEAD")

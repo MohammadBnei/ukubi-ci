@@ -2,8 +2,10 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -118,5 +120,31 @@ func TestRender(t *testing.T) {
 `
 	if got != want {
 		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestReadLocalDir(t *testing.T) {
+	d := t.TempDir()
+	g := func(args ...string) {
+		t.Helper()
+		c := exec.Command("git", append([]string{"-C", d, "-c", "user.name=t", "-c", "user.email=t@t"}, args...)...)
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	g("init", "-q", "-b", "main")
+	write(t, d, ".github/workflows/release.yml", "uses: MohammadBnei/ukubi-ci/.github/workflows/release.yml@abc")
+	g("add", ".")
+	g("commit", "-q", "-m", "x")
+	write(t, d, "CLAUDE.md", "# x\nTier: service. rest\n") // uncommitted: must not be read
+	r := read(d, filepath.Join(t.TempDir(), "c"))
+	if r.Err != "" || !strings.HasPrefix(r.Head, "main@") {
+		t.Fatalf("bad result: %+v", r)
+	}
+	if got := r.Found[tierIdx]; got != "" {
+		t.Errorf("uncommitted file scanned: %q", got)
+	}
+	if got := r.Found[8]; got != ".github/workflows/release.yml" {
+		t.Errorf("found %q", got)
 	}
 }
