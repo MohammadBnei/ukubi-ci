@@ -1,9 +1,11 @@
 // Command standard-status reports which ukubi Code Standard mechanisms each
 // repo's origin default branch has, as the markdown tables of §18 and §19.
 //
-//	go run github.com/MohammadBnei/ukubi-ci/standard-status@<sha> owner/repo...
+//	go run github.com/MohammadBnei/ukubi-ci/standard-status@<sha> owner/repo|dir...
 //
-// Needs gh authenticated for the repos (it clones with gh). Reads no token.
+// An owner/repo is cloned over the Forgejo SSH remote (git@git.bnei.lan:owner/repo.git),
+// so it needs an SSH key Forgejo accepts; an existing directory is read in place.
+// Reads no token.
 package main
 
 import (
@@ -35,7 +37,7 @@ func ext(e string) func(string) bool {
 func testGo(p string) bool { return strings.HasSuffix(p, "_test.go") }
 
 func workflow(p string) bool {
-	return strings.HasPrefix(p, ".github/workflows/") && (strings.HasSuffix(p, ".yml") || strings.HasSuffix(p, ".yaml"))
+	return (strings.HasPrefix(p, ".github/workflows/") || strings.HasPrefix(p, ".forgejo/workflows/")) && (strings.HasSuffix(p, ".yml") || strings.HasSuffix(p, ".yaml"))
 }
 
 // src allowlists code, so docs, .env examples and fixtures are never evidence.
@@ -184,8 +186,11 @@ func run(name string, args ...string) (string, error) {
 }
 
 // dir is per call: repo names can collide once flattened, or repeat.
+// An existing directory is a local checkout and is read in place.
 func read(repo, dir string) Result {
-	if _, err := run("gh", "repo", "clone", repo, dir, "--", "--depth", "1", "--single-branch", "-q"); err != nil {
+	if fi, err := os.Stat(repo); err == nil && fi.IsDir() {
+		dir = repo
+	} else if _, err := run("git", "clone", "--depth", "1", "--single-branch", "-q", "git@git.bnei.lan:"+repo+".git", dir); err != nil {
 		return Result{Repo: repo, Err: strings.ReplaceAll(err.Error(), "|", "/")}
 	}
 	br, e1 := run("git", "-C", dir, "rev-parse", "--abbrev-ref", "HEAD")
@@ -199,7 +204,7 @@ func read(repo, dir string) Result {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: standard-status owner/repo...")
+		fmt.Fprintln(os.Stderr, "usage: standard-status owner/repo|dir...")
 		os.Exit(2)
 	}
 	tmp, err := os.MkdirTemp("", "standard-status")

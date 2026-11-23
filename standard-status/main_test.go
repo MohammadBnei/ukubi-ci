@@ -59,6 +59,11 @@ func TestScan(t *testing.T) {
 			t.Errorf("%s: got %q, want %q", checks[i].name, got[i], w)
 		}
 	}
+	f := t.TempDir() // Forgejo's own workflow folder counts too
+	write(t, f, ".forgejo/workflows/c.yml", "on: pull_request\n")
+	if g := scan(f)[6]; g != ".forgejo/workflows/c.yml" {
+		t.Errorf("forgejo workflows: got %q", g)
+	}
 	l := t.TempDir()
 	write(t, l, ".github/workflows/b.yml", "on:\n  - push\n  - pull_request\n")
 	if g := scan(l)[6]; g != ".github/workflows/b.yml" {
