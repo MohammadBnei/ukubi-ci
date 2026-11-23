@@ -89,7 +89,7 @@ RUN set -eux; \
     /opt/hostedtoolcache/go/${GO_VERSION}/x64/bin/go version; \
     node --version; bun --version; buf --version; golangci-lint --version; hadolint --version; \
     helm version --short; uv --version; yq --version; shellcheck --version | head -2; actionlint -version | head -1; \
-    protoc --version
+    protoc --version; psql --version
 
 # Layer 2: Rust. rustup under RUSTUP_HOME/CARGO_HOME, the pinned toolchains with
 # clippy and rustfmt, and rustup's proxies on /usr/local/bin in case a runner
