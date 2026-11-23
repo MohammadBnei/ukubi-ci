@@ -1,5 +1,5 @@
 // Command standard-status reports which ukubi Code Standard mechanisms each
-// repo's origin default branch has, as the markdown tables of §18 and §19.
+// repo has (owner/repo at its default branch; a directory at its HEAD), as the markdown tables of §18 and §19.
 //
 //	go run github.com/MohammadBnei/ukubi-ci/standard-status@<sha> owner/repo|dir...
 //

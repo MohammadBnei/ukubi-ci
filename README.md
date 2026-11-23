@@ -303,12 +303,13 @@ jobs:
 
 ## standard-status
 
-Reports which Code Standard mechanisms each repo's origin default branch has,
+Reports which Code Standard mechanisms each repo has (an `owner/repo` is read at its origin default branch),
 as the markdown tables for standard §18 (one row per mechanism) and §19 (one
 row per repo: tier, head, n/10). Stdlib Go; it shallow-clones each `owner/repo`
 over the Forgejo SSH remote (`git@git.bnei.lan:<owner>/<repo>.git`), so it needs
 an SSH key Forgejo accepts, and it reads an argument that is an existing
-directory (a local checkout) in place. It runs only in local sessions, not in
+directory (a local checkout) in place: that reports the checkout's current HEAD (possibly a feature branch) under
+its path, not under a repo name. It runs only in local sessions, not in
 agent-fleet. It scans `.github/workflows/` (where workflows still live) and
 `.forgejo/workflows/`. It reads, prints and writes no token.
 
@@ -316,7 +317,7 @@ agent-fleet. It scans `.github/workflows/` (where workflows still live) and
 go run github.com/MohammadBnei/ukubi-ci/standard-status@<40-char sha> \
   MohammadBnei/hq MohammadBnei/drop MohammadBnei/ukubi-bridge MohammadBnei/mountain \
   MohammadBnei/ukubi-game MohammadBnei/agent-fleet MohammadBnei/pi-lab
-# or a local checkout: go run ...standard-status@<sha> ~/Code/ukubi/hq
+# or a local checkout: go run ...standard-status@<sha> <path to checkout>
 ```
 
 The output depends only on the repos' heads, so the same heads print the same
@@ -402,7 +403,7 @@ jobs:
     uses: MohammadBnei/ukubi-ci/.github/workflows/trailers.yml@<40-char sha>
     with:
       conventional: true
-      agent-trailers: pair
+      agent-trailers: forbid # the workspace rule is no trailers; `pair` demands trailers a session must not write
 ```
 
 ### go-checks.yml
@@ -487,7 +488,7 @@ The forms are anchored, so prose about the rule passes.
 | input | default | |
 |---|---|---|
 | `runs-on` | `["k8s-ubuntu-latest"]` | JSON list of runner labels; the default is the Talos runner (ephemeral unprivileged pod, image `ukubi-ci-runner`). CT 103 callers pass `["ubuntu-latest"]` |
-| `conventional` | `false` | Conventional Commit subjects on non-merge commits (git's `Revert "..."` passes, `fixup!` does not), and the PR title (a trailing ` (#N)` is ignored), since a squash lands the title |
+| `conventional` | `false` | Conventional Commit subjects on non-merge commits (git's `Revert "..."` passes, `fixup!` does not), and the PR title (a trailing ` (#N)` is ignored); a squash merge would land the title |
 | `allow-prefixes` | | multiline literal subject prefixes exempt from the Conventional rule only, never from the ban |
 | `agent-trailers` | `any` | `forbid`: no agent `Co-Authored-By` or `Agent-Session` at all. `pair`: an agent commit carries both `Co-Authored-By: ukubi-agent[-<host>] <noreply@bnei.dev>` and `Agent-Session: <id>`, a human one neither |
 | `extra-banned` | | an extra case-insensitive ERE, e.g. `generated with` for a repo that bans the words anywhere |
