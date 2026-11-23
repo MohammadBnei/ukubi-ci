@@ -47,13 +47,70 @@ ENV RUSTUP_HOME=/opt/rustup \
     PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
     PATH=/opt/cargo/bin:/usr/local/bin:$PATH
 
-# One RUN per concern keeps the layers few and each cacheable on its own.
-# Layer 1: apt packages (protoc for tonic/prost, psql for the dev-db roles, xz and unzip for the archives
-# below), then every pinned binary. Nothing here needs root at run time.
+# Layer order is cache order: heavy, rarely changing layers first, small and often edited ones last.
+# A change rebuilds its own layer and every layer after it. A one-line apt change used to sit before
+# Playwright and Rust, so it rebuilt both and hit a mirror stall (2026-11-23). Keep new small things at the end.
 # apt must not hang a build: 2026-11-23 an IPv6 fetch from the Ubuntu mirror stalled for 17 min inside
 # playwright install-deps (which calls apt itself, so the options live in apt.conf, not on one command line).
+# This file must stay before any apt use.
 RUN printf '%s\n' 'Acquire::ForceIPv4 "true";' 'Acquire::Retries "5";' 'Acquire::http::Timeout "30";' 'Acquire::https::Timeout "30";' \
       > /etc/apt/apt.conf.d/99ci-network
+
+# Playwright's Chromium (full and headless shell) and the OS libraries
+# it links (install-deps needs root, so it happens here, not in a job). Browsers
+# sit in PLAYWRIGHT_BROWSERS_PATH, owned by uid 1001 because `playwright install`
+# takes a lock and writes .links there even when nothing needs downloading;
+# callers run it without --with-deps and pin the same version.
+# Each tree is chowned in the RUN that creates it (a later chown -R would copy
+# every file into a new overlay layer). uid 1001 is the Talos runner job user, so
+# setup-* actions can add tool versions and rustup can add toolchains.
+RUN set -eux; \
+    npm install --no-save --no-package-lock --prefix /tmp/pw "playwright@${PLAYWRIGHT_VERSION}"; \
+    /tmp/pw/node_modules/.bin/playwright install --with-deps chromium chromium-headless-shell; \
+    rm -rf /tmp/pw /var/lib/apt/lists/* /root/.npm /root/.cache; \
+    chown -R 1001:1001 /opt/ms-playwright
+
+# Rust. rustup under RUSTUP_HOME/CARGO_HOME, the pinned toolchains with
+# clippy and rustfmt, and rustup's proxies on /usr/local/bin in case a runner
+# resets PATH. rust-checks finds rustup on PATH and skips its own install.
+RUN set -eux; \
+    curl -fsSL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init"; \
+    echo "${RUSTUP_SHA256}  /tmp/rustup-init" | sha256sum -c -; \
+    chmod +x /tmp/rustup-init; \
+    /tmp/rustup-init -y --profile minimal --default-toolchain none --no-modify-path; \
+    rm /tmp/rustup-init; \
+    for tc in ${RUST_TOOLCHAINS}; do rustup toolchain install "$tc" --profile minimal -c clippy -c rustfmt; done; \
+    rustup default "${RUST_TOOLCHAINS%% *}"; \
+    for b in rustup cargo rustc rustfmt cargo-fmt cargo-clippy clippy-driver; do ln -s "/opt/cargo/bin/$b" "/usr/local/bin/$b"; done; \
+    chown -R 1001:1001 /opt/rustup /opt/cargo; \
+    cargo --version
+
+# Go in the toolcache.
+RUN set -eux; \
+    t=$(mktemp -d); cd "$t"; \
+    dl() { curl -fsSL -o "$1" "$2"; echo "$3  $1" | sha256sum -c -; }; \
+    d=/opt/hostedtoolcache/go/${GO_VERSION}/x64; mkdir -p "$d"; \
+    dl go.tgz "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" "$GO_SHA256"; \
+    tar -xzf go.tgz -C "$d" --strip-components=1; touch "$d.complete"; \
+    cd /; rm -rf "$t"; \
+    chown -R 1001:1001 /opt/hostedtoolcache; \
+    /opt/hostedtoolcache/go/${GO_VERSION}/x64/bin/go version
+
+# Node (toolcache + /usr/local/bin links) and bun.
+RUN set -eux; \
+    t=$(mktemp -d); cd "$t"; \
+    dl() { curl -fsSL -o "$1" "$2"; echo "$3  $1" | sha256sum -c -; }; \
+    d=/opt/hostedtoolcache/node/${NODE_VERSION}/x64; mkdir -p "$d"; \
+    dl node.txz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" "$NODE_SHA256"; \
+    tar -xJf node.txz -C "$d" --strip-components=1; touch "$d.complete"; \
+    ln -s "$d/bin/node" "$d/bin/npm" "$d/bin/npx" /usr/local/bin/; \
+    dl bun.zip "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip" "$BUN_SHA256"; \
+    unzip -q bun.zip; install -m 0755 bun-linux-x64/bun /usr/local/bin/bun; \
+    cd /; rm -rf "$t"; \
+    chown -R 1001:1001 /opt/hostedtoolcache; \
+    node --version; bun --version
+
+# Last: small apt packages (protoc for tonic/prost, psql for the dev-db roles, rsync, ...) and the pinned binaries.
 RUN set -eux; \
     apt-get update -qq; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
@@ -61,15 +118,6 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*; \
     t=$(mktemp -d); cd "$t"; \
     dl() { curl -fsSL -o "$1" "$2"; echo "$3  $1" | sha256sum -c -; }; \
-    d=/opt/hostedtoolcache/go/${GO_VERSION}/x64; mkdir -p "$d"; \
-    dl go.tgz "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" "$GO_SHA256"; \
-    tar -xzf go.tgz -C "$d" --strip-components=1; touch "$d.complete"; \
-    d=/opt/hostedtoolcache/node/${NODE_VERSION}/x64; mkdir -p "$d"; \
-    dl node.txz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" "$NODE_SHA256"; \
-    tar -xJf node.txz -C "$d" --strip-components=1; touch "$d.complete"; \
-    ln -s "$d/bin/node" "$d/bin/npm" "$d/bin/npx" /usr/local/bin/; \
-    dl bun.zip "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip" "$BUN_SHA256"; \
-    unzip -q bun.zip; install -m 0755 bun-linux-x64/bun /usr/local/bin/bun; \
     dl buf "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-Linux-x86_64" "$BUF_SHA256"; \
     install -m 0755 buf /usr/local/bin/buf; \
     dl gl.tgz "https://github.com/golangci/golangci-lint/releases/download/v${GOLANGCI_VERSION}/golangci-lint-${GOLANGCI_VERSION}-linux-amd64.tar.gz" "$GOLANGCI_SHA256"; \
@@ -89,37 +137,8 @@ RUN set -eux; \
     dl al.tgz "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" "$ACTIONLINT_SHA256"; \
     tar -xzf al.tgz actionlint; install -m 0755 actionlint /usr/local/bin/actionlint; \
     cd /; rm -rf "$t"; \
-    chown -R 1001:1001 /opt/hostedtoolcache; \
-    /opt/hostedtoolcache/go/${GO_VERSION}/x64/bin/go version; \
+    /opt/hostedtoolcache/go/${GO_VERSION}/x64/bin/go version; cargo --version; \
     node --version; bun --version; buf --version; golangci-lint --version; hadolint --version; \
     helm version --short; uv --version; yq --version; shellcheck --version | head -2; actionlint -version | head -1; \
     protoc --version; psql --version
 
-# Layer 2: Rust. rustup under RUSTUP_HOME/CARGO_HOME, the pinned toolchains with
-# clippy and rustfmt, and rustup's proxies on /usr/local/bin in case a runner
-# resets PATH. rust-checks finds rustup on PATH and skips its own install.
-RUN set -eux; \
-    curl -fsSL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init"; \
-    echo "${RUSTUP_SHA256}  /tmp/rustup-init" | sha256sum -c -; \
-    chmod +x /tmp/rustup-init; \
-    /tmp/rustup-init -y --profile minimal --default-toolchain none --no-modify-path; \
-    rm /tmp/rustup-init; \
-    for tc in ${RUST_TOOLCHAINS}; do rustup toolchain install "$tc" --profile minimal -c clippy -c rustfmt; done; \
-    rustup default "${RUST_TOOLCHAINS%% *}"; \
-    for b in rustup cargo rustc rustfmt cargo-fmt cargo-clippy clippy-driver; do ln -s "/opt/cargo/bin/$b" "/usr/local/bin/$b"; done; \
-    chown -R 1001:1001 /opt/rustup /opt/cargo; \
-    cargo --version
-
-# Layer 3: Playwright's Chromium (full and headless shell) and the OS libraries
-# it links (install-deps needs root, so it happens here, not in a job). Browsers
-# sit in PLAYWRIGHT_BROWSERS_PATH, owned by uid 1001 because `playwright install`
-# takes a lock and writes .links there even when nothing needs downloading;
-# callers run it without --with-deps and pin the same version.
-# Each tree is chowned in the RUN that creates it (a later chown -R would copy
-# every file into a new overlay layer). uid 1001 is the Talos runner job user, so
-# setup-* actions can add tool versions and rustup can add toolchains.
-RUN set -eux; \
-    npm install --no-save --no-package-lock --prefix /tmp/pw "playwright@${PLAYWRIGHT_VERSION}"; \
-    /tmp/pw/node_modules/.bin/playwright install --with-deps chromium chromium-headless-shell; \
-    rm -rf /tmp/pw /var/lib/apt/lists/* /root/.npm /root/.cache; \
-    chown -R 1001:1001 /opt/ms-playwright
